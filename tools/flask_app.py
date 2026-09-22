@@ -1143,6 +1143,12 @@ PAGE = """<!DOCTYPE html>
   .bchip.bE { color:#c96bff; border-color:#c96bff; }
   .bchip.bF { color:#ff8c3a; border-color:#ff8c3a; }
   .bchip.bL { color:#8a958a; border-color:#8a958a; }
+  #detsum { font-size:.58rem; letter-spacing:.05em; color:var(--dim);
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .dchip { display:inline-block; padding:0 4px; border-radius:3px;
+           border:1px solid; font-size:.56rem; letter-spacing:.06em; }
+  .stdb { padding:0 3px; border-radius:3px; border:1px solid var(--dim);
+          color:var(--txt); font-size:.54rem; letter-spacing:.08em; }
   .ltb { padding:0 4px; border-radius:3px; border:1px solid var(--dim);
          color:var(--dim); font-size:.56rem; letter-spacing:.05em; }
   .ltb.scanner { color:var(--grn); border-color:var(--grn); }
@@ -1302,6 +1308,7 @@ PAGE = """<!DOCTYPE html>
   <div class="detbar">
     <span class="lbl">DETECTION LOG // tools/detections.csv</span>
     <span id="dettotal">0 ROWS</span>
+    <span id="detsum"></span>
     <a id="export" class="tg" href="/api/detections/export" download="detections.csv">EXPORT CSV</a>
     <button id="detclear" class="tg" title="truncate tools/detections.csv to header-only">CLEAR</button>
   </div>
@@ -1448,7 +1455,8 @@ function showTab(t) {
 }
 const DETCOLS = [
   ['start_iso', 'START'], ['end_iso', 'END'], ['duration_s', 'DUR s'],
-  ['channel', 'CH'], ['band', 'BAND'], ['freq_mhz', 'FREQ'],
+  ['channel', 'CH'], ['drone', 'DRONE'], ['band', 'BAND'], ['freq_mhz', 'FREQ'],
+  ['cfo_ppm', 'CFO'], ['video_std', 'STD'], ['line_us', 'LINE'],
   ['level_peak_db', 'PEAK'], ['level_mean_db', 'MEAN'], ['level_min_db', 'MIN'],
   ['video_sync', 'SYNC'], ['frames_received', 'FRAMES'], ['max_fps', 'MAXFPS'],
   ['lock_type', 'LOCK'], ['end_reason', 'END REASON'],
@@ -1481,6 +1489,58 @@ const sparkSpan = r => {
 /* Row accent class: video-synced episodes green, standalone events amber. */
 const detRowCls = r => r.video_sync === 1 ? 'vs'
                      : r.lock_type === 'event' ? 'ev' : '';
+/* DRONE-ID clustering: fingerprint = cfo_ppm rounded to the nearest
+   0.5 ppm + video_std ('' when the firmware left it blank). Rows with a
+   blank/non-numeric cfo_ppm carry no fingerprint and get no ID. */
+const droneFp = r => {
+  if (r.cfo_ppm === '' || r.cfo_ppm === undefined || r.cfo_ppm === null)
+    return null;
+  const p = Number(r.cfo_ppm);
+  if (!isFinite(p)) return null;
+  return (Math.round(p * 2) / 2).toFixed(1) + '|' + (r.video_std || '');
+};
+/* Deterministic fp -> DRONE-XXX map: clusters are numbered by first-seen
+   (earliest start_iso), so the same row set always yields the same IDs. */
+function droneMap(rows) {
+  const first = {};
+  rows.forEach(r => {
+    const fp = droneFp(r);
+    if (!fp) return;
+    const t = String(r.start_iso || '');
+    if (!(fp in first) || t < first[fp]) first[fp] = t;
+  });
+  const fps = Object.keys(first).sort((a, b) =>
+    first[a] < first[b] ? -1 : first[a] > first[b] ? 1 : a < b ? -1 : 1);
+  const m = {};
+  fps.forEach((fp, i) => { m[fp] = 'DRONE-' + String(i + 1).padStart(3, '0'); });
+  return m;
+}
+/* Stable per-ID hue so each drone keeps its own chip color. */
+const droneHue = id => {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return h % 360;
+};
+const droneChip = id =>
+  '<span class="dchip" style="color:hsl(' + droneHue(id) + ',80%,62%);' +
+  'border-color:hsl(' + droneHue(id) + ',80%,40%)">' + esc(id) + '</span>';
+const fmtCfo = v => (v > 0 ? '+' : '') + Number(v).toFixed(1);
+const fmtLine = v => (typeof v === 'number' ? v.toFixed(2) : esc(v)) + 'us';
+/* Header summary strip: "N drones fingerprinted · M encounters ·
+   strongest: DRONE-X (peak dB)" from the loaded rows. */
+function renderDetSum(rows, dm) {
+  const ids = Object.keys(dm).length;
+  const enc = rows.reduce((n, r) => n + (r.drone ? 1 : 0), 0);
+  let best = null;
+  rows.forEach(r => {
+    if (r.drone && typeof r.level_peak_db === 'number' &&
+        (!best || r.level_peak_db > best.peak)) best = { id: r.drone, peak: r.level_peak_db };
+  });
+  document.getElementById('detsum').textContent =
+    ids + ' drone' + (ids === 1 ? '' : 's') + ' fingerprinted · ' +
+    enc + ' encounter' + (enc === 1 ? '' : 's') +
+    (best ? ' · strongest: ' + best.id + ' (' + best.peak + 'dB)' : '');
+}
 /* Match a detection row to its screenshot: capture names are
    <sanitized episode start>__<HHMMSS>.jpg, sanitized the same way
    (YYYY-MM-DDTHH:MM:SS -> dashes). */
@@ -1498,6 +1558,13 @@ function renderDets(d) {
   const rows = d.rows || [];
   const shots = d.shots || [];
   document.getElementById('dettotal').textContent = (d.total || 0) + ' ROWS';
+  // Cluster fingerprinted rows and inject the display ID, then summarize.
+  const dm = droneMap(rows);
+  rows.forEach(r => {
+    const fp = droneFp(r);
+    if (fp) r.drone = dm[fp];
+  });
+  renderDetSum(rows, dm);
   // Skip columns the CSV lacks entirely (or that are blank on every row).
   const cols = DETCOLS.filter(c => rows.some(r => r[c[0]] !== undefined && r[c[0]] !== ''));
   if (rows.some(r => typeof r.level_peak_db === 'number')) {
@@ -1529,6 +1596,10 @@ function renderDets(d) {
                        : '<td class="na">--</td>';
       if (v === undefined || v === '') return '<td class="na">--</td>';
       if (k === 'channel') return '<td>' + bchip(r.band, v) + '</td>';
+      if (k === 'drone') return '<td>' + droneChip(v) + '</td>';
+      if (k === 'cfo_ppm') return '<td class="num">' + esc(fmtCfo(v)) + '</td>';
+      if (k === 'video_std') return '<td><span class="stdb">' + esc(v) + '</span></td>';
+      if (k === 'line_us') return '<td class="num">' + fmtLine(v) + '</td>';
       if (k === 'start_iso' || k === 'end_iso')
         return '<td class="ts">' + fmtISO(v) + '</td>';
       if (k === 'duration_s') return '<td class="num">' + esc(fmtDur(v)) + '</td>';
@@ -1547,10 +1618,11 @@ function renderDets(d) {
    chip + timestamp + duration + shot + sync; the rest stacks as
    label:value pairs in a 2-column grid. */
 function renderDetCards(rows, cols, shots) {
-  const TITLE = ['channel', 'start_iso', 'duration_s', 'video_sync', 'shot'];
+  const TITLE = ['channel', 'drone', 'start_iso', 'duration_s', 'video_sync', 'shot'];
   document.getElementById('detcards').innerHTML = rows.map(r => {
     let h = '<div class="dcline">';
     if (r.channel !== undefined && r.channel !== '') h += bchip(r.band, r.channel);
+    if (r.drone) h += droneChip(r.drone);
     if (r.start_iso) h += '<span class="dcts">' + fmtISO(r.start_iso) + '</span>';
     if (r.duration_s !== undefined && r.duration_s !== '')
       h += '<span class="dcdur">' + esc(fmtDur(r.duration_s)) + '</span>';
@@ -1568,6 +1640,9 @@ function renderDetCards(rows, cols, shots) {
       let val;
       if (c[0] === 'end_iso') val = fmtISO(v);
       else if (c[0] === 'freq_mhz' && typeof v === 'number') val = v.toFixed(1);
+      else if (c[0] === 'cfo_ppm') val = esc(fmtCfo(v));
+      else if (c[0] === 'video_std') val = '<span class="stdb">' + esc(v) + '</span>';
+      else if (c[0] === 'line_us') val = fmtLine(v);
       else if (c[0] === 'lock_type') val = '<span class="ltb ' + esc(v) + '">' + esc(v) + '</span>';
       else val = esc(v);
       h += '<span><i>' + c[1] + '</i>' + val + '</span>';
