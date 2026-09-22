@@ -338,6 +338,21 @@ int main()
     }
     printf("ok: real-capture layout analysis (informational)\n");
 
+    // 11) BIND-PHRASE UID + FLRC identity vector. UID derivation is
+    //     MD5("-DMY_BINDING_PHRASE=\"<phrase>\"")[:6] (binary_configurator.py
+    //     + community converters — NOT md5(phrase) plain). Verified python
+    //     value for "ExpressLRS": 43 7f 2f b1 d3 39.
+    {
+        static const uint8_t uid_def[6] = { 0x43, 0x7f, 0x2f, 0xb1, 0xd3, 0x39 };
+        uint32_t macseed = elrs_uid_mac_seed(uid_def[2], uid_def[3], uid_def[4], uid_def[5]);
+        uint16_t crcinit = elrs_crc_init_from_uid(uid_def[4], uid_def[5]);
+        printf("default phrase UID 43 7f 2f b1 d3 39 -> macseed %08lx crcinit %04x\n",
+               (unsigned long)macseed, crcinit);
+        assert(macseed == 0x2fb1d33a); // 2f b1 d3 (39^3=3a)
+        assert(crcinit == 0xd33a);     // (d3<<8|39)^3
+    }
+    printf("ok: bind-phrase UID + FLRC identity vector\n");
+
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }

@@ -10,6 +10,7 @@
 // =============================================================================
 #include <Arduino.h>
 #include <Preferences.h>
+#include <mbedtls/md5.h>
 #include "board_pins.h"
 #include "elrs_defs.h"
 #include "elrs_parse.h"
@@ -369,6 +370,50 @@ static bool radio_init_bounded(const radio_pin_set_t *ps, uint32_t timeout_ms,
     return true;
 }
 
+// ---- bind phrase -> UID (FLRC identity) ------------------------------------
+// ELRS derivation, verified against two independent sources:
+//   src/python/binary_configurator.py:82  uid = md5(('-DMY_BINDING_PHRASE="'
+//                                           + phrase + '"').encode())[:6]
+//   community converters (e.g. busheezy/elrs-binding-phrase-to-bytes) hash
+//   the SAME wrapped string. NOT md5(phrase) plain.
+// Default phrase "ExpressLRS" -> UID 43 7f 2f b1 d3 39 (verified by python).
+static uint8_t g_uid[6] = { 0x43, 0x7f, 0x2f, 0xb1, 0xd3, 0x39 };
+
+static void derive_uid_from_phrase(const char *phrase, uint8_t uid[6])
+{
+    char wrapped[96];
+    snprintf(wrapped, sizeof(wrapped), "-DMY_BINDING_PHRASE=\"%s\"", phrase);
+    uint8_t digest[16];
+    mbedtls_md5_ret((const unsigned char *)wrapped, strlen(wrapped), digest);
+    memcpy(uid, digest, 6);
+}
+
+static void apply_bind_phrase(const char *phrase, bool announce)
+{
+    Preferences pr;
+    if (pr.begin(PREF_NAMESPACE, false)) {
+        pr.putString("bind", phrase);
+        pr.end();
+    }
+    derive_uid_from_phrase(phrase, g_uid);
+    g_radio.setFlrcIdentity(g_uid);
+    if (announce) {
+        Serial.printf("{\"t\":\"event\",\"what\":\"uid\",\"uid\":\"%02x %02x %02x %02x %02x %02x\"}\n",
+                      g_uid[0], g_uid[1], g_uid[2], g_uid[3], g_uid[4], g_uid[5]);
+    }
+}
+
+static void load_bind_phrase()
+{
+    Preferences pr;
+    String s = "ExpressLRS";
+    if (pr.begin(PREF_NAMESPACE, true)) {
+        s = pr.getString("bind", "ExpressLRS");
+        pr.end();
+    }
+    apply_bind_phrase(s.c_str(), true);
+}
+
 // ---- OLED driver preference ------------------------------------------------
 static int oled_pref_read()
 {
@@ -510,6 +555,7 @@ void setup()
 
     elrs_decode_init(&dctx);
     sniffer_sweep_build(&sweep);
+    load_bind_phrase(); // persisted phrase or "ExpressLRS" -> UID -> FLRC identity
 
     // OLED: bounded probe, splash only on success; driver from prefs
     // (default SH1106 — these panels ship interchangeably and mislabelled)
@@ -564,12 +610,26 @@ void setup()
 void loop()
 {
     // console commands: P = radio pin re-probe, D = toggle OLED driver,
-    // V = verbose rawpkt toggle, R [step] = park sweep / resume
+    // V = verbose rawpkt toggle, R [step] = park sweep / resume,
+    // U <phrase> = set bind phrase (to end of line)
     static bool r_pending = false;
     static uint8_t r_digits = 0;
     static int r_num = 0;
+    static bool u_pending = false;
+    static char u_buf[64];
+    static uint8_t u_len = 0;
     while (Serial.available()) {
         int c = Serial.read();
+        if (u_pending) {
+            if (c == '\n' || c == '\r') {
+                u_pending = false;
+                u_buf[u_len] = 0;
+                if (u_len > 0) apply_bind_phrase(u_buf, true);
+            } else if (u_len < sizeof(u_buf) - 1) {
+                u_buf[u_len++] = (char)c; // phrase may contain spaces
+            }
+            continue;
+        }
         if (r_pending) {
             if (c >= '0' && c <= '9' && r_digits < 2) {
                 r_num = r_num * 10 + (c - '0');
@@ -598,6 +658,8 @@ void loop()
             Serial.printf("{\"t\":\"event\",\"what\":\"%s\"}\n", g_verbose ? "verbose_on" : "verbose_off");
         } else if (c == 'R' || c == 'r') {
             r_pending = true; r_num = 0; r_digits = 0;
+        } else if (c == 'U' || c == 'u') {
+            u_pending = true; u_len = 0;
         }
     }
 
@@ -653,11 +715,13 @@ void loop()
     }
 
     if (radio_ok) {
+        const bool flrc_step = sweep.steps[step_idx].rate->flrc;
         // live energy sampling (<=5 Hz) — the RF-path discriminator.
         // Guarded: only when RX is running and no packet SPI is in flight;
         // three consecutive SPI errors stop sampling for THIS dwell (the
         // rssi values stay stale) instead of hammering a wedged radio.
-        if (sampling_enabled && !g_rx_busy && !locked &&
+        // (GET_RSSIINST is LoRa-only — skipped on FLRC dwells.)
+        if (sampling_enabled && !g_rx_busy && !locked && !flrc_step &&
             millis() - last_sample_ms >= RSSI_SAMPLE_MS) {
             last_sample_ms = millis();
             float db;
@@ -686,10 +750,21 @@ void loop()
             last_snr = snr;
             if (!ok) {
                 n_unk++; dwell_unk++;
+                if (g_verbose && millis() - last_rawpkt_ms >= 100) {
+                    last_rawpkt_ms = millis();
+                    char hex[2 * ELRS_OTA8_LEN + 1];
+                    to_hex(buf, want, hex);
+                    Serial.printf("{\"t\":\"rawpkt\",\"cls\":2,\"hex\":\"%s\"}\n", hex);
+                }
             } else {
                 last_pkt_ms = millis();
                 dwell_pkts++;
                 if (!dwell_first_pkt_ms) dwell_first_pkt_ms = millis();
+                // FLRC: no software CRC — the radio's seeded 3-byte CRC and
+                // the UID sync word already filtered demods, so a classified
+                // packet counts as validated.
+                if (pkt.cls == ELRS_PKT_CLASS_CRC_OK || flrc_step)
+                    pkt.cls = ELRS_PKT_CLASS_CRC_OK;
                 // verbose (V): EVERY demodded packet as rawpkt, 10/s
                 if (g_verbose && millis() - last_rawpkt_ms >= 100) {
                     last_rawpkt_ms = millis();
@@ -701,6 +776,23 @@ void loop()
                 switch (pkt.type) {
                 case ELRS_PKT_SYNC:
                     n_sync++; dwell_sync++;
+                    if (flrc_step) {
+                        // FLRC sync: identity comes from the bind phrase, not
+                        // the soft CRC — print the UID-tail comparison.
+                        bool match = pkt.sync.uid3 == g_uid[3] &&
+                                     pkt.sync.uid4 == g_uid[4] &&
+                                     pkt.sync.uid5 == g_uid[5];
+                        Serial.printf("{\"t\":\"event\",\"what\":\"flrc_sync\","
+                                      "\"uid_pkt\":\"%02x%02x%02x\",\"uid_phrase\":\"%02x%02x%02x\",\"match\":%u}\n",
+                                      pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5,
+                                      g_uid[3], g_uid[4], g_uid[5], match ? 1 : 0);
+                        dctx.uid3 = g_uid[3];
+                        dctx.uid4 = g_uid[4];
+                        dctx.uid5 = g_uid[5];
+                        dctx.uid_known = true;
+                        dctx.crc_init = elrs_crc_init_from_uid(g_uid[4], g_uid[5]);
+                        dctx.crc_init_known = true;
+                    }
                     // raw ground-truth: FULL hex of every sync-classified
                     // packet (validated or not), <=2/s — for CRC forensics.
                     if (millis() - last_rawpkt_ms >= PKT_DEBUG_MIN_MS) {

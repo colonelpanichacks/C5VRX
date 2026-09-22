@@ -63,14 +63,18 @@
 // ---------------------------------------------------------------------------
 typedef struct {
     const char *name;      // human label
-    uint8_t     bw;        // SX1280 LoRa BW register enum (0x18 = 812.5 kHz)
-    uint8_t     sf;        // SX1280 SF register enum (0x50 = SF5 .. 0x80 = SF8)
-    uint8_t     cr;        // SX1280 CR register enum (LI variants)
+    uint8_t     bw;        // SX1280 LoRa BW register enum (0x18 = 812.5 kHz);
+                           // for flrc rows: FLRC bitrate/bandwidth byte (0x86)
+    uint8_t     sf;        // SX1280 SF register enum (0x50 = SF5 .. 0x80 = SF8);
+                           // for flrc rows: BT byte (0x10 = BT 1.0)
+    uint8_t     cr;        // SX1280 CR register enum (LI variants);
+                           // for flrc rows: FLRC coding-rate byte (0x00 = 1/2)
     uint8_t     preamble;  // symbols
     uint32_t    interval_us;
     uint8_t     payload;   // fixed OTA payload bytes: 8 (OTA4) or 13 (OTA8)
     uint8_t     hop_interval;
     uint8_t     rate_index;// ELRS index (sync packet rateIndex field)
+    uint8_t     flrc;      // 1 = FLRC modem (sync word = uidMacSeed, radio CRC)
 } elrs_rate_t;
 
 static const elrs_rate_t ELRS_RATES_3X[] = {
@@ -96,6 +100,20 @@ static const elrs_rate_t ELRS_RATES_2X[] = {
     { "LoRa 50Hz*",   0x18,  0x90,  0x06,  12,  20000,     8,   2,  0xFF }, // SF9
 };
 #define ELRS_RATES_2X_COUNT (sizeof(ELRS_RATES_2X) / sizeof(ELRS_RATES_2X[0]))
+
+// FLRC rates (3.x table rows 0..3; SX1280.cpp Config FLRC branch +
+// SetPacketParamsFLRC). FLRC carries NO ELRS software CRC — integrity is the
+// radio's 3-byte CRC seeded with OtaCrcInitializer, and demod requires the
+// 32-bit sync word = uidMacSeedGet() (UID-derived). IQ inversion does not
+// apply to FLRC (ELRS ignores InvertIQ for the FLRC branch), so these are
+// single-polarity dwell steps.
+static const elrs_rate_t ELRS_RATES_FLRC[] = {
+    // name            flrc-bw flrc-bt flrc-cr pre  interval  len  hop  idx  flrc
+    { "FLRC 1000Hz",   0x86,   0x10,   0x00,  32,   1000,     8,   2,   0,  1 },
+    { "DVDA 500Hz",    0x86,   0x10,   0x00,  32,   1000,     8,   2,   2,  1 },
+    { "DVDA 250Hz",    0x86,   0x10,   0x00,  32,   1000,     8,   2,   3,  1 },
+};
+#define ELRS_RATES_FLRC_COUNT (sizeof(ELRS_RATES_FLRC) / sizeof(ELRS_RATES_FLRC[0]))
 
 // FLRC rates (SX128X table rows 0..3) are NOT swept by default: the FLRC
 // 32-bit sync word is UID-derived (uidMacSeedGet, below), unknown to a

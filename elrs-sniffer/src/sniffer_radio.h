@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include "elrs_defs.h"
 
-#define SNIFFER_MAX_STEPS (2 * (ELRS_RATES_3X_COUNT + ELRS_RATES_2X_COUNT))
+#define SNIFFER_MAX_STEPS (2 * (ELRS_RATES_3X_COUNT + ELRS_RATES_2X_COUNT) + ELRS_RATES_FLRC_COUNT)
 
 typedef struct {
     const elrs_rate_t *rate;
@@ -59,6 +59,11 @@ public:
     // path underneath is bounded by RadioLib's busy-pin timeout — this is
     // the dwell watchdog's recovery hammer; it cannot hang the caller.
     bool recover(const sniffer_step_t &step, uint32_t freq_hz);
+    // FLRC identity: 32-bit sync word = uidMacSeedGet(UID), radio CRC seed =
+    // OtaCrcInitializer — both derived from the bind-phrase UID (elrs_defs.h
+    // citations). Without the right phrase, FLRC demods all fail the radio
+    // CRC and the dwell stays silent (by design).
+    void setFlrcIdentity(const uint8_t uid[6]);
     // (Re)start continuous RX with DIO1 -> RX_DONE only.
     void start_rx();
     // Called from loop; when a packet demodded, fills buf/len/rssi/snr.
@@ -77,6 +82,9 @@ private:
     Module *mod = nullptr;
     SX1280 *radio = nullptr;
     uint8_t payload_len = 0;
+    uint8_t flrc_sw[4] = { 0, 0, 0, 3 };  // uidMacSeedGet (default-phrase UID)
+    uint16_t flrc_seed = 3;               // OtaCrcInitializer for the FLRC radio CRC
+    bool flrc_id_ok = false;
 };
 
 extern SnifferRadio g_radio;

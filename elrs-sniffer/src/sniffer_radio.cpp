@@ -1,6 +1,7 @@
 // sniffer_radio.cpp — see sniffer_radio.h
 #include "sniffer_radio.h"
 #include "board_pins.h"
+#include "elrs_parse.h" // uidMacSeed / crc-init helpers (elrs_defs.h cited)
 #ifdef ARDUINO
 #include <Arduino.h>
 #include <RadioLib.h>
@@ -13,19 +14,29 @@ class SnifferSX1280 : public SX1280 {
 public:
     using SX1280::SX1280;
     using SX1280::setPacketParamsLoRa;
+    using SX1280::setPacketParamsGFSK;
     using SX1280::setPacketType;
 };
 
 void sniffer_sweep_build(sniffer_sweep_t *sw)
 {
     sw->count = 0;
-    // Likelihood-ordered first pass — most-deployed rates first, each with
-    // normal IQ then inverted (invertIQ = UID[5]&1 splits real links ~50/50).
-    // FLRC/DVDA rates are absent: their 32-bit sync word is UID-derived
-    // (elrs_defs.h); hunting them stays a post-capture TODO.
+    // Likelihood-ordered first pass — most-deployed LoRa rates first, each
+    // with normal IQ then inverted (invertIQ = UID[5]&1 splits real links
+    // ~50/50). FLRC trio (single polarity — ELRS ignores InvertIQ for the
+    // FLRC branch) sits after the four main LoRa pairs; 8ch variants and
+    // legacy 2.x rows last.
     static const uint8_t order3x[ELRS_RATES_3X_COUNT] = { 2, 0, 3, 5, 1, 4 };
     //                         table idx ->   250, 500, 150, 50, 333-8, 100-8
-    for (uint8_t k = 0; k < ELRS_RATES_3X_COUNT; k++) {
+    for (uint8_t k = 0; k < 4; k++) { // the four main rates, IQ pairs
+        uint8_t i = order3x[k];
+        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], false, false };
+        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], true, false };
+    }
+    for (uint8_t i = 0; i < ELRS_RATES_FLRC_COUNT; i++) {
+        sw->steps[sw->count++] = { &ELRS_RATES_FLRC[i], false, false };
+    }
+    for (uint8_t k = 4; k < ELRS_RATES_3X_COUNT; k++) { // 8ch variants
         uint8_t i = order3x[k];
         sw->steps[sw->count++] = { &ELRS_RATES_3X[i], false, false };
         sw->steps[sw->count++] = { &ELRS_RATES_3X[i], true, false };
@@ -89,9 +100,32 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
 {
     const elrs_rate_t *r = step.rate;
     payload_len = r->payload;
-    // Individual setters write the SetModulationParams pieces; the packet
-    // params (implicit header, fixed length, CRC OFF, IQ) go out in one
-    // explicit call — exactly the ELRS air config from SX1280.cpp
+    if (r->flrc) {
+        // FLRC branch — exact ELRS SX1280.cpp Config/SetPacketParamsFLRC:
+        //   modparams {BR0.65_BW0.6 (0x86), CR 1/2 (0x00), BT 1.0 (0x10)}
+        //   preamble 32 -> AGCPreambleLength ((32/4)-1)<<4 = 0x70
+        //   32-bit sync word = uidMacSeed, match SWM1, fixed 8B payload,
+        //   3-byte radio CRC seeded with OtaCrcInitializer, whitening off.
+        static_cast<SnifferSX1280 *>(radio)->setPacketType(RADIOLIB_SX128X_PACKET_TYPE_FLRC);
+        radio->setFrequency(freq_hz / 1000000.0);
+        uint8_t mp[3] = { r->bw, r->cr, r->sf }; // flrc rows carry bw/bt/cr bytes
+        mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_MODULATION_PARAMS, mp, 3);
+        // sync word with the DS 16.4 erratum swap (SX1280.cpp SetPacketParamsFLRC)
+        uint8_t sw[4] = { flrc_sw[0], flrc_sw[1], flrc_sw[2], flrc_sw[3] };
+        if ((sw[0] == 0x8C && sw[1] == 0x38) || (sw[0] == 0x63 && sw[1] == 0x0E)) {
+            uint8_t t = sw[0]; sw[0] = sw[1]; sw[1] = t;
+        }
+        radio->setSyncWord(sw, 4);
+        static_cast<SnifferSX1280 *>(radio)->setPacketParamsGFSK(0x70, 0x04, 0x10, RADIOLIB_SX128X_GFSK_FLRC_CRC_3_BYTE,
+                                   0x08, payload_len, RADIOLIB_SX128X_GFSK_FLRC_PACKET_FIXED);
+        // CRC seed = OtaCrcInitializer; polynomial left at chip default 0x1021
+        // (ELRS never writes the FLRC poly register)
+        radio->setCRC(3, flrc_seed, 0x1021);
+        return true;
+    }
+    // LoRa branch: individual setters write the SetModulationParams pieces;
+    // packet params (implicit header, fixed length, CRC OFF, IQ) go out in
+    // one explicit call — exactly the ELRS air config from SX1280.cpp
     // SetPacketParamsLoRa. ELRS InvertIQ==true is register 0x00 (INVERTED).
     radio->setBandwidth(r->bw == 0x18 ? 812.5f : r->bw == 0x26 ? 406.25f : 203.125f);
     radio->setSpreadingFactor(r->sf >> 4);         // 0x50->5 .. 0x90->9
@@ -103,6 +137,17 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
         0x00, step.iq_inverted ? RADIOLIB_SX128X_LORA_IQ_INVERTED
                                : RADIOLIB_SX128X_LORA_IQ_STANDARD);
     return true;
+}
+
+void SnifferRadio::setFlrcIdentity(const uint8_t uid[6])
+{
+    uint32_t seed32 = elrs_uid_mac_seed(uid[2], uid[3], uid[4], uid[5]);
+    flrc_sw[0] = (uint8_t)(seed32 >> 24);
+    flrc_sw[1] = (uint8_t)(seed32 >> 16);
+    flrc_sw[2] = (uint8_t)(seed32 >> 8);
+    flrc_sw[3] = (uint8_t)(seed32 & 0xFF);
+    flrc_seed = elrs_crc_init_from_uid(uid[4], uid[5]);
+    flrc_id_ok = true;
 }
 
 void SnifferRadio::start_rx()

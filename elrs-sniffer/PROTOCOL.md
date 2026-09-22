@@ -142,10 +142,23 @@ Boot/lifecycle:
   Console commands: `P` = radio pin re-probe, `D` = toggle OLED driver,
   `V` = print every demodded packet as `rawpkt` (10/s), `R [step]` = park
   the sweep on a step (`R` alone resumes; steps are numbered 0..N-1 as
-  listed in the `dwell` lines). The T3-S3 BOOT button (GPIO0) held ≥1.5 s
-  also toggles the OLED driver. Manual toggles pause `stats` for ~1.5 s
-  (splash); while parked, dwell extensions still apply and the unlock path
-  re-enters at the parked step.
+  listed in the `dwell` lines), `U <phrase>` = set the ELRS bind phrase
+  (rest of the line, spaces allowed; persisted; the derived UID is printed
+  as `{"t":"event","what":"uid","uid":"xx xx ..."}`). The T3-S3 BOOT button
+  (GPIO0) held ≥1.5 s also toggles the OLED driver. Manual toggles pause
+  `stats` for ~1.5 s (splash); while parked, dwell extensions still apply
+  and the unlock path re-enters at the parked step.
+
+## FLRC rates
+
+Dwell labels `FLRC 1000Hz`, `DVDA 500Hz`, `DVDA 250Hz` (single polarity —
+ELRS ignores InvertIQ for FLRC) use the UID-derived 32-bit sync word and a
+3-byte radio CRC seeded with `OtaCrcInitializer`, both from the bind
+phrase. FLRC packets have NO ELRS software CRC: on FLRC dwells `crc_ok`
+counts radio-validated packets, and a classified SYNC prints
+`{"t":"event","what":"flrc_sync","uid_pkt":"...","uid_phrase":"...","match":0|1}`
+— `match:1` when the packet's UID tail agrees with the phrase-derived UID.
+A wrong phrase yields silence on FLRC dwells (radio CRC rejects everything).
 
 ## Notes for the dashboard integration
 
