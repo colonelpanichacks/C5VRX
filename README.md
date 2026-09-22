@@ -31,6 +31,10 @@ grayscale video preview over USB to a phone-friendly Flask dashboard.
 - **CSV detection log** — every detection episode (channel, band, frequency,
   level stats, duration, video-sync flags) is appended to
   `tools/detections.csv`; the dashboard's EXPORT CSV button downloads it.
+- **Companion: ELRS sniffer (2.4 GHz)** — a standalone LilyGo SX1280
+  sub-project that passively decodes ExpressLRS control links (stick
+  channels, telemetry, link stats) shown on its own display and as JSON for
+  the same Flask dashboard; see [elrs-sniffer/](elrs-sniffer/README.md).
 
 ## Hardware
 

@@ -1,0 +1,5 @@
+.pio/
+.vscode/
+*.o
+test/host/test_parser
+test/host/dbg
