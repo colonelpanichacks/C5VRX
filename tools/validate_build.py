@@ -29,13 +29,16 @@ def read(path):
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-# ---- fm.bsasm checks ----
+# ---- BitScrambler program checks ----
+# Two programs: the proven Phase5 default (fm.bsasm) and the opt-in
+# Trajectory v2 weak-signal experiment (fm_traj.bsasm, runtime A/B 'T').
 bsasm_files = list(MAIN.glob("*.bsasm"))
-check("exactly one .bsasm file", len(bsasm_files) == 1,
+check("fm.bsasm + fm_traj.bsasm present",
+      {f.name for f in bsasm_files} == {"fm.bsasm", "fm_traj.bsasm"},
       f"found {[f.name for f in bsasm_files]}")
 
 if bsasm_files:
-    bsasm = read(bsasm_files[0])
+    bsasm = "\n".join(read(f) for f in bsasm_files)
     check("fm.bsasm: cfg eof_on downstream", "cfg eof_on downstream" in bsasm)
     check("fm.bsasm: cfg trailing_bytes 0", "cfg trailing_bytes 0" in bsasm)
     check("fm.bsasm: cfg prefetch true", "cfg prefetch true" in bsasm)
@@ -106,13 +109,14 @@ check("no periodic telemetry or timer tasks in production",
       "telemetry_task" not in all_c and "hw_diag_task" not in all_c,
       "periodic tasks must not be present")
 
-# One BS program
+# BitScrambler programs (proven default + opt-in trajectory A/B)
 cmake_main = read(MAIN / "CMakeLists.txt")
 bs_srcs = re.findall(r'target_bitscrambler_add_src\("([^"]+)"\)', cmake_main)
-check("exactly one BitScrambler program in CMakeLists",
-      len(bs_srcs) == 1, f"found: {bs_srcs}")
+check("two BitScrambler programs in CMakeLists",
+      len(bs_srcs) == 2, f"found: {bs_srcs}")
 if bs_srcs:
-    check("BitScrambler program is fm.bsasm", bs_srcs[0] == "fm.bsasm")
+    check("BitScrambler programs are fm.bsasm + fm_traj.bsasm",
+          set(bs_srcs) == {"fm.bsasm", "fm_traj.bsasm"})
 
 # ---- Summary ----
 print(f"\n{'='*50}")

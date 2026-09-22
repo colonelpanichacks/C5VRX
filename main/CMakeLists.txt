@@ -30,5 +30,7 @@ idf_component_register(
         esp_hw_support
 )
 
-# One BitScrambler program: the proven Phase5 FM demodulator.
+# BitScrambler programs: proven Phase5 default + opt-in Trajectory v2
+# weak-signal experiment (runtime A/B via console 'T').
 target_bitscrambler_add_src("fm.bsasm")
+target_bitscrambler_add_src("fm_traj.bsasm")
