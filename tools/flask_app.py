@@ -970,15 +970,20 @@ PAGE = """<!DOCTYPE html>
                box-shadow:0 0 8px rgba(49,200,255,.5); }
   .bandrow { color:var(--amb); font-size:.58rem; letter-spacing:.12em; margin:4px 0 1px; }
   /* Controls live inside the channel card: a 3-up grid row exactly the
-   * grid's width, every button the same height; two tidy rows on narrow. */
-  .cardbar { display:grid; grid-template-columns:repeat(3,1fr); gap:5px;
+   * grid's width, every button the same generous height, each with a real
+   * iOS-style switch (26px track, sliding knob) and a readable label. */
+  .cardbar { display:grid; grid-template-columns:repeat(3,1fr); gap:6px;
              margin-top:8px; }
-  .cardbar .tg { box-sizing:border-box; height:26px; min-height:0;
-                 padding:2px 1px; font-size:.52rem; gap:3px;
-                 letter-spacing:.04em; white-space:nowrap; }
-  .cardbar .tg .sw { width:14px; height:8px; }
-  .cardbar .tg .sw::after { width:6px; height:6px; top:1px; left:1px; }
-  .cardbar .tg.on .sw::after { left:7px; }
+  .cardbar .tg { box-sizing:border-box; height:38px; min-height:0;
+                 padding:2px 4px; font-size:.68rem; gap:5px;
+                 letter-spacing:.05em; white-space:nowrap;
+                 transition:border-color .2s, color .2s, box-shadow .2s; }
+  .cardbar .tg .sw { width:26px; height:14px; border-radius:8px;
+                     transition:border-color .2s, box-shadow .2s; }
+  .cardbar .tg .sw::after { width:10px; height:10px; top:1px; left:1px;
+                            transition:left .2s ease, background .2s; }
+  .cardbar .tg.on { box-shadow:0 0 10px rgba(57,255,106,.25); }
+  .cardbar .tg.on .sw::after { left:13px; }
   .tg { font:inherit; font-size:.6rem; letter-spacing:.08em; display:flex;
         align-items:center; justify-content:center; gap:6px; padding:7px 2px;
         min-height:34px; min-width:0; background:var(--panel); color:var(--dim);
@@ -1099,6 +1104,41 @@ PAGE = """<!DOCTYPE html>
             font-size:.6rem; }
   .dcgrid i { font-style:normal; color:var(--dim); font-size:.56rem;
               margin-right:5px; }
+  /* Detections data-table dressing: row accents by episode type, band
+     chips, split timestamps, right-aligned numerics, level spark strip. */
+  #dettable tr.vs { background:rgba(57,255,106,.05); }
+  #dettable tr.vs td:first-child { border-left:2px solid var(--grn); }
+  #dettable tr.ev { background:rgba(255,176,0,.04); }
+  #dettable tr.ev td:first-child { border-left:2px solid var(--amb); }
+  #dettable td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  #dettable th.sps { min-width:64px; }
+  .dt-d { color:var(--dim); }
+  .dt-t { color:var(--txt); }
+  .bchip { display:inline-block; min-width:22px; text-align:center;
+           padding:0 4px; border-radius:3px; border:1px solid;
+           font-size:.58rem; letter-spacing:.05em; }
+  .bchip.bR { color:#ffb000; border-color:#ffb000; }
+  .bchip.bA { color:#39ff6a; border-color:#39ff6a; }
+  .bchip.bB { color:#31c8ff; border-color:#31c8ff; }
+  .bchip.bE { color:#c96bff; border-color:#c96bff; }
+  .bchip.bF { color:#ff8c3a; border-color:#ff8c3a; }
+  .bchip.bL { color:#8a958a; border-color:#8a958a; }
+  .ltb { padding:0 4px; border-radius:3px; border:1px solid var(--dim);
+         color:var(--dim); font-size:.56rem; letter-spacing:.05em; }
+  .ltb.scanner { color:var(--grn); border-color:var(--grn); }
+  .ltb.manual { color:#31c8ff; border-color:#31c8ff; }
+  .ltb.event { color:var(--amb); border-color:var(--amb); }
+  .spark { display:inline-block; position:relative; width:60px; height:14px;
+           background:#050805; border:1px solid rgba(51,80,47,.5);
+           border-radius:2px; vertical-align:middle; }
+  .sp-range { position:absolute; top:3px; bottom:3px; border-radius:1px;
+              background:linear-gradient(90deg,#1a5f2a,#39ff6a); }
+  .sp-mean { position:absolute; top:1px; bottom:1px; width:2px;
+             margin-left:-1px; background:#e8ffe8; }
+  .detcard.vs { border-left:2px solid var(--grn);
+                background:rgba(57,255,106,.05); }
+  .detcard.ev { border-left:2px solid var(--amb); }
+  .dcspark { margin:2px 0 3px; }
   /* ============ mobile / narrow layout (<=899px) ============
      The 3-column card row un-nests (.col -> display:contents) into a
      2-column grid: video spans the left (tap toggles a fixed full-viewport
@@ -1133,7 +1173,7 @@ PAGE = """<!DOCTYPE html>
     .ch b { font-size:.58rem; }
     .bandrow { margin:1px 0 0; font-size:.58rem; }
     .cardbar { grid-template-columns:repeat(3,1fr); gap:4px; margin-top:6px; }
-    .cardbar .tg { height:36px; font-size:.56rem; letter-spacing:.02em; }
+    .cardbar .tg { height:36px; font-size:.64rem; letter-spacing:.02em; gap:4px; }
     .screen { cursor:pointer; }
     .vidcard.zoom { position:fixed; inset:0; z-index:20; border-radius:0; }
     .botsplit { flex:0 0 auto; flex-direction:column; height:34dvh;
@@ -1233,7 +1273,7 @@ PAGE = """<!DOCTYPE html>
 <div id="swrap">
 <canvas id="wfall"></canvas>
 <canvas id="fspec"></canvas>
-<div id="fstitle">CHANNEL POWER</div>
+<div id="fstitle">CHAN SPECTRUM</div>
 <label id="holdw" title="peak-hold trace on the power plot"><input type="checkbox" id="hold" checked>HOLD</label>
 </div>
 </div>
@@ -1395,8 +1435,32 @@ const DETCOLS = [
 ];
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
                           .replace(/>/g, '&gt;');
-const hhmmss = v => (typeof v === 'string' && v.length >= 19 && v.charAt(10) === 'T')
-                    ? v.slice(11, 19) : v;
+const fmtDur = v => {
+  const s = Math.round(Number(v) || 0);
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+};
+const fmtISO = v => (typeof v === 'string' && v.length >= 19 && v.charAt(10) === 'T')
+  ? '<span class="dt-d">' + esc(v.slice(0, 10)) + '</span> <span class="dt-t">' +
+    esc(v.slice(11, 19)) + '</span>' : esc(v);
+const bchip = (band, name) =>
+  '<span class="bchip b' + esc(band || '?') + '">' + esc(name) + '</span>';
+/* Mini level strip: min..peak range bar with a mean tick, on the graph's
+   fixed 0..45 dB scale. '' when the episode has no level samples. */
+const sparkSpan = r => {
+  const lo = r.level_min_db, hi = r.level_peak_db, mean = r.level_mean_db;
+  if (typeof lo !== 'number' || typeof hi !== 'number') return '';
+  const X = v => Math.max(0, Math.min(100, v / 45 * 100));
+  const left = X(lo), width = Math.max(2, X(hi) - left);
+  return '<span class="spark">' +
+    '<span class="sp-range" style="left:' + left.toFixed(1) +
+      '%;width:' + width.toFixed(1) + '%"></span>' +
+    (typeof mean === 'number'
+      ? '<span class="sp-mean" style="left:' + X(mean).toFixed(1) + '%"></span>'
+      : '') + '</span>';
+};
+/* Row accent class: video-synced episodes green, standalone events amber. */
+const detRowCls = r => r.video_sync === 1 ? 'vs'
+                     : r.lock_type === 'event' ? 'ev' : '';
 /* Match a detection row to its screenshot: capture names are
    <sanitized episode start>__<HHMMSS>.jpg, sanitized the same way
    (YYYY-MM-DDTHH:MM:SS -> dashes). */
@@ -1416,56 +1480,79 @@ function renderDets(d) {
   document.getElementById('dettotal').textContent = (d.total || 0) + ' ROWS';
   // Skip columns the CSV lacks entirely (or that are blank on every row).
   const cols = DETCOLS.filter(c => rows.some(r => r[c[0]] !== undefined && r[c[0]] !== ''));
+  if (rows.some(r => typeof r.level_peak_db === 'number')) {
+    const li = cols.findIndex(c => c[0] === 'level_min_db');
+    cols.splice(li >= 0 ? li + 1 : cols.length, 0, ['spark', 'LEVEL']);
+  }
   if (rows.some(r => shotFor(r, shots))) cols.push(['shot', 'SHOT']);
   if (window.innerWidth <= 899) { renderDetCards(rows, cols, shots); return; }
   const sig = cols.map(c => c[0]).join(',');
   if (sig !== detSig) {
     detSig = sig;
     document.getElementById('dethead').innerHTML =
-      '<tr>' + cols.map(c => '<th>' + c[1] + '</th>').join('') + '</tr>';
+      '<tr>' + cols.map(c => '<th' + (c[0] === 'spark' ? ' class="sps"' : '') + '>' +
+                             c[1] + '</th>').join('') + '</tr>';
   }
-  document.getElementById('detbody').innerHTML = rows.map(r =>
-    '<tr>' + cols.map(c => {
+  document.getElementById('detbody').innerHTML = rows.map(r => {
+    const rcls = detRowCls(r);
+    return '<tr' + (rcls ? ' class="' + rcls + '"' : '') + '>' + cols.map(c => {
       const k = c[0], v = r[k];
       if (k === 'shot') {
         const nm = shotFor(r, shots);
         return nm ? '<td><img class="shotth" src="/shots/' + nm + '"></td>'
                   : '<td class="na">--</td>';
       }
-      if (v === undefined || v === '') return '<td class="na">--</td>';
-      if (k === 'channel') return '<td class="dch">' + esc(v) + '</td>';
+      if (k === 'spark') { const sp = sparkSpan(r); return sp ? '<td>' + sp + '</td>'
+                                                              : '<td class="na">--</td>'; }
       if (k === 'video_sync')
-        return '<td><span class="vsb' + (v === 1 ? ' y' : '') + '">' +
-               (v === 1 ? 'YES' : 'NO') + '</span></td>';
+        return v === 1 ? '<td><span class="vsb y">YES</span></td>'
+                       : '<td class="na">--</td>';
+      if (v === undefined || v === '') return '<td class="na">--</td>';
+      if (k === 'channel') return '<td>' + bchip(r.band, v) + '</td>';
+      if (k === 'start_iso' || k === 'end_iso')
+        return '<td class="ts">' + fmtISO(v) + '</td>';
+      if (k === 'duration_s') return '<td class="num">' + esc(fmtDur(v)) + '</td>';
+      if (k === 'freq_mhz')
+        return '<td class="num">' + (typeof v === 'number' ? v.toFixed(1) : esc(v)) + '</td>';
+      if (k === 'level_peak_db' || k === 'level_mean_db' || k === 'level_min_db')
+        return '<td class="num">' + esc(v) + '</td>';
+      if (k === 'lock_type')
+        return '<td><span class="ltb ' + esc(v) + '">' + esc(v) + '</span></td>';
       return '<td>' + esc(v) + '</td>';
-    }).join('') + '</tr>').join('');
+    }).join('') + '</tr>';
+  }).join('');
 }
-/* Mobile: one compact card per row instead of the wide table. Title line
-   is channel + start HH:MM:SS + duration + sync badge; everything else
-   stacks as label:value pairs in a 2-column grid. */
+/* Mobile: one compact card per row instead of the wide table, same visual
+   language (accent bar, band chip, spark strip). Title line is channel
+   chip + timestamp + duration + shot + sync; the rest stacks as
+   label:value pairs in a 2-column grid. */
 function renderDetCards(rows, cols, shots) {
   const TITLE = ['channel', 'start_iso', 'duration_s', 'video_sync', 'shot'];
   document.getElementById('detcards').innerHTML = rows.map(r => {
     let h = '<div class="dcline">';
-    if (r.channel !== undefined && r.channel !== '')
-      h += '<b class="dch">' + esc(r.channel) + '</b>';
-    if (r.start_iso) h += '<span class="dcts">' + esc(hhmmss(r.start_iso)) + '</span>';
+    if (r.channel !== undefined && r.channel !== '') h += bchip(r.band, r.channel);
+    if (r.start_iso) h += '<span class="dcts">' + fmtISO(r.start_iso) + '</span>';
     if (r.duration_s !== undefined && r.duration_s !== '')
-      h += '<span class="dcdur">' + esc(r.duration_s) + 's</span>';
+      h += '<span class="dcdur">' + esc(fmtDur(r.duration_s)) + '</span>';
     const nm = shotFor(r, shots);
     if (nm) h += '<img class="shotth" src="/shots/' + nm + '">';
-    if (r.video_sync === 0 || r.video_sync === 1)
-      h += '<span class="vsb' + (r.video_sync === 1 ? ' y' : '') + '">' +
-           (r.video_sync === 1 ? 'YES' : 'NO') + '</span>';
-    h += '</div><div class="dcgrid">';
+    if (r.video_sync === 1) h += '<span class="vsb y">YES</span>';
+    h += '</div>';
+    const sp = sparkSpan(r);
+    if (sp) h += '<div class="dcspark">' + sp + '</div>';
+    h += '<div class="dcgrid">';
     cols.forEach(c => {
-      if (TITLE.indexOf(c[0]) >= 0) return;
+      if (TITLE.indexOf(c[0]) >= 0 || c[0] === 'spark') return;
       const v = r[c[0]];
       if (v === undefined || v === '') return;
-      h += '<span><i>' + c[1] + '</i>' +
-           esc(c[0] === 'end_iso' ? hhmmss(v) : v) + '</span>';
+      let val;
+      if (c[0] === 'end_iso') val = fmtISO(v);
+      else if (c[0] === 'freq_mhz' && typeof v === 'number') val = v.toFixed(1);
+      else if (c[0] === 'lock_type') val = '<span class="ltb ' + esc(v) + '">' + esc(v) + '</span>';
+      else val = esc(v);
+      h += '<span><i>' + c[1] + '</i>' + val + '</span>';
     });
-    return '<div class="detcard">' + h + '</div></div>';
+    return '<div class="detcard ' + detRowCls(r) + '">' + h + '</div></div>';
   }).join('');
 }
 document.querySelector('.detwrap').addEventListener('click', e => {
@@ -1603,7 +1690,7 @@ function draw() {
   mc.fillRect(sx(peak) - 1, h * .2, 2 * devicePixelRatio, h * .75);
 
   /* 48CH PWR: one bar per channel from [SWEEP] hop data (same sweep P
-     values as the big CHANNEL POWER panel). Bar height = P, auto-scaled;
+     values as the big CHAN SPECTRUM panel). Bar height = P, auto-scaled;
      band color-coded; current scanner position an amber glow, locked
      channel a bright outline, strongest channel a brighter green bar with
      its name lit. Every channel name is printed vertically under its bar
@@ -1961,8 +2048,11 @@ function draw() {
         wh = we.height = we.clientHeight * devicePixelRatio;
   const wcpt = we.clientWidth < 520 || we.clientHeight < 200;
   const wpadL = (wcpt ? 24 : 30) * devicePixelRatio, wpadR = 8 * devicePixelRatio;
-  const wpadT = (wcpt ? 18 : 20) * devicePixelRatio, wpadB = 26 * devicePixelRatio;
-  const wgw = ww - wpadL - wpadR, wgh = wh - wpadT - wpadB;
+  const wpadT = (wcpt ? 18 : 20) * devicePixelRatio;
+  const wgw = ww - wpadL - wpadR;
+  const wstag = wgw / Math.max(allF.length, 1) < 9 * devicePixelRatio;
+  const wpadB = (wstag ? 30 : 16) * devicePixelRatio;  // label strip below
+  const wgh = wh - wpadT - wpadB;
   const WX = f => wpadL + (f - F_LO) / (F_HI - F_LO) * wgw;
   if (wgw > 0 && wgh > 0) {
     if (wfOff.width !== wgw || wfOff.height !== wgh) {
@@ -2008,17 +2098,33 @@ function draw() {
                     8 * devicePixelRatio, 2 * devicePixelRatio);
       }
     }
+    /* Dedicated label strip below the plot: every channel name at its
+       frequency position, rotated vertical, fully inside the strip (never
+       over data). Two staggered rows when the per-channel pitch is too
+       tight; the active channel's label is lit. */
+    wc.fillStyle = '#050805';
+    wc.fillRect(wpadL, wpadT + wgh, wgw, wh - wpadT - wgh);
+    wc.strokeStyle = '#1a2f1a'; wc.lineWidth = 1;
+    wc.beginPath(); wc.moveTo(wpadL, wpadT + wgh + 0.5);
+    wc.lineTo(ww - wpadR, wpadT + wgh + 0.5); wc.stroke();
     wc.font = (9 * devicePixelRatio) + 'px monospace';
-    wc.fillStyle = '#4a6a4f'; wc.textAlign = 'left'; wc.textBaseline = 'middle';
-    const lstep = wcpt ? 2 : 1;                    // cramped: label every 2nd
+    wc.textAlign = 'left'; wc.textBaseline = 'middle';
+    const curCh = S && S.telemetry.channel;
     allF.forEach((e, i) => {
-      if (i % lstep) return;
+      const ly = wpadT + wgh + (wstag ? (i % 2) * 14 + 14 : 14) * devicePixelRatio;
       wc.save();
-      wc.translate(WX(e.freq_mhz), wpadT + wgh + 3 * devicePixelRatio);
+      wc.translate(WX(e.freq_mhz), ly);
       wc.rotate(-Math.PI / 2);
+      if (e.name === curCh) {
+        wc.fillStyle = '#e8ffe8'; wc.shadowColor = '#39ff6a';
+        wc.shadowBlur = 5 * devicePixelRatio;
+      } else {
+        wc.fillStyle = '#4a6a4f';
+      }
       wc.fillText(e.name, 0, 0);
       wc.restore();
     });
+    wc.shadowBlur = 0;
   }
   } catch (e) { /* one bad frame must not kill the loop */ }
   finally { requestAnimationFrame(draw); }
