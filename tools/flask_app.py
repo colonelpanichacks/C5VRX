@@ -6,7 +6,9 @@ the USB Serial/JTAG console; legacy 128x96 whole frames still accepted) as
 an MJPEG stream any browser can watch, with a
 HUD-style dashboard: animated carrier-level meter with peak-hold, Q_phase
 and gain bars, a 60 s level-history graph, a 48-channel direct-tune grid,
-and console-key control buttons. Mobile-friendly, so an iPhone on the LAN
+console-key control buttons, and an ELRS sniffer card + full tab
+(auto-discovered LilyGo T3-S3 running elrs-sniffer/, JSON lines at 460800
+on its own USB port). Mobile-friendly, so an iPhone on the LAN
 can drive the receiver. No external JS/CSS - works offline on a LAN.
 
 Dependencies (pip3 install --user ... if missing):
@@ -899,6 +901,226 @@ class SerialManager(threading.Thread):
             pass
 
 
+# ----- ELRS sniffer (second serial port, elrs-sniffer/) -----
+#
+# A LilyGo T3-S3 running the elrs-sniffer firmware streams one JSON object
+# per line at 460800 8N1 on its own /dev/cu.usbmodem* node (contract:
+# elrs-sniffer/PROTOCOL.md, v0.2.x). ElrsManager auto-discovers it among
+# the usbmodem ports the main board reader has NOT claimed, identifying it
+# by content: a line that UTF-8 decodes, starts with '{' and parses as a
+# JSON object with a string "t" key. The OUI-SPY board only emits binary
+# C5VRX-magic packets and "[TAG]" console text, so it can never match.
+# The thread mirrors the main reader's reconnect/backoff shape but is
+# fully independent: own lock, own port, read-only (it never writes to
+# the dongle), and never touches STATE or the video/frame path.
+
+ELRS_BAUD = 460800
+ELRS_SNIFF_S = 2.5            # discovery window per candidate port
+ELRS_MAX_EVENTS = 8           # last_events ring exposed via /api/state
+ELRS_TLM_TYPES = ("gps", "batt", "atti", "fm", "tlm", "linkstats", "sync")
+
+
+class ElrsState:
+    """Latest ELRS link state + telemetry, mutated only by ElrsManager."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.connected = False
+        self.port = None
+        self.radio = 0
+        self.link_lock = 0
+        self.rate = "-"
+        self.iq = "-"
+        self.rssi = None
+        self.snr10 = None
+        self.pps = 0
+        self.lq_permille = 0
+        self.uid = None
+        self.arm = 0
+        self.ch = [0, 0, 0, 0]
+        self.stats_time = None  # monotonic of the last stats line
+        self.tlm = {}           # type -> (payload dict, monotonic)
+        self.events = []        # newest-last [(monotonic, seq, payload)]
+        self.event_seq = 0
+
+    def update(self, obj: dict) -> None:
+        now = time.monotonic()
+        t = obj.get("t")
+        with self.lock:
+            if t == "stats":
+                self.radio = obj.get("radio", 1)
+                self.link_lock = obj.get("lock", 0)
+                self.rate = obj.get("rate", "-")
+                self.iq = obj.get("iq", "-")
+                self.rssi = obj.get("rssi")
+                self.snr10 = obj.get("snr10")
+                self.pps = obj.get("pps", 0)
+                self.lq_permille = obj.get("lq_permille", 0)
+                if obj.get("uid"):
+                    self.uid = obj["uid"]
+                self.arm = obj.get("arm", 0)
+                ch = obj.get("ch")
+                if isinstance(ch, list) and len(ch) == 4:
+                    self.ch = [int(c) for c in ch]
+                self.stats_time = now
+            else:
+                if t in ELRS_TLM_TYPES:
+                    self.tlm[t] = (obj, now)
+                    if t == "sync" and obj.get("uid"):
+                        self.uid = obj["uid"]
+                if t:
+                    self.event_seq += 1
+                    self.events.append((now, self.event_seq, obj))
+                    del self.events[:-ELRS_MAX_EVENTS]
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        with self.lock:
+            return {
+                "connected": self.connected,
+                "port": self.port,
+                "radio": self.radio,
+                "lock": self.link_lock,
+                "rate": self.rate,
+                "iq": self.iq,
+                "rssi": self.rssi,
+                "snr": None if self.snr10 is None else round(self.snr10 / 10.0, 1),
+                "pps": self.pps,
+                "lq": round(self.lq_permille / 10.0, 1),
+                "uid": self.uid,
+                "arm": self.arm,
+                "ch": list(self.ch),
+                "stats_age_s": (None if self.stats_time is None
+                                else round(now - self.stats_time, 1)),
+                "tlm": {k: {"age_s": round(now - ts, 1),
+                            **{kk: vv for kk, vv in v.items() if kk != "t"}}
+                        for k, (v, ts) in self.tlm.items()},
+                "last_events": [{"seq": seq, "age_s": round(now - ts, 1), **ev}
+                                for ts, seq, ev in self.events[-ELRS_MAX_EVENTS:]],
+            }
+
+
+ELRS = ElrsState()
+
+
+class ElrsManager(threading.Thread):
+    """Discovers and reads the ELRS sniffer dongle (see notes above)."""
+
+    def __init__(self, exclude: str) -> None:
+        super().__init__(daemon=True)
+        self.exclude = exclude    # main board's configured port
+        self.ser = None
+        self.stop_event = threading.Event()
+
+    @staticmethod
+    def is_elrs_line(raw: bytes) -> bool:
+        """Discovery discriminator: True only for a protocol JSON line
+        (UTF-8, '{...}', object with a string "t" key)."""
+        try:
+            text = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return False
+        if not text.startswith("{"):
+            return False
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            return False
+        return isinstance(obj, dict) and isinstance(obj.get("t"), str)
+
+    def _candidates(self) -> list:
+        with STATE.lock:
+            main_port = STATE.serial_port
+        return [p for p in sorted(glob.glob("/dev/cu.usbmodem*"))
+                if p != main_port and p != self.exclude]
+
+    def _discover(self):
+        """Sniff each unclaimed usbmodem port for a protocol line; return
+        the open serial port of the ELRS dongle, or None."""
+        for port in self._candidates():
+            try:
+                ser = serial.Serial(port, ELRS_BAUD, timeout=0.2)
+            except (serial.SerialException, OSError):
+                continue
+            try:
+                deadline = time.monotonic() + ELRS_SNIFF_S
+                buf = b""
+                while time.monotonic() < deadline:
+                    chunk = ser.read(1024)
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        if self.is_elrs_line(line):
+                            print(f"[elrs] identified sniffer on {port}")
+                            return ser
+            except (serial.SerialException, OSError):
+                pass
+            try:
+                ser.close()
+            except OSError:
+                pass
+        return None
+
+    def run(self) -> None:
+        backoff = 0.5
+        buf = b""
+        while not self.stop_event.is_set():
+            try:
+                if self.ser is None:
+                    ser = self._discover()
+                    if ser is None:
+                        self.stop_event.wait(min(backoff, 3.0))
+                        backoff = min(backoff * 2.0, 5.0)
+                        continue
+                    backoff = 0.5
+                    buf = b""
+                    self.ser = ser
+                    with ELRS.lock:
+                        ELRS.connected = True
+                        ELRS.port = ser.port
+                    print(f"[elrs] connected to {ser.port}")
+                chunk = self.ser.read(1024)
+                if not chunk:
+                    continue
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    # Protocol: skip any line that does not begin with '{'
+                    # (boot banners, fault text); ignore unknown keys.
+                    if not line.startswith(b"{"):
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict):
+                        ELRS.update(obj)
+            except (serial.SerialException, OSError) as exc:
+                print(f"[elrs] lost: {exc}; rediscovering in {backoff:.1f}s")
+                try:
+                    if self.ser is not None:
+                        self.ser.close()
+                except OSError:
+                    pass
+                self.ser = None
+                buf = b""
+                with ELRS.lock:
+                    ELRS.connected = False
+                self.stop_event.wait(backoff)
+                backoff = min(backoff * 2.0, 5.0)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        try:
+            if self.ser is not None:
+                self.ser.close()
+        except OSError:
+            pass
+
+
 def make_jpeg(image: Image.Image) -> bytes:
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=JPEG_QUALITY)
@@ -1123,12 +1345,12 @@ PAGE = """<!DOCTYPE html>
   .stats .k { color:var(--dim); }
   .botsplit { flex:1 1 0; min-height:45dvh; display:flex; width:100vw;
               margin:5px 0 0 calc(50% - 50vw); }
-  #gwrap { flex:11 1 0; min-width:0; position:relative;
+  #gwrap { flex:1 1 0; min-width:0; position:relative;
            border-top:1px solid var(--dim);
            background:#071007;
            background-image:repeating-linear-gradient(90deg,rgba(57,255,106,.04) 0 1px,transparent 1px 24px),
                             repeating-linear-gradient(0deg,rgba(57,255,106,.04) 0 1px,transparent 1px 24px); }
-  #swrap { flex:9 1 0; min-width:0; position:relative;
+  #swrap { flex:1 1 0; min-width:0; position:relative;
            border-top:1px solid var(--dim); border-left:1px solid var(--dim);
            background:#071007;
            background-image:repeating-linear-gradient(90deg,rgba(57,255,106,.04) 0 1px,transparent 1px 24px),
@@ -1165,6 +1387,83 @@ PAGE = """<!DOCTYPE html>
   #gcur.lock b { color:var(--grn); text-shadow:0 0 8px rgba(57,255,106,.8); }
   #gcur.scan b { color:var(--amb); text-shadow:0 0 8px rgba(255,176,0,.7);
                  animation:pulse 1s infinite; }
+  /* ELRS card (third bottom card) + ELRS tab: same grid backdrop, dense. */
+  #ewrap { flex:1 1 0; min-width:0; position:relative; overflow:hidden;
+           border-top:1px solid var(--dim); border-left:1px solid var(--dim);
+           background:#071007; padding:24px 12px 6px;
+           display:flex; flex-direction:column; gap:4px;
+           background-image:repeating-linear-gradient(90deg,rgba(57,255,106,.04) 0 1px,transparent 1px 24px),
+                            repeating-linear-gradient(0deg,rgba(57,255,106,.04) 0 1px,transparent 1px 24px); }
+  #etitle { position:absolute; top:7px; left:14px; font-size:.62rem;
+            letter-spacing:.18em; color:var(--dim); pointer-events:none; }
+  #edot { display:inline-block; width:8px; height:8px; border-radius:50%;
+          background:#4a5a4a; vertical-align:1px; }
+  #edot.lock { background:var(--grn); box-shadow:0 0 8px rgba(57,255,106,.8); }
+  #edot.sweep { background:var(--amb); box-shadow:0 0 8px rgba(255,176,0,.7);
+                animation:pulse 1s infinite; }
+  #ebig { display:flex; gap:14px; align-items:baseline; }
+  .eb .ek, .egauge .ek { color:var(--dim); font-size:.56rem; letter-spacing:.1em; }
+  .eb b { font-size:1.3rem; color:var(--txt); margin:0 3px; }
+  .eb .eu, .egauge .eu { color:var(--dim); font-size:.54rem; }
+  #erate { font-size:.6rem; color:var(--txt); letter-spacing:.06em; }
+  #eintel { font-size:.6rem; color:var(--amb); letter-spacing:.04em;
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #euid { font-size:.56rem; color:#31c8ff; border:1px solid #31c8ff;
+          border-radius:3px; padding:0 5px; align-self:flex-start;
+          letter-spacing:.08em; }
+  #etick { flex:1 1 0; min-height:0; overflow:hidden; font-size:.54rem;
+           line-height:1.5; color:var(--dim); }
+  #etick .evl { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sticks { display:flex; gap:6px; }
+  .stk { flex:1 1 0; min-width:0; }
+  .stk i { font-style:normal; color:var(--dim); font-size:.5rem;
+           letter-spacing:.08em; }
+  .stk .stkbar { position:relative; height:8px; background:#0d160d;
+                 border:1px solid var(--dim); border-radius:2px; }
+  .stk .stkbar::after { content:""; position:absolute; left:50%; top:0;
+                        bottom:0; width:1px; background:var(--dim); }
+  .stkfill { position:absolute; top:1px; bottom:1px; background:var(--grn);
+             border-radius:1px; }
+  .stk.dim .stkfill { background:#4a5a4a; }
+  .stk.dim i, .stk.dim b { opacity:.5; }
+  .stk b { font-size:.5rem; color:var(--txt); font-weight:normal; }
+  .evl .etag { display:inline-block; min-width:34px; margin-right:5px; }
+  .evl.k-sync .etag { color:#31c8ff; }
+  .evl.k-lock .etag { color:var(--grn); }
+  .evl.k-unlock .etag, .evl.k-error .etag { color:var(--red); }
+  .evl.k-gps .etag, .evl.k-batt .etag { color:var(--amb); }
+  .evl .eage { color:var(--dim); margin-left:5px; }
+  /* ELRS tab: gauges on top, sparkline middle, intel + log bottom. */
+  #view-elrs { flex:1 1 0; min-height:0; display:none; flex-direction:column;
+               background:var(--panel); border:1px solid var(--dim);
+               border-radius:6px; overflow:hidden;
+               background-image:repeating-linear-gradient(90deg,rgba(57,255,106,.03) 0 1px,transparent 1px 24px),
+                                repeating-linear-gradient(0deg,rgba(57,255,106,.03) 0 1px,transparent 1px 24px); }
+  .etop { flex:0 0 auto; display:flex; align-items:center; gap:22px;
+          flex-wrap:wrap; padding:14px 18px; border-bottom:1px solid var(--dim); }
+  .egauge { text-align:center; }
+  .egauge b { display:block; font-size:1.9rem; color:var(--txt); }
+  #xemeta { font-size:.62rem; color:var(--txt); letter-spacing:.06em;
+            line-height:1.7; }
+  #xemeta .k { color:var(--dim); }
+  .sticks.big { flex:1 1 220px; max-width:420px; }
+  .sticks.big .stk .stkbar { height:14px; }
+  .sticks.big .stk i, .sticks.big .stk b { font-size:.56rem; }
+  .emid { flex:1 1 0; min-height:80px; position:relative;
+          border-bottom:1px solid var(--dim); }
+  #espark { position:absolute; inset:0; width:100%; height:100%; }
+  .esptitle { position:absolute; top:6px; left:14px; font-size:.58rem;
+              letter-spacing:.16em; color:var(--dim); pointer-events:none; }
+  .ebot { flex:0 0 auto; display:flex; max-height:38%;
+          border-top:none; }
+  #eintelpanel { flex:1 1 0; min-width:0; padding:8px 14px; font-size:.64rem;
+                 line-height:1.7; border-right:1px solid var(--dim);
+                 overflow:auto; }
+  #eintelpanel .k { color:var(--dim); display:inline-block; min-width:64px; }
+  #elog { flex:1 1 0; min-width:0; padding:8px 14px; font-size:.58rem;
+          line-height:1.6; overflow:auto; }
+  #elog .evl { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #elog .ets { color:var(--dim); margin-right:6px; }
   .tabs { flex:0 0 auto; display:flex; gap:6px; align-items:flex-end;
           justify-content:center; }
   .tab { font:inherit; font-size:.62rem; letter-spacing:.14em; padding:4px 14px;
@@ -1176,6 +1475,10 @@ PAGE = """<!DOCTYPE html>
             text-shadow:0 0 6px rgba(57,255,106,.6); }
   #detchip { font-size:.52rem; letter-spacing:.08em; color:var(--amb);
              border:1px solid var(--dim); border-radius:3px; padding:0 5px; }
+  #elrschip { font-size:.52rem; letter-spacing:.08em; color:var(--dim);
+              border:1px solid var(--dim); border-radius:3px; padding:0 5px; }
+  #elrschip.sweep { color:var(--amb); border-color:var(--amb); }
+  #elrschip.lock { color:var(--grn); border-color:var(--grn); }
   #view-dets { flex:1 1 0; min-height:0; display:none; flex-direction:column;
                gap:0; background:var(--panel); border:1px solid var(--dim);
                border-radius:6px; overflow:hidden;
@@ -1303,10 +1606,16 @@ PAGE = """<!DOCTYPE html>
     .cardbar .tg { height:36px; font-size:.64rem; letter-spacing:.02em; gap:4px; }
     .screen { cursor:pointer; }
     .vidcard.zoom { position:fixed; inset:0; z-index:20; border-radius:0; }
-    .botsplit { flex:0 0 auto; flex-direction:column; height:34dvh;
-                min-height:0; margin-top:6px; }
-    #gwrap, #swrap { flex:1 1 0; min-height:0; }
+    .botsplit { flex:0 0 auto; flex-direction:row; height:34dvh;
+                min-height:0; margin-top:6px; overflow-x:auto;
+                scroll-snap-type:x mandatory; }
+    #gwrap, #swrap, #ewrap { flex:0 0 86%; min-height:0;
+                             scroll-snap-align:center; }
     #swrap { border-left:none; }
+    .etop { gap:12px; padding:10px 12px; }
+    .egauge b { font-size:1.3rem; }
+    .ebot { flex-direction:column; max-height:none; overflow:auto; }
+    #eintelpanel { border-right:none; border-bottom:1px solid var(--dim); }
     #gtitle, #fstitle { font-size:.58rem; }
     #gcur b { font-size:1.1rem; }
     .detbar { gap:8px; padding:6px 8px; }
@@ -1328,7 +1637,8 @@ PAGE = """<!DOCTYPE html>
     .grow { grid-column:4; grid-row:1 / 3; }
     .grid48 { grid-template-columns:repeat(4,1fr); }  /* cells stay >=32px */
     .cardbar .tg .sw { display:none; }   /* .on/.pend border+color carry state */
-    .botsplit { flex-direction:row; height:32dvh; }
+    .botsplit { flex-direction:row; height:32dvh; overflow-x:visible; }
+    #gwrap, #swrap, #ewrap { flex:1 1 0; }
     #swrap { border-left:1px solid var(--dim); }
   }
   @media (max-width: 899px) and (orientation: portrait) and (max-height: 700px) {
@@ -1339,6 +1649,7 @@ PAGE = """<!DOCTYPE html>
 <body>
 <div class="tabs">
   <button id="tab-live" class="tab on" onclick="showTab('live')">LIVE <span id="detchip">detections: --</span></button>
+  <button id="tab-elrs" class="tab" onclick="showTab('elrs')">ELRS <span id="elrschip" class="off">--</span></button>
   <button id="tab-dets" class="tab" onclick="showTab('dets')">DETECTIONS</button>
 </div>
 <div class="top" id="view-live">
@@ -1403,7 +1714,34 @@ PAGE = """<!DOCTYPE html>
 <div id="fstitle">CHAN SPECTRUM</div>
 <label id="holdw" title="peak-hold trace on the power plot"><input type="checkbox" id="hold" checked>HOLD</label>
 </div>
+<div id="ewrap">
+  <div id="etitle">ELRS 2.4G <span id="edot"></span></div>
+  <div id="ebig">
+    <div class="eb"><span class="ek">RSSI</span><b id="erssi">--</b><span class="eu">dBm</span></div>
+    <div class="eb"><span class="ek">LQ</span><b id="elq">--</b><span class="eu">%</span></div>
+  </div>
+  <div id="erate">--</div>
+  <div id="esticks" class="sticks"></div>
+  <div id="eintel">--</div>
+  <div id="euid" style="display:none"></div>
+  <div id="etick"></div>
 </div>
+</div>
+</div>
+<div id="view-elrs">
+  <div class="etop">
+    <div class="egauge"><span class="ek">RSSI</span><b id="xerssi">--</b><span class="eu">dBm</span></div>
+    <div class="egauge"><span class="ek">LQ</span><b id="xelq">--</b><span class="eu">%</span></div>
+    <div class="egauge"><span class="ek">SNR</span><b id="xesnr">--</b><span class="eu">dB</span></div>
+    <div class="egauge"><span class="ek">PPS</span><b id="xepps">--</b><span class="eu">pkt/s</span></div>
+    <div id="xemeta"></div>
+    <div id="xesticks" class="sticks big"></div>
+  </div>
+  <div class="emid"><canvas id="espark"></canvas><div class="esptitle">RSSI / LQ // 60S</div></div>
+  <div class="ebot">
+    <div id="eintelpanel"></div>
+    <div id="elog"></div>
+  </div>
 </div>
 <div id="view-dets">
   <div class="detbar">
@@ -1543,18 +1881,20 @@ async function tune(idx, name) {
 }
 function toast(t) { document.getElementById('toast').textContent = t; }
 
-/* Tabs: LIVE dashboard vs the DETECTIONS log. No reload; the detections
-   table polls /api/detections on the same 500 ms cadence, but only while
-   its tab is active. Active tab persists in localStorage. */
-let tabLive = true;
+/* Tabs: LIVE dashboard, ELRS link page, DETECTIONS log. No reload; every
+   data source (main board poll, detections, ELRS via /api/state) keeps
+   updating on the 500 ms cadence regardless of the active tab — switching
+   only changes what is RENDERED (canvas work is skipped for hidden tabs).
+   Active tab persists in localStorage. */
+let tabCur = 'live';
 function showTab(t) {
-  tabLive = (t !== 'dets');
-  lsSet('c5_tab', tabLive ? 'live' : 'dets');
-  document.getElementById('view-live').style.display = tabLive ? '' : 'none';
-  document.getElementById('view-dets').style.display = tabLive ? 'none' : 'flex';
-  document.getElementById('tab-live').classList.toggle('on', tabLive);
-  document.getElementById('tab-dets').classList.toggle('on', !tabLive);
-  if (!tabLive) pollDets();
+  tabCur = (t === 'elrs' || t === 'dets') ? t : 'live';
+  lsSet('c5_tab', tabCur);
+  document.getElementById('view-live').style.display = tabCur === 'live' ? '' : 'none';
+  document.getElementById('view-elrs').style.display = tabCur === 'elrs' ? 'flex' : 'none';
+  document.getElementById('view-dets').style.display = tabCur === 'dets' ? 'flex' : 'none';
+  ['live', 'elrs', 'dets'].forEach(x =>
+    document.getElementById('tab-' + x).classList.toggle('on', x === tabCur));
 }
 const DETCOLS = [
   ['start_iso', 'START'], ['end_iso', 'END'], ['duration_s', 'DUR s'],
@@ -1879,6 +2219,179 @@ async function pollDets() {
   catch (e) { /* keep last good table */ }
 }
 
+/* ---- ELRS sniffer card + tab (data rides /api/state as s.elrs) ---- */
+const STICK_NAMES = ['R', 'P', 'T', 'Y'];
+/* Stick deflection: 988-2012 us -> -100..+100 % around 1500. 0 us (never
+   decoded) or lock=0 greys the bar: frozen/stale per the protocol notes. */
+const stickPct = us => us > 0 ? Math.max(-100, Math.min(100, (us - 1500) / 512 * 100)) : 0;
+function stickHtml(ch, lock) {
+  return STICK_NAMES.map((n, i) => {
+    const us = (ch && ch[i]) || 0, dim = !lock || !us;
+    const p = stickPct(us), l = p >= 0 ? 50 : 50 + p / 2, w = Math.abs(p) / 2;
+    return '<div class="stk' + (dim ? ' dim' : '') + '"><i>' + n + '</i>' +
+      '<div class="stkbar"><div class="stkfill" style="left:' + l.toFixed(1) +
+      '%;width:' + w.toFixed(1) + '%"></div></div><b>' + (us || '----') + '</b></div>';
+  }).join('');
+}
+/* Detail text per event type for the ticker/log (the colored tag carries
+   the type name). Unknown types degrade to a JSON shrug, per protocol. */
+function fmtEv(ev) {
+  switch (ev.t) {
+    case 'sync': return 'uid=' + (ev.uid || '?') + ' rateIdx=' + ev.rateIdx +
+                        (ev.ok ? '' : ' (crc fail)');
+    case 'lock': return 'link captured';
+    case 'unlock': return ev.why || '';
+    case 'linkstats': return 'lq=' + ev.lq + ' rssi=' + ev.rssi1 + '/' +
+                             ev.rssi2 + ' snr=' + ev.snr;
+    case 'gps': return (ev.lat_e7 / 1e7).toFixed(5) + ',' +
+                       (ev.lon_e7 / 1e7).toFixed(5) + ' ' + ev.sats + 'sat ' +
+                       (ev.spd_kmh10 / 10).toFixed(0) + 'km/h';
+    case 'batt': return (ev.v10 / 10).toFixed(1) + 'V ' +
+                        (ev.a10 / 10).toFixed(1) + 'A ' + ev.mah + 'mAh';
+    case 'atti': return 'p=' + (ev.p / 10000 * 57.3).toFixed(0) +
+                        ' r=' + (ev.r / 10000 * 57.3).toFixed(0) +
+                        ' y=' + (ev.y / 10000 * 57.3).toFixed(0);
+    case 'fm': return ev.m || '';
+    case 'dwell': return (ev.rate || '') + ' iq=' + (ev.iq || '?');
+    case 'tlm': return 'ft=' + ev.ft;
+    case 'boot': return 'v' + (ev.v || '?') + ' ' + (ev.board || '');
+    case 'ready': return 'radio=' + ev.radio + ' freq=' + (ev.sync_freq || '?');
+    case 'radio_up': return 'recovered';
+    case 'error': return (ev.what || '?') + ' ' + (ev.detail || '');
+    case 'probe': return (ev.set || ev.info || '') + (ev.ok ? ' ok' : '');
+    default: return '';
+  }
+}
+const evLine = (ev, stamp) =>
+  '<div class="evl k-' + esc(ev.t || '?') + '">' +
+  (stamp ? '<span class="ets">' + esc(stamp) + '</span>' : '') +
+  '<span class="etag">' + esc((ev.t || '?').toUpperCase()) + '</span>' +
+  esc(fmtEv(ev)) +
+  (ev.age_s !== undefined ? '<span class="eage">' + ev.age_s.toFixed(0) + 's</span>' : '') +
+  '</div>';
+/* Latest intel items (GPS/batt/atti/mode/uplink) as one-line strings. */
+function intelItems(e) {
+  const t = (e && e.tlm) || {}, out = [];
+  if (t.gps) out.push('GPS ' + (t.gps.lat_e7 / 1e7).toFixed(5) + ',' +
+    (t.gps.lon_e7 / 1e7).toFixed(5) + ' · ' + t.gps.sats + 'sat · ' +
+    (t.gps.spd_kmh10 / 10).toFixed(0) + 'km/h');
+  if (t.batt) out.push('BATT ' + (t.batt.v10 / 10).toFixed(1) + 'V · ' +
+    (t.batt.a10 / 10).toFixed(1) + 'A · ' + t.batt.mah + 'mAh');
+  if (t.atti) out.push('ATTI p' + (t.atti.p / 10000 * 57.3).toFixed(0) +
+    ' r' + (t.atti.r / 10000 * 57.3).toFixed(0) +
+    ' y' + (t.atti.y / 10000 * 57.3).toFixed(0));
+  if (t.fm) out.push('MODE ' + t.fm.m);
+  if (t.linkstats) out.push('UPLINK lq=' + t.linkstats.lq + ' rssi=' +
+    t.linkstats.rssi1 + '/' + t.linkstats.rssi2 + ' snr=' + t.linkstats.snr);
+  return out;
+}
+let elrsHist = [];                     // {t, rssi, lq} per poll, 60 s window
+let elogSeen = 0;                      // last event seq in the tab log
+let elogRows = [];                     // newest-last HTML lines, capped
+function updElrs(e, set) {
+  const dot = document.getElementById('edot');
+  const chip = document.getElementById('elrschip');
+  const on = e && e.connected;
+  dot.className = on ? (e.lock ? 'lock' : 'sweep') : '';
+  chip.textContent = on ? (e.lock ? 'LOCK' : 'sweep') : 'offline';
+  chip.className = on ? (e.lock ? 'lock' : 'sweep') : 'off';
+  const numv = v => (typeof v === 'number' && isFinite(v)) ? v : null;
+  const rssi = on ? numv(e.rssi) : null;
+  set('erssi', on ? (rssi === null ? '--' : rssi) : '--');
+  set('elq', on ? numv(e.lq) ?? '--' : '--');
+  set('erate', on ? (e.rate || '--') + ' · iq ' + (e.iq || '-') + ' · ' +
+        (e.pps || 0) + ' pps · SNR ' + (numv(e.snr) === null ? '--' : e.snr) + ' dB'
+                  : 'no dongle');
+  document.getElementById('esticks').innerHTML = stickHtml(on ? e.ch : null, on && e.lock);
+  const items = intelItems(e);
+  set('eintel', on ? (items.length ?
+        items[Math.floor(Date.now() / 2000) % items.length] : 'listening...')
+                   : '--');
+  const uidEl = document.getElementById('euid');
+  uidEl.style.display = on && e.uid ? '' : 'none';
+  uidEl.textContent = 'UID ' + (e.uid || '');
+  document.getElementById('etick').innerHTML =
+    on ? (e.last_events || []).slice(-3).reverse().map(ev => evLine(ev)).join('') : '';
+  // ELRS tab gauges + meta
+  set('xerssi', on ? (rssi === null ? '--' : rssi) : '--');
+  set('xelq', on ? numv(e.lq) ?? '--' : '--');
+  set('xesnr', on ? (numv(e.snr) === null ? '--' : e.snr) : '--');
+  set('xepps', on ? (e.pps || 0) : '--');
+  document.getElementById('xemeta').innerHTML = on ?
+    '<span class="k">RATE </span>' + esc(e.rate || '-') + '<br>' +
+    '<span class="k">IQ </span>' + esc(e.iq || '-') + '<br>' +
+    '<span class="k">LOCK </span>' + (e.lock ? 'YES' : 'no') + '<br>' +
+    '<span class="k">ARM </span>' + (e.arm ? 'ARMED' : 'disarmed') + '<br>' +
+    '<span class="k">UID </span>' + esc(e.uid || '-') + '<br>' +
+    '<span class="k">PORT </span>' + esc(e.port || '-') : 'dongle offline';
+  document.getElementById('xesticks').innerHTML = stickHtml(on ? e.ch : null, on && e.lock);
+  document.getElementById('eintelpanel').innerHTML = intelItems(e).map(s => {
+    const sp = s.indexOf(' ');
+    return '<div><span class="k">' + esc(s.slice(0, sp)) + '</span> ' +
+           esc(s.slice(sp + 1)) + '</div>';
+  }).join('') || '<div><span class="k">—</span> no telemetry decoded yet</div>';
+  // Scrolling event log: append only events newer than the last seen seq.
+  (on ? e.last_events || [] : []).forEach(ev => {
+    if (ev.seq > elogSeen) {
+      elogSeen = ev.seq;
+      elogRows.push(evLine(ev, new Date().toTimeString().slice(0, 8)));
+    }
+  });
+  elogRows = elogRows.slice(-60);
+  document.getElementById('elog').innerHTML = elogRows.slice().reverse().join('');
+  // Sparkline history: 60 s rolling window, updated every poll.
+  if (on) {
+    elrsHist.push({ t: Date.now(), rssi: rssi, lq: numv(e.lq) });
+    elrsHist = elrsHist.filter(h => Date.now() - h.t < 60000);
+  }
+}
+/* ELRS tab sparkline: RSSI auto-range (green) + LQ 0..100 (amber), 60 s. */
+function drawElrsSpark() {
+  const c = document.getElementById('espark');
+  if (!c || !c.clientWidth) return;
+  const x = c.getContext('2d');
+  const w = c.width = c.clientWidth * devicePixelRatio,
+        h = c.height = c.clientHeight * devicePixelRatio;
+  const now = Date.now(), dpr = devicePixelRatio;
+  const pts = elrsHist.filter(p => now - p.t < 60000);
+  x.clearRect(0, 0, w, h);
+  x.strokeStyle = 'rgba(51,80,47,.3)'; x.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    x.beginPath(); x.moveTo(0, h * i / 4); x.lineTo(w, h * i / 4); x.stroke();
+  }
+  if (pts.length < 2) return;
+  const X = t => (1 - (now - t) / 60000) * w;
+  const rs = pts.map(p => p.rssi).filter(v => typeof v === 'number');
+  if (rs.length > 1) {
+    let lo = Math.min.apply(null, rs), hi = Math.max.apply(null, rs);
+    if (hi - lo < 6) { const m = (hi + lo) / 2; lo = m - 3; hi = m + 3; }
+    const Y = v => h - (v - lo) / (hi - lo) * (h - 16 * dpr) - 8 * dpr;
+    x.strokeStyle = '#39ff6a'; x.lineWidth = 1.5 * dpr;
+    x.shadowColor = '#39ff6a'; x.shadowBlur = 4 * dpr;
+    x.beginPath();
+    let started = false;
+    pts.forEach(p => {
+      if (typeof p.rssi !== 'number') return;
+      const px = X(p.t), py = Y(p.rssi);
+      if (!started) { x.moveTo(px, py); started = true; } else x.lineTo(px, py);
+    });
+    x.stroke(); x.shadowBlur = 0;
+    x.fillStyle = '#4a6a4f'; x.font = (9 * dpr) + 'px monospace';
+    x.fillText(hi.toFixed(0) + ' dBm', 6 * dpr, 10 * dpr);
+    x.fillText(lo.toFixed(0), 6 * dpr, h - 4 * dpr);
+  }
+  const Yq = v => h - v / 100 * (h - 16 * dpr) - 8 * dpr;
+  x.strokeStyle = '#ffb000'; x.lineWidth = dpr;
+  x.beginPath();
+  let qs = false;
+  pts.forEach(p => {
+    if (typeof p.lq !== 'number') return;
+    const px = X(p.t), py = Yq(p.lq);
+    if (!qs) { x.moveTo(px, py); qs = true; } else x.lineTo(px, py);
+  });
+  x.stroke();
+}
+
 async function poll() {
   let s;
   try { s = await (await fetch('/api/state')).json(); }
@@ -1962,6 +2475,7 @@ async function poll() {
   // Waterfall: one new row per poll (drawn by draw() on its own cadence).
   wfNew = (s.spectrum || []).filter(e => e && e.freq_mhz >= 5560 && e.freq_mhz <= 6000)
                             .sort((a, b) => a.freq_mhz - b.freq_mhz);
+  updElrs(s.elrs, set);
   if (!s.connected) toast('SERIAL DISCONNECTED');
 }
 
@@ -1969,6 +2483,13 @@ async function poll() {
 let shown = 0, peak = 0, peakT = 0;
 function draw() {
   try {
+  /* Every data source updates regardless of the active tab; only canvas
+     work is skipped while a tab is hidden. The ELRS tab draws just its
+     sparkline. */
+  if (tabCur !== 'live') {
+    if (tabCur === 'elrs') drawElrsSpark();
+    return;
+  }
   const num = v => (typeof v === 'number' && isFinite(v)) ? v : 0;
   const target = num(S && S.telemetry.level_db);
   shown += (target - shown) * 0.15;
@@ -2434,8 +2955,9 @@ function draw() {
   finally { requestAnimationFrame(draw); }
 }
 setInterval(poll, 500); poll(); requestAnimationFrame(draw);
-setInterval(() => { if (!tabLive) pollDets(); }, 500);
-if (lsGet('c5_tab') === 'dets') showTab('dets');
+setInterval(pollDets, 500);          // all tabs live: no per-tab fetch pauses
+const savedTab = lsGet('c5_tab');
+if (savedTab && savedTab !== 'live') showTab(savedTab);
 </script>
 </body>
 </html>"""
@@ -2500,6 +3022,7 @@ def create_app() -> Flask:
                 },
             }
         body["fps"] = round(STATE.fps(), 2)
+        body["elrs"] = ELRS.snapshot()   # own lock; independent of STATE
         return jsonify(body)
 
     @app.post("/api/key/<k>")
@@ -2630,6 +3153,10 @@ def main() -> None:
 
     SERIAL = SerialManager(args.serial_port, args.baud)
     SERIAL.start()
+    # Second reader: auto-discovers the ELRS sniffer on the usbmodem ports
+    # the main board has not claimed. Fully independent of SERIAL.
+    elrs_mgr = ElrsManager(args.serial_port)
+    elrs_mgr.start()
     app = create_app()
     try:
         app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)
@@ -2638,7 +3165,9 @@ def main() -> None:
     finally:
         print("\nshutting down: stopping preview stream")
         SERIAL.close()
+        elrs_mgr.close()
         SERIAL.join(timeout=2.0)
+        elrs_mgr.join(timeout=2.0)
 
 
 if __name__ == "__main__":
