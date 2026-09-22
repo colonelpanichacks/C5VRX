@@ -35,6 +35,7 @@
 #include "menu_font.h"
 #include "menu_raster.h"
 #include "range_control.h"
+#include "arc_controller.h"
 #include "hal/parlio_ll.h"
 #include "hal/usb_serial_jtag_ll.h"
 
@@ -843,8 +844,10 @@ static control_metrics_t analyze_control_window(const uint8_t *sample, size_t by
  *
  * Modes:
  *   - ANALOG_AGC_SHADOW: Realtime state machine & Q_phase active, physical gain frozen.
- *   - ANALOG_AGC_ACTIVE: Default! Classic state machine (sole gain authority).
- *     The range v2 controller runs observation-only beside it (benched).
+ *   - ANALOG_AGC_ACTIVE: Default! ARC vendor-aware receive chain (gain
+ *     authority; upstream PR #52). The range v2 controller runs
+ *     observation-only beside it (benched); the classic state machine
+ *     remains for SHADOW.
  *   - ANALOG_AGC_MANUAL: Fixed gain controlled by user (+ / - keys).
  * ========================================================================= */
 
@@ -1369,6 +1372,28 @@ static void analog_agc_task(void *arg)
     range_control_t range_controller;
     range_control_reset(&range_controller, s_current_gain);
     uint32_t receive_generation = s_receive_generation;
+
+    /* ARC boot recovery (upstream "BOOT recovery selects ARC", PR #52):
+     * the ARC receive chain is the production RF layer -- fixed BW40 /
+     * AFC-off operation, gain at the vendor survival index (first entry
+     * of the highest RF stage: maximum front-end sensitivity without
+     * blindly maximizing BB/fine gain), controller synced to the table
+     * captured during rf_start. This REPLACES the old G62 SEARCH park
+     * with the stage-aware survival gain: rf_set_channel recaptures the
+     * vendor table and bumps the ARC generation on every retune (incl.
+     * scanner hops), so the ACTIVE path below re-parks to survival on
+     * every hop. The classic state machine keeps its G62 SEARCH case for
+     * SHADOW dry-run mode only. */
+    s_bw_gear_mode = BW_GEAR_BW40;
+    s_current_bw40 = true;
+    apply_rf_bandwidth(true);
+    s_afc_mode = AFC_MODE_OFF;
+    if (rf_get_frequency_offset_khz() != 0) apply_frequency_offset_khz_tracked(0);
+    apply_rx_gain_tracked(rf_get_arc_survival_gain());
+    arc_controller_t arc_controller;
+    arc_controller_reset(&arc_controller, rf_get_arc_gain_table(), s_current_gain);
+    uint32_t seen_arc_generation = rf_get_arc_generation();
+
     int btn_ticks = 0;
     bool btn_long_fired = false;
     bool was_locked = false;
@@ -1716,17 +1741,16 @@ static void analog_agc_task(void *arg)
             goto apply_target;
         }
 
-        /* Upstream range v2 controller -- BENCHED (hardware verdict 2026-09:
-         * controller-owned gain during hops gave slow, shoddy locking; the
-         * proven combo is gain parked at G62 while scanning + flat 200 ms
-         * dwells + the classic AGC). The controller runs OBSERVATION-ONLY:
-         * optimize_allowed = false unconditionally, so it keeps scoring and
-         * its locked state stays fresh for the diagnostics dump, but it can
-         * never write gain. The classic state machine below is the sole gain
-         * authority in ACTIVE mode again, including the pre-port SEARCH park
-         * (target_gain = 62 while hopping; the scanner sets AGC_STATE_SEARCH
-         * on every hop). The s_legacy_lock_confirmed mirror is unaffected:
-         * it still gates the gearbox/AFC freezes in control_tail. */
+        /* Benched range v2 controller (hardware verdict 2026-09): runs
+         * OBSERVATION-ONLY -- optimize_allowed = false, so it keeps scoring
+         * for the diagnostics dump but can never write gain. The gain
+         * authority in ACTIVE mode is the ARC receive chain below (upstream
+         * PR #52); the classic state machine under it remains for SHADOW
+         * dry-run, keeping its G62 SEARCH case. The s_legacy_lock_confirmed
+         * mirror is unaffected: it still gates the gearbox/AFC freezes in
+         * control_tail (ARC covers gain/BW/offset writes by design -- fixed
+         * BW40/AFC-off, zero writes under clean LOCK -- but never touches
+         * the BW/offset movers, so our freeze gates stay). */
         if (s_agc_mode == ANALOG_AGC_ACTIVE) {
             if (receive_generation != s_receive_generation ||
                 range_controller.gain != s_current_gain) {
@@ -1739,18 +1763,56 @@ static void analog_agc_task(void *arg)
                 false /* benched: observation-only, never optimize */);
             if (menu_active_now) {
                 /* a3ca2a9: keep the observer (and gain state) live while the
-                 * menu raster runs; the classic machine stays paused,
-                 * matching the menu-era freeze for gain decisions. */
+                 * menu raster runs; gain decisions stay paused, matching the
+                 * menu-era freeze. ARC resumes on exit (retunes made in the
+                 * menu bump the generation and are picked up then). */
                 settle_ticks = 0;
                 goto control_tail;
             }
-            /* Menu closed: fall through to the classic machine -- the proven
-             * pre-port ACTIVE path (fast overload rem, SEARCH/LEARN/TRACK,
-             * G62 scan park, 500 ms settle, [AGC:GAIN] prints). */
+            /* Menu closed: the ARC receive chain owns gain in ACTIVE mode.
+             * rf_set_channel() recaptures the vendor gain table after every
+             * retune and bumps the ARC generation (the controller is the
+             * sole retune owner), so no ARC state can retain a tuple from
+             * an older channel -- and every scanner hop re-parks to the
+             * survival gain, replacing the old G62 SEARCH park. */
+            const uint32_t arc_generation = rf_get_arc_generation();
+            if (seen_arc_generation != arc_generation) {
+                seen_arc_generation = arc_generation;
+                apply_rx_gain_tracked(rf_get_arc_survival_gain());
+                arc_controller_reset(&arc_controller, rf_get_arc_gain_table(),
+                                     s_current_gain);
+            }
+            /* Our settled lock semantics feed ARC's lock evidence: the
+             * unified receiver lock (legacy fast/vote declare + grabber)
+             * counts as sync so ARC never walks gain down under a lock our
+             * detector trusts. All other observations are the same per-tick
+             * metrics the benched controller and lock detector use. */
+            const arc_observation_t arc_obs = {
+                .sync = fresh_sync || was_locked,
+                .sync_quality = (was_locked && sync_quality < 70) ? 70 : sync_quality,
+                .p_median = p_median,
+                .q_phase = q_phase,
+                .clip_permille = clip_permille,
+                .origin_permille = origin_permille,
+                .winding_permille = winding_permille,
+            };
+            target_gain = arc_controller_tick(&arc_controller, &arc_obs);
+            s_shadow_gain = target_gain;
+            s_agc_state = arc_controller.state == ARC_LOCK ?
+                          AGC_STATE_TRACK : AGC_STATE_LEARN;
+            if (target_gain != s_current_gain) {
+                uint8_t old_g = s_current_gain;
+                apply_rx_gain_tracked(target_gain);
+                printf("[AGC:GAIN] %u -> %u (P_med=%d, Q_phase=%d%%, Clip=%d, State=%s)\n",
+                       old_g, s_current_gain, p_median, q_phase, n_clip,
+                       arc_controller.state == ARC_LOCK ? "TRACK" : "LEARN");
+            }
+            /* ARC owns its settling and never changes BW/AFC in flight. */
+            settle_ticks = 0;
+            goto control_tail;
         }
 
-        /* Settle delay after gain change (classic path: ACTIVE with menu
-         * closed, and SHADOW dry-run) */
+        /* Settle delay after gain change (classic path: SHADOW dry-run) */
         if (settle_ticks > 0) {
             settle_ticks--;
             goto update_telemetry;
