@@ -65,6 +65,15 @@ limited to 2/s), so the actual bytes reaching the parser are visible:
 {"t":"pkt","type":"rc","len":8,"hex":"1a5802d42b88f3c2"}
 ```
 
+`rawpkt` — FULL hex of every packet that classifies as sync (validated or
+not), ≤2/s — ground truth for CRC forensics:
+```json
+{"t":"rawpkt","cls":0,"hex":"de3f0000000031de"}
+```
+`cls` is the parser classification (0 = CRC_OK, 1 = plausible, 2 = noise).
+Re-run the host seed-search (`test/host/test_parser.cpp`) on any captured
+hex to test whether ANY CRC init validates it.
+
 `sync` — a sync packet decoded (`ok=1` means the ELRS software CRC validated):
 ```json
 {"t":"sync","ok":1,"fhss":42,"nonce":240,"rateIdx":6,"swMode":0,"tlmRatio":2,"uid":"a5b3c2"}

@@ -51,7 +51,8 @@ static uint32_t lock_total_pkts;
 // rx = RxDone demods; crc_ok = passed ELRS software CRC; types = parses.
 static uint32_t n_rx, n_crc_ok, n_rc, n_msp, n_sync, n_tlm, n_unk;
 static uint32_t dwell_rx, dwell_crc_ok, dwell_rc, dwell_msp, dwell_sync, dwell_tlm, dwell_unk;
-static uint32_t last_pkt_debug_ms;
+static uint32_t last_pkt_debug_ms;      // crc-ok pkt hex (2/s)
+static uint32_t last_rawpkt_ms;         // sync-classified raw hex (2/s)
 
 // live energy (GET_RSSIINST sampling): per-dwell max, per-stats-window max,
 // and last sample. -128 = no sample yet (radio faulted) — with a working RF
@@ -658,7 +659,18 @@ void loop()
                 if (!dwell_first_pkt_ms) dwell_first_pkt_ms = millis();
                 switch (pkt.type) {
                 case ELRS_PKT_SYNC:
-                    n_sync++; dwell_sync++; on_sync(pkt); break;
+                    n_sync++; dwell_sync++;
+                    // raw ground-truth: FULL hex of every sync-classified
+                    // packet (validated or not), <=2/s — for CRC forensics.
+                    if (millis() - last_rawpkt_ms >= PKT_DEBUG_MIN_MS) {
+                        last_rawpkt_ms = millis();
+                        char hex[2 * ELRS_OTA8_LEN + 1];
+                        to_hex(buf, want, hex);
+                        Serial.printf("{\"t\":\"rawpkt\",\"cls\":%u,\"hex\":\"%s\"}\n",
+                                      (unsigned)pkt.cls, hex);
+                    }
+                    on_sync(pkt);
+                    break;
                 case ELRS_PKT_TLM:
                     n_tlm++; dwell_tlm++; on_tlm(pkt); break;
                 case ELRS_PKT_RCDATA:
