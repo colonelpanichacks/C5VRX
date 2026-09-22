@@ -105,3 +105,15 @@ radio: `radio:0, pps:0, lock:0`). Failure signatures after a good flash:
 A truly silent board after this flash = still a boot-stage problem (bad
 image, flash-mode mismatch, or hardware), not an app init stall: re-check
 `verify_flash` output and try download mode (BOOT+RST).
+
+## Radio pin auto-probe
+
+At boot the firmware probes a small table of known T3-S3 SX1280 pin sets
+(5 s bound each, LED blinking while it works), logs each attempt as a
+`probe` JSON line, stops at the first success, and caches the winner in
+NVS so later boots skip the sweep (cached set tried first; if it fails,
+the full table is swept again). Send `P` on the serial console to force a
+full re-probe. If every set fails, the fault screen now also hints the
+module may not be an SX1280-class chip at all — check the RF can marking
+(the T3-S3 also ships in an LR1121 variant, which this firmware does not
+drive).

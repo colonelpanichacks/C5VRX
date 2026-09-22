@@ -30,13 +30,29 @@ typedef struct {
 // word is UID-derived (see elrs_defs.h); hunting them is a post-capture TODO.
 void sniffer_sweep_build(sniffer_sweep_t *sw);
 
+// ---- pin-set table for the startup auto-probe ------------------------------
+// The V1.2 SX1280 wiring per LilyGo's factory sources, plus the alternates
+// that circulate for T3-S3 boards (set B: RST=12/DIO1=14/BUSY=13). All share
+// the SPI bus (SCK=5, MISO=3, MOSI=6, NSS=7). -1 = pin not fitted/driven.
+typedef struct {
+    const char *name;
+    int8_t nss, sck, miso, mosi, rst, dio1, busy, rxen, txen;
+} radio_pin_set_t;
+
+extern const radio_pin_set_t RADIO_PIN_SETS[];
+extern const uint8_t RADIO_PIN_SET_COUNT;
+extern const uint8_t RADIO_PIN_SET_DEFAULT; // compile-time pins from board_pins.h
+
 #ifdef ARDUINO
 #include <RadioLib.h>
 
 class SnifferRadio {
 public:
-    // SPI + radio init; returns false when no SX1280 answers.
-    bool begin();
+    // SPI + radio init with an explicit pin set; returns the RadioLib
+    // status code (RADIOLIB_ERR_NONE == 0 on success — a plain bool has
+    // bitten us here before: success reads as "err 1").
+    int16_t begin(const radio_pin_set_t *ps);
+    int16_t begin(); // default: RADIO_PIN_SETS[RADIO_PIN_SET_DEFAULT]
     // Apply a dwell step: modulation, fixed length, CRC off, IQ, frequency.
     bool apply(const sniffer_step_t &step, uint32_t freq_hz);
     // (Re)start continuous RX with DIO1 -> RX_DONE only.

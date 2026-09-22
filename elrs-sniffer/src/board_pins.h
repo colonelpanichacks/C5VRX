@@ -25,6 +25,11 @@
 // constructor in ui.cpp (U8G2_SSD1306_... -> U8G2_SH1106_128X64_NONAME_F_HW_I2C).
 
 // --- SX1280 radio, SPI (FSPI) [VERIFIED: utilities.h T3_S3_V1_2_SX1280*] ---
+// Re-verified verbatim from LilyGo-LoRa-Series master on 2026-09-22
+// (examples/T3S3Factory/utilities.h + LoRa/T3S3/SX1280*_PingPong). Alternate
+// wirings circulate (RST=12/DIO1=14/BUSY=13) — the firmware auto-probes
+// both families at boot (RADIO_PIN_SETS in sniffer_radio.cpp), so a board
+// with either wiring comes up; these compile-time pins remain the default.
 #define PIN_LORA_NSS   7    // RADIO_CS_PIN
 #define PIN_LORA_SCK   5    // RADIO_SCLK_PIN
 #define PIN_LORA_MISO  3    // RADIO_MISO_PIN

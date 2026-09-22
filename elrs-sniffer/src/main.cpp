@@ -9,6 +9,7 @@
 // what, so "alive, no packets" and "dead" are always distinguishable.
 // =============================================================================
 #include <Arduino.h>
+#include <Preferences.h>
 #include "board_pins.h"
 #include "elrs_defs.h"
 #include "elrs_parse.h"
@@ -16,7 +17,9 @@
 #include "ui.h"
 
 #define RADIO_INIT_TIMEOUT_MS 15000u
+#define RADIO_PROBE_TIMEOUT_MS 5000u
 #define RADIO_RETRY_MS 15000u
+#define PREF_NAMESPACE "elrs-sniffer"
 
 static elrs_decode_ctx_t dctx;
 static sniffer_sweep_t sweep;
@@ -230,33 +233,39 @@ static void led_boot_marker_done(uint32_t) {}
 static void led_update(bool, bool) {}
 #endif
 
-// ---- bounded radio init --------------------------------------------------
+// ---- bounded radio init + pin auto-probe -----------------------------------
 // RadioLib 6.6 already bounds each SPI transaction (1 s timeout), but run the
 // whole init pinned to core 0 behind a wall-clock bound anyway: if anything
 // pathological stalls, the main loop on core 1 keeps emitting stats. A
 // stalled task may remain on core 0 — harmless (nothing else lives there).
 static volatile bool g_radio_task_done;
-static volatile int g_radio_task_result;
+static volatile int16_t g_radio_task_result;
+static const radio_pin_set_t *g_task_pin_set;
 
 static void radio_init_task(void *)
 {
-    g_radio_task_result = g_radio.begin();
+    g_radio_task_result = g_radio.begin(g_task_pin_set);
     g_radio_task_done = true;
     vTaskDelete(NULL);
 }
 
-static bool radio_init_bounded(char *err, size_t errlen)
+// Returns true only on RADIOLIB_ERR_NONE. Polarity matters: begin() returns
+// a RadioLib status (0 = success); the previous bool-shaped path reported a
+// WORKING radio as "begin err 1" and a dead one as ok. Don't reintroduce.
+static bool radio_init_bounded(const radio_pin_set_t *ps, uint32_t timeout_ms,
+                               char *err, size_t errlen)
 {
+    g_task_pin_set = ps;
     g_radio_task_done = false;
     if (xTaskCreatePinnedToCore(radio_init_task, "radio_init", 4096, NULL, 1,
                                 NULL, 0) != pdPASS) {
-        g_radio_task_result = g_radio.begin(); // fallback: RadioLib's own bounds
+        g_radio_task_result = g_radio.begin(ps); // fallback: RadioLib's own bounds
         g_radio_task_done = true;
     }
     uint32_t t0 = millis();
     uint32_t last_blink = 0;
     bool led_state = false;
-    while (!g_radio_task_done && millis() - t0 < RADIO_INIT_TIMEOUT_MS) {
+    while (!g_radio_task_done && millis() - t0 < timeout_ms) {
         delay(10);
 #if defined(PIN_BOARD_LED)
         if (millis() - last_blink >= 200) { // init-in-progress blink
@@ -267,14 +276,79 @@ static bool radio_init_bounded(char *err, size_t errlen)
 #endif
     }
     if (!g_radio_task_done) {
-        snprintf(err, errlen, "timeout %us (no SX1280 ACK)", RADIO_INIT_TIMEOUT_MS / 1000);
+        snprintf(err, errlen, "timeout %lus (no SX1280 ACK)", timeout_ms / 1000);
         return false; // init task still spinning on core 0; left to die there
     }
-    if (g_radio_task_result != 0) {
+    if (g_radio_task_result != RADIOLIB_ERR_NONE) {
         snprintf(err, errlen, "RadioLib begin err %d", (int)g_radio_task_result);
         return false;
     }
     return true;
+}
+
+// ---- pin-set cache (Preferences/NVS) --------------------------------------
+static int pin_cache_read()
+{
+    Preferences pr;
+    if (!pr.begin(PREF_NAMESPACE, true)) return -1;
+    int v = pr.getUChar("pinset", 0);
+    pr.end();
+    return (v >= 1 && v <= (int)RADIO_PIN_SET_COUNT) ? v - 1 : -1;
+}
+
+static void pin_cache_write(int idx)
+{
+    Preferences pr;
+    if (pr.begin(PREF_NAMESPACE, false)) {
+        pr.putUChar("pinset", (uint8_t)(idx + 1));
+        pr.end();
+    }
+}
+
+static void fmt_pins(const radio_pin_set_t *ps, char *buf, size_t n)
+{
+    snprintf(buf, n, "NSS=%d SCK=%d MISO=%d MOSI=%d RST=%d DIO1=%d BUSY=%d",
+             ps->nss, ps->sck, ps->miso, ps->mosi, ps->rst, ps->dio1, ps->busy);
+}
+
+// Try one pin set, emit a probe event, return success.
+static bool try_pin_set(int idx, uint32_t timeout_ms, bool cached, char *err, size_t errlen)
+{
+    const radio_pin_set_t *ps = &RADIO_PIN_SETS[idx];
+    char pinbuf[72];
+    fmt_pins(ps, pinbuf, sizeof(pinbuf));
+    bool ok = radio_init_bounded(ps, timeout_ms, err, errlen);
+    Serial.printf("{\"t\":\"probe\",\"set\":\"%s\",\"pins\":\"%s\",\"ok\":%u%s}\n",
+                  ps->name, pinbuf, ok ? 1 : 0, cached ? ",\"cached\":1" : "");
+    return ok;
+}
+
+// Probe all sets starting with `first_idx`; on success cache + return the set.
+static const radio_pin_set_t *probe_pin_sets(int first_idx, uint32_t timeout_ms,
+                                             bool cached_first, char *err, size_t errlen)
+{
+    for (uint8_t k = 0; k < RADIO_PIN_SET_COUNT; k++) {
+        int idx = (first_idx + k) % RADIO_PIN_SET_COUNT;
+        if (try_pin_set(idx, timeout_ms, cached_first && k == 0, err, errlen)) {
+            pin_cache_write(idx);
+            return &RADIO_PIN_SETS[idx];
+        }
+    }
+    return NULL;
+}
+
+static const radio_pin_set_t *g_working_pins = NULL;
+static bool g_force_reprobe = false;
+
+static void report_radio_fault(const char *detail)
+{
+    char pinbuf[72];
+    if (g_working_pins) fmt_pins(g_working_pins, pinbuf, sizeof(pinbuf));
+    else snprintf(pinbuf, sizeof(pinbuf), "none");
+    Serial.printf("{\"t\":\"error\",\"what\":\"radio_init\",\"detail\":\"%s\",\"pins\":\"%s\"}\n",
+                  detail, pinbuf);
+    if (oled_ok) ui_show_fault("RADIO FAULT", detail);
+    snprintf(uist.rate, sizeof(uist.rate), "rf fault");
 }
 
 // ---- boot observability: first serial output, before ANY init ------------
@@ -332,32 +406,70 @@ void setup()
                       OLED_I2C_ADDR, PIN_OLED_SDA, PIN_OLED_SCL);
     }
 
-    // Radio: bounded init, fault is recoverable and reported both ways
-    static char radio_err[72];
-    radio_ok = radio_init_bounded(radio_err, sizeof(radio_err));
+    // Radio: pin auto-probe (cached set first), bounded per candidate.
+    int cached_idx = pin_cache_read();
+    int first_idx = (cached_idx >= 0) ? cached_idx : (int)RADIO_PIN_SET_DEFAULT;
+    Serial.printf("radio probe: %u sets, starting at \"%s\"%s\n", RADIO_PIN_SET_COUNT,
+                  RADIO_PIN_SETS[first_idx].name, cached_idx >= 0 ? " (cached)" : "");
+    static char radio_err[96];
+    g_working_pins = probe_pin_sets(first_idx, RADIO_PROBE_TIMEOUT_MS, cached_idx >= 0,
+                                    radio_err, sizeof(radio_err));
+    radio_ok = (g_working_pins != NULL);
     if (!radio_ok) {
-        Serial.printf("{\"t\":\"error\",\"what\":\"radio_init\",\"detail\":\"%s\",\"pins\":\"NSS=%d SCK=%d MISO=%d MOSI=%d RST=%d DIO1=%d BUSY=%d\"}\n",
-                      radio_err, PIN_LORA_NSS, PIN_LORA_SCK, PIN_LORA_MISO,
-                      PIN_LORA_MOSI, PIN_LORA_RST, PIN_LORA_DIO1, PIN_LORA_BUSY);
-        if (oled_ok) ui_show_fault("RADIO FAULT", radio_err);
-        snprintf(uist.rate, sizeof(uist.rate), "rf fault");
+        // last error + the possibility the module isn't an SX1280 at all
+        char detail[120];
+        snprintf(detail, sizeof(detail), "%s - if all sets fail the module may not be an SX1280 (check the RF can marking; an LR1121 variant needs different firmware)",
+                 radio_err);
+        report_radio_fault(detail);
     }
 
-    Serial.printf("{\"t\":\"ready\",\"steps\":%u,\"sync_freq\":%lu,\"radio\":%u,\"oled\":%u}\n",
+    char ready_extra[40] = { 0 };
+    if (g_working_pins) snprintf(ready_extra, sizeof(ready_extra), ",\"pins\":\"%s\"",
+                                 g_working_pins->name);
+    Serial.printf("{\"t\":\"ready\",\"steps\":%u,\"sync_freq\":%lu,\"radio\":%u,\"oled\":%u%s}\n",
                   sweep.count, (unsigned long)(ELRS_2G4_SYNC_FREQ_HZ / 1000000),
-                  radio_ok ? 1 : 0, oled_ok ? 1 : 0);
+                  radio_ok ? 1 : 0, oled_ok ? 1 : 0, ready_extra);
     if (radio_ok) apply_step(0);
     last_stats_ms = millis();
 }
 
 void loop()
 {
-    // retry a faulted radio — the fault may be transient
+    // 'P' on the serial console forces a full pin re-probe
+    if (Serial.available()) {
+        int c = Serial.read();
+        if (c == 'P' || c == 'p') g_force_reprobe = true;
+    }
+
+    if (g_force_reprobe) {
+        g_force_reprobe = false;
+        locked = false;
+        radio_ok = false;
+        Serial.println("{\"t\":\"probe\",\"info\":\"manual sweep start\"}");
+        static char err[96];
+        const radio_pin_set_t *ps = probe_pin_sets(0, RADIO_PROBE_TIMEOUT_MS, false,
+                                                   err, sizeof(err));
+        if (ps) {
+            g_working_pins = ps;
+            radio_ok = true;
+            Serial.println("{\"t\":\"radio_up\"}");
+            apply_step(0);
+        } else {
+            report_radio_fault(err);
+        }
+    }
+
+    // retry a faulted radio — start from the cached/working set again
     static uint32_t last_radio_retry = 0;
     if (!radio_ok && millis() - last_radio_retry > RADIO_RETRY_MS) {
         last_radio_retry = millis();
-        static char err[72];
-        if (radio_init_bounded(err, sizeof(err))) {
+        static char err[96];
+        int start = pin_cache_read();
+        if (start < 0) start = (int)RADIO_PIN_SET_DEFAULT;
+        const radio_pin_set_t *ps = probe_pin_sets(start, RADIO_PROBE_TIMEOUT_MS,
+                                                   start >= 0, err, sizeof(err));
+        if (ps) {
+            g_working_pins = ps;
             radio_ok = true;
             Serial.println("{\"t\":\"radio_up\"}");
             apply_step(0);

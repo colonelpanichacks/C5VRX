@@ -33,6 +33,20 @@ void sniffer_sweep_build(sniffer_sweep_t *sw)
     }
 }
 
+const radio_pin_set_t RADIO_PIN_SETS[] = {
+    // name            nss sck miso mosi rst dio1 busy rxen txen
+    { "v12-sx1280",     7,  5,   3,   6,  8,   9,  36,  -1,  -1 },
+    { "v12-sx1280-pa",  7,  5,   3,   6,  8,   9,  36,  21,  10 },
+    { "altB",           7,  5,   3,   6, 12,  14,  13,  -1,  -1 },
+    { "altB-pa",        7,  5,   3,   6, 12,  14,  13,  21,  10 },
+};
+const uint8_t RADIO_PIN_SET_COUNT = sizeof(RADIO_PIN_SETS) / sizeof(RADIO_PIN_SETS[0]);
+#if PIN_LORA_RXEN != -1
+const uint8_t RADIO_PIN_SET_DEFAULT = 1; // v12-sx1280-pa
+#else
+const uint8_t RADIO_PIN_SET_DEFAULT = 0; // v12-sx1280
+#endif
+
 volatile bool SnifferRadio::dio1_fired = false;
 
 void SnifferRadio::on_dio1()
@@ -42,25 +56,30 @@ void SnifferRadio::on_dio1()
 
 SnifferRadio g_radio;
 
-bool SnifferRadio::begin()
+int16_t SnifferRadio::begin()
+{
+    return begin(&RADIO_PIN_SETS[RADIO_PIN_SET_DEFAULT]);
+}
+
+int16_t SnifferRadio::begin(const radio_pin_set_t *ps)
 {
     // T3-S3 radio SPI bus (FSPI) at verified pins 5/3/6/7 — board_pins.h.
     spi = new SPIClass(FSPI);
-    spi->begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
-    Module *mod = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY, *spi,
+    spi->begin(ps->sck, ps->miso, ps->mosi, ps->nss);
+    Module *mod = new Module(ps->nss, ps->dio1, ps->rst, ps->busy, *spi,
                              SPISettings(8000000, MSBFIRST, SPI_MODE0));
     radio = new SnifferSX1280(mod);
     // placeholder params; every dwell reconfigures via apply()
     int16_t st = radio->begin(2441.4, 812.5, 9, 7);
-    if (st != RADIOLIB_ERR_NONE) return false;
+    if (st != RADIOLIB_ERR_NONE) return st;
     // ELRS SX1280.cpp Begin(): register 0x0891 |= 0xC0 (high sensitivity)
     mod->SPIwriteRegister(0x0891, mod->SPIreadRegister(0x0891) | 0xC0);
-#if PIN_LORA_RXEN != -1
-    // PA variant: antenna switch enables (verified SX1280PA_PingPong.ino)
-    radio->setRfSwitchPins(PIN_LORA_RXEN, PIN_LORA_TXEN);
-#endif
+    if (ps->rxen != -1) {
+        // PA variant: antenna switch enables (verified SX1280PA_PingPong.ino)
+        radio->setRfSwitchPins(ps->rxen, ps->txen);
+    }
     radio->setDio1Action(on_dio1);
-    return true;
+    return RADIOLIB_ERR_NONE;
 }
 
 bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)

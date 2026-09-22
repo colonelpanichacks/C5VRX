@@ -16,7 +16,7 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 | `stats` | exactly once per second — **always**, even with no radio (`radio:0`); a missing `stats` line for >2 s means the device is dead |
 | `dwell` | on every sweep-step change while unlocked (≈ every 0.7–4 s) |
 | `sync`, `lock`, `unlock`, `linkstats`, `gps`, `batt`, `atti`, `fm`, `tlm` | as decoded, asynchronous |
-| `boot`, `ready`, `error`, `radio_up` | boot / fault lifecycle |
+| `boot`, `ready`, `error`, `radio_up`, `probe` | boot / fault lifecycle |
 
 ## `stats` — 1 Hz summary (the primary dashboard feed)
 
@@ -87,11 +87,21 @@ Boot/lifecycle:
 - `boot` fires before any init, always — its absence means the board never
   ran (bad flash/hardware), not an app problem.
 - `ready` reports init outcomes: `radio`/`oled` 0 = that subsystem faulted;
-  stats still flow.
+  stats still flow. `pins` (optional) names the pin set the radio probe
+  settled on (see `probe`).
 - `error.what` values: `radio_init`, `oled_init`, `sx1280_init` (legacy
   string may still appear on very old builds).
 - `radio_up` fires when a previously faulted radio recovers (retried every
   ~15 s); there is no `radio_down` — use `stats.radio:0` as the fault flag.
+- `probe` — one line per pin-set the startup probe tries:
+  ```json
+  {"t":"probe","set":"v12-sx1280-pa","pins":"NSS=7 SCK=5 MISO=3 MOSI=6 RST=8 DIO1=9 BUSY=36","ok":1,"cached":1}
+  ```
+  `set` values: `v12-sx1280`, `v12-sx1280-pa`, `altB`, `altB-pa` (all share
+  the SPI bus; RST/DIO1/BUSY and the PA switch pins differ). `cached:1`
+  marks the NVS-cached set tried first; `{"t":"probe","info":"manual
+  sweep start"}` precedes a console-forced re-probe (send `P`). The probe
+  caches its winner in flash, so later boots try it first.
 
 ## Notes for the dashboard integration
 
