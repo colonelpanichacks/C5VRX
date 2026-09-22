@@ -21,13 +21,14 @@
 #define RADIO_RETRY_MS 15000u
 #define DWELL_MIN_MS 2000u        // initial dwell per rate (sync can be seconds apart)
 #define DWELL_CHUNK_MS 2000u      // adaptive dwell grows in these steps...
-#define DWELL_MAX_MS 20000u       // ...up to this cap
+#define DWELL_MAX_MS 35000u       // ...up to this cap (connected sync can be slow)
 #define EXTEND_RSSI_DB -85        // hot dwells (or any packets) extend
 #define AWAIT_PKT_MS 3000u        // packets-for-this-long-without-sync = patient
 #define AWAIT_LOG_MS 5000u        // awaiting_sync heartbeat interval
 #define DWELL_WATCHDOG_GRACE_MS 2000u // wedged dwell -> restart + advance
 #define RSSI_SAMPLE_MS 200u        // <=5 Hz live energy sampling
 #define RSSI_MAX_FAILS 3           // consecutive SPI errors -> stop for this dwell
+#define PKT_DEBUG_MIN_MS 500u      // sync-first debug line rate limit (2/s)
 #define PREF_NAMESPACE "elrs-sniffer"
 
 static elrs_decode_ctx_t dctx;
@@ -40,10 +41,17 @@ static bool locked;
 static uint32_t step_entered_ms;
 static uint32_t last_pkt_ms;
 static uint32_t last_stats_ms;
-static uint32_t window_pkts;      // ELRS-classified packets this second
+static uint32_t window_pkts;      // CRC-OK packets this second (stats.pps)
+static uint32_t window_rx;        // raw RxDone this second (stats.rx_per_s)
 static float last_rssi = -128.0f;
 static float last_snr = 0.0f;
 static uint32_t lock_total_pkts;
+
+// packet-path instrumentation: cumulative (since boot) + per-dwell.
+// rx = RxDone demods; crc_ok = passed ELRS software CRC; types = parses.
+static uint32_t n_rx, n_crc_ok, n_rc, n_msp, n_sync, n_tlm, n_unk;
+static uint32_t dwell_rx, dwell_crc_ok, dwell_rc, dwell_msp, dwell_sync, dwell_tlm, dwell_unk;
+static uint32_t last_pkt_debug_ms;
 
 // live energy (GET_RSSIINST sampling): per-dwell max, per-stats-window max,
 // and last sample. -128 = no sample yet (radio faulted) — with a working RF
@@ -77,6 +85,7 @@ static void dwell_begin(uint8_t i)
     dwell_len_ms = DWELL_MIN_MS;
     dwell_pkts = 0;
     dwell_first_pkt_ms = 0;
+    dwell_rx = dwell_crc_ok = dwell_rc = dwell_msp = dwell_sync = dwell_tlm = dwell_unk = 0;
     sampling_enabled = true;
     sample_fails = 0;
     snprintf(uist.rate, sizeof(uist.rate), "%s", s.rate->name);
@@ -84,14 +93,39 @@ static void dwell_begin(uint8_t i)
     uist.freq_hz = ELRS_2G4_SYNC_FREQ_HZ;
 }
 
-// End the current dwell: print its energy fingerprint and advance.
+static const char *pkt_type_name(uint8_t t)
+{
+    switch (t) {
+    case ELRS_PKT_RCDATA: return "rc";
+    case ELRS_PKT_SYNC:   return "sync";
+    case ELRS_PKT_TLM:    return "tlm";
+    default:              return "msp";
+    }
+}
+
+static void to_hex(const uint8_t *d, size_t n, char *out)
+{
+    static const char h[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2 * i] = h[d[i] >> 4];
+        out[2 * i + 1] = h[d[i] & 0x0F];
+    }
+    out[2 * n] = 0;
+}
+
+// End the current dwell: print its energy + packet fingerprint and advance.
 static void dwell_advance()
 {
     const sniffer_step_t &s = sweep.steps[step_idx];
     Serial.printf("{\"t\":\"dwell\",\"step\":%u,\"rate\":\"%s\",\"iq\":\"%c\",\"legacy\":%u,"
-                  "\"rssi_max\":%d}\n",
+                  "\"rssi_max\":%d,\"rx\":%lu,\"crc_ok\":%lu,"
+                  "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu}}\n",
                   step_idx, s.rate->name, s.iq_inverted ? 'i' : 'n',
-                  s.legacy_2x ? 1 : 0, (int)dwell_rssi_max);
+                  s.legacy_2x ? 1 : 0, (int)dwell_rssi_max,
+                  (unsigned long)dwell_rx, (unsigned long)dwell_crc_ok,
+                  (unsigned long)dwell_rc, (unsigned long)dwell_msp,
+                  (unsigned long)dwell_sync, (unsigned long)dwell_tlm,
+                  (unsigned long)dwell_unk);
     dwell_begin(step_idx + 1);
 }
 
@@ -192,8 +226,10 @@ static void stats_tick()
     if (dt < 1000) return;
     last_stats_ms = now;
 
-    uist.pps = window_pkts * 1000 / dt;
+    uist.pps = window_pkts * 1000 / dt;   // CRC-OK per second
+    uint32_t rx_per_s = window_rx * 1000 / dt;
     window_pkts = 0;
+    window_rx = 0;
 
     // observed-vs-expected ratio while locked (the only time it means anything)
     if (locked) {
@@ -217,13 +253,19 @@ static void stats_tick()
     window_rssi_max = -128.0f;
 
     Serial.printf("{\"t\":\"stats\",\"ms\":%lu,\"rate\":\"%s\",\"iq\":\"%c\",\"rssi\":%d,"
-                  "\"rssi_now\":%d,\"snr10\":%d,\"pps\":%lu,\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
+                  "\"rssi_now\":%d,\"snr10\":%d,\"pps\":%lu,\"rx_per_s\":%lu,"
+                  "\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
+                  "\"rx\":%lu,\"crc_ok\":%lu,"
+                  "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},"
                   "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u",
                   (unsigned long)now, uist.rate, uist.iq_inverted ? 'i' : 'n',
                   (int)uist.rssi_dbm, (int)rssi_now, (int)(last_snr * 10),
-                  (unsigned long)uist.pps,
+                  (unsigned long)uist.pps, (unsigned long)rx_per_s,
                   (unsigned long)uist.lq_permille,
                   locked ? 1 : 0, radio_ok ? 1 : 0,
+                  (unsigned long)n_rx, (unsigned long)n_crc_ok,
+                  (unsigned long)n_rc, (unsigned long)n_msp,
+                  (unsigned long)n_sync, (unsigned long)n_tlm, (unsigned long)n_unk,
                   (unsigned long)uist.ch_us[0], (unsigned long)uist.ch_us[1],
                   (unsigned long)uist.ch_us[2], (unsigned long)uist.ch_us[3],
                   uist.armed ? 1 : 0);
@@ -603,21 +645,39 @@ void loop()
         bool got = g_radio.read_packet(buf, want, rssi, snr);
         g_rx_busy = false;
         if (got) {
+            n_rx++; dwell_rx++; window_rx++;
             elrs_packet_t pkt;
             bool ok = elrs_decode_packet(&dctx, buf, want, &pkt);
             if (rssi > last_rssi) last_rssi = rssi; // peak-hold for the stats window
             last_snr = snr;
-            if (ok) { // classified only: junk must not extend dwells/locks
+            if (!ok) {
+                n_unk++; dwell_unk++;
+            } else {
                 last_pkt_ms = millis();
-                window_pkts++;
                 dwell_pkts++;
                 if (!dwell_first_pkt_ms) dwell_first_pkt_ms = millis();
-                if (locked) lock_total_pkts++;
                 switch (pkt.type) {
-                case ELRS_PKT_SYNC: on_sync(pkt); break;
-                case ELRS_PKT_TLM:  on_tlm(pkt); break;
-                case ELRS_PKT_RCDATA: on_rc(pkt); break;
-                default: break; // MSP: counted in pps only
+                case ELRS_PKT_SYNC:
+                    n_sync++; dwell_sync++; on_sync(pkt); break;
+                case ELRS_PKT_TLM:
+                    n_tlm++; dwell_tlm++; on_tlm(pkt); break;
+                case ELRS_PKT_RCDATA:
+                    n_rc++; dwell_rc++; on_rc(pkt); break;
+                default:
+                    n_msp++; dwell_msp++; break;
+                }
+                if (pkt.cls == ELRS_PKT_CLASS_CRC_OK) {
+                    n_crc_ok++; dwell_crc_ok++; window_pkts++;
+                    if (locked) lock_total_pkts++;
+                    // sync-first debug: SHOW validated packets (2/s cap)
+                    if (millis() - last_pkt_debug_ms >= PKT_DEBUG_MIN_MS) {
+                        last_pkt_debug_ms = millis();
+                        char hex[2 * 16 + 1];
+                        size_t hn = want < 16 ? want : 16;
+                        to_hex(buf, hn, hex);
+                        Serial.printf("{\"t\":\"pkt\",\"type\":\"%s\",\"len\":%u,\"hex\":\"%s\"}\n",
+                                      pkt_type_name(pkt.type), (unsigned)want, hex);
+                    }
                 }
             }
         }

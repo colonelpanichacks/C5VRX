@@ -31,29 +31,39 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 | `rssi` | int | dBm | **live energy max** over the 1 s window (SX1280 GET_RSSIINST sampled at ~10 Hz) — includes noise floor; see below |
 | `rssi_now` | int | dBm | most recent live sample |
 | `snr10` | int | dB×10 | SNR of the last classified packet (sniffer receiver) |
-| `pps` | uint | packets/s | ELRS-classified packets demodulated in the window |
+| `pps` | uint | packets/s | **CRC-validated ELRS packets** demodulated in the window (true decode rate) |
+| `rx_per_s` | uint | RxDone/s | raw demodulated packets in the window (anything the radio accepted) |
 | `lq_permille` | uint | ‰ | while `lock=1`: `pps / expected_pps_for_rate × 1000` (sniffer-side estimate, quantized by the 1 s window; 1000 = ceiling). While unlocked: last link-reported LQ ×10 from a `linkstats` event, else 0 |
 | `lock` | 0/1 | — | a CRC-validated ELRS sync has been captured and not timed out |
 | `ch` | [4] uint | µs | sticks `[roll, pitch, throttle, yaw]`, 988–2012; `0` = not yet decoded |
 | `arm` | 0/1 | — | AUX1 high (arm channel) |
 | `radio` | 0/1 | — | 0 = radio faulted (no SX1280); device alive but deaf. `rssi` is then the last/initial -128 sentinel |
+| `rx`, `crc_ok` | uint | count | cumulative since boot: RxDone demods / ELRS-CRC-validated packets |
+| `types` | object | count | cumulative per-type parses: `rc`, `msp`, `sync`, `tlm`, and `unk` (demodded but failed classification = noise) |
 | `uid` | string, optional | — | `UID[3..5]` as lowercase hex — **link fingerprint, not identity**; absent until a sync is captured |
 
 ## Events
 
-`dwell` — emitted when a sweep dwell ENDS, carrying that dwell's energy
-fingerprint. Dwells start at 2 s and extend in 2 s chunks (cap 20 s) while
+`dwell` — emitted when a sweep dwell ENDS, carrying its energy + packet
+fingerprint. Dwells start at 2 s and extend in 2 s chunks (cap 35 s) while
 the dwell shows energy (`rssi_max` > −85 dBm) or classified packets — sync
-packets can be up to ~16 s apart, so hot dwells are patient:
+packets can be tens of seconds apart on a connected link, so hot dwells
+are patient:
 ```json
-{"t":"dwell","step":0,"rate":"LoRa 250Hz","iq":"n","legacy":0,"rssi_max":-71}
+{"t":"dwell","step":0,"rate":"LoRa 250Hz","iq":"n","legacy":0,"rssi_max":-71,
+ "rx":14,"crc_ok":11,"types":{"rc":11,"msp":0,"sync":0,"tlm":0,"unk":3}}
 {"t":"dwell_ext","rate":"LoRa 250Hz","iq":"n","rssi_max":-69,"dwell_ms":4000}
 {"t":"event","what":"awaiting_sync","rate":"LoRa 250Hz","iq":"n"}
 ```
+`rx` = raw RxDone in the dwell; `crc_ok` = ELRS-CRC-validated; `types`
+the per-type parses (`unk` = demodded noise that failed classification).
 `awaiting_sync` repeats every 5 s while packets flow without a sync yet.
-After a lock drops, the sweep re-enters at the last good rate+IQ before
-continuing. `rssi_max` −128 means "no sample" (radio fault); with a working
-front end the noise floor reads ≈ −120…−110.
+
+`pkt` — sync-first debug: every packet that passes the ELRS CRC (rate
+limited to 2/s), so the actual bytes reaching the parser are visible:
+```json
+{"t":"pkt","type":"rc","len":8,"hex":"1a5802d42b88f3c2"}
+```
 
 `sync` — a sync packet decoded (`ok=1` means the ELRS software CRC validated):
 ```json
