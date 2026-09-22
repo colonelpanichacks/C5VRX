@@ -15,6 +15,7 @@ packages/
 
 # Runtime data (dashboard CSV export + captured frames — never commit)
 tools/detections.csv
+tools/drone_aliases.json
 tools/shots/
 
 # OS / editor droppings

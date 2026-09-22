@@ -40,6 +40,7 @@ import argparse
 import csv
 import glob
 import io
+import json
 import os
 import re
 import sys
@@ -64,7 +65,7 @@ from c5vrx_usb_protocol import (  # noqa: E402
 )
 
 import serial  # noqa: E402
-from flask import Flask, Response, jsonify, send_from_directory  # noqa: E402
+from flask import Flask, Response, jsonify, request, send_from_directory  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
 WIDTH = 224                 # default canvas: firmware now streams 224x168
@@ -286,7 +287,56 @@ def _det_read_rows(limit: int = 500):
             return [], 0
     total = len(rows)
     rows.reverse()
-    return [{k: _det_coerce(v) for k, v in r.items()} for r in rows[:limit]], total
+    out = []
+    for r in rows[:limit]:
+        # Legacy-header file with newer rows: DictReader parks the extra
+        # trailing cells under a None key; map them onto the header columns
+        # the file predates (cfo_ppm, video_std, line_us).
+        extra = r.pop(None, None)
+        if extra:
+            missing = [k for k in DETECTIONS_HEADER if k not in r]
+            for k, v in zip(missing, extra):
+                r[k] = v
+        out.append({k: _det_coerce(v) for k, v in r.items()})
+    return out, total
+
+
+# ----- Drone aliases (tools/drone_aliases.json) -----
+#
+# User-named display aliases for fingerprinted drones, keyed by the same
+# fingerprint the DETECTIONS tab clusters on (cfo_ppm rounded to the
+# nearest 0.5 ppm + "|" + video_std, e.g. "12.0|PAL"). Display-only: the
+# fingerprint stays the identity; detections.csv is never rewritten.
+# Same pattern as _dets_lock: state mutated and file written under one
+# lock; missing/corrupt file reads as {}.
+
+DRONE_ALIASES_JSON = Path(__file__).resolve().parent / "drone_aliases.json"
+ALIAS_FP_RE = re.compile(r"^-?\d+\.[05]\|\w{0,8}$")
+ALIAS_MAX = 40
+
+_aliases_lock = threading.Lock()
+
+
+def _load_aliases() -> dict:
+    try:
+        with open(DRONE_ALIASES_JSON) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items()}
+    except (OSError, ValueError):
+        return {}
+
+
+DRONE_ALIASES = _load_aliases()
+
+
+def _save_aliases() -> None:
+    """Write the alias map atomically (caller holds _aliases_lock)."""
+    tmp = DRONE_ALIASES_JSON.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(DRONE_ALIASES, f, indent=1, sort_keys=True)
+    tmp.replace(DRONE_ALIASES_JSON)
 
 
 # ----- Video screenshots (tools/shots/) -----
@@ -1146,7 +1196,13 @@ PAGE = """<!DOCTYPE html>
   #detsum { font-size:.58rem; letter-spacing:.05em; color:var(--dim);
             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .dchip { display:inline-block; padding:0 4px; border-radius:3px;
-           border:1px solid; font-size:.56rem; letter-spacing:.06em; }
+           border:1px solid; font-size:.56rem; letter-spacing:.06em;
+           cursor:pointer; }
+  .dchip:hover::after { content:'\270E'; margin-left:3px; opacity:.65; }
+  .dchip.aliased { font-weight:bold; }
+  .dedit { width:90px; background:#0d160d; color:var(--txt);
+           border:1px solid var(--grn); border-radius:3px;
+           font:inherit; font-size:.56rem; padding:0 3px; }
   .stdb { padding:0 3px; border-radius:3px; border:1px solid var(--dim);
           color:var(--txt); font-size:.54rem; letter-spacing:.08em; }
   .ltb { padding:0 4px; border-radius:3px; border:1px solid var(--dim);
@@ -1515,31 +1571,82 @@ function droneMap(rows) {
   fps.forEach((fp, i) => { m[fp] = 'DRONE-' + String(i + 1).padStart(3, '0'); });
   return m;
 }
-/* Stable per-ID hue so each drone keeps its own chip color. */
-const droneHue = id => {
+/* Stable per-fingerprint hue so a drone keeps its chip color even when
+   renamed (the alias is display-only; the fingerprint is the identity). */
+const droneHue = fp => {
   let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  for (let i = 0; i < fp.length; i++) h = (h * 31 + fp.charCodeAt(i)) >>> 0;
   return h % 360;
 };
-const droneChip = id =>
-  '<span class="dchip" style="color:hsl(' + droneHue(id) + ',80%,62%);' +
-  'border-color:hsl(' + droneHue(id) + ',80%,40%)">' + esc(id) + '</span>';
+let detAliases = {};                   // fingerprint -> user alias (sidecar)
+let detLast = null;                    // last /api/detections payload
+const droneChip = (fp, id) => {
+  const h = droneHue(fp), al = detAliases[fp];
+  return '<span class="dchip' + (al ? ' aliased' : '') + '" data-fp="' + esc(fp) + '"' +
+    (al ? ' title="' + esc(id) + ' (' + esc(fp) + ')"' : '') +
+    ' style="color:hsl(' + h + ',80%,62%);' +
+    'border-color:hsl(' + h + ',80%,40%)">' + esc(al || id) + '</span>';
+};
 const fmtCfo = v => (v > 0 ? '+' : '') + Number(v).toFixed(1);
 const fmtLine = v => (typeof v === 'number' ? v.toFixed(2) : esc(v)) + 'us';
 /* Header summary strip: "N drones fingerprinted · M encounters ·
-   strongest: DRONE-X (peak dB)" from the loaded rows. */
+   strongest: DRONE-X (peak dB)" — aliased drones show the alias with the
+   fingerprint's ppm instead ("strongest: MY RIG (+12.0 ppm)"). */
 function renderDetSum(rows, dm) {
   const ids = Object.keys(dm).length;
   const enc = rows.reduce((n, r) => n + (r.drone ? 1 : 0), 0);
   let best = null;
   rows.forEach(r => {
     if (r.drone && typeof r.level_peak_db === 'number' &&
-        (!best || r.level_peak_db > best.peak)) best = { id: r.drone, peak: r.level_peak_db };
+        (!best || r.level_peak_db > best.peak))
+      best = { id: r.drone, fp: r.dronefp, peak: r.level_peak_db };
   });
+  let strong = '';
+  if (best) {
+    const al = detAliases[best.fp];
+    strong = al ? ' · strongest: ' + al + ' (' + fmtCfo(parseFloat(best.fp)) + ' ppm)'
+                : ' · strongest: ' + best.id + ' (' + best.peak + 'dB)';
+  }
   document.getElementById('detsum').textContent =
     ids + ' drone' + (ids === 1 ? '' : 's') + ' fingerprinted · ' +
-    enc + ' encounter' + (enc === 1 ? '' : 's') +
-    (best ? ' · strongest: ' + best.id + ' (' + best.peak + 'dB)' : '');
+    enc + ' encounter' + (enc === 1 ? '' : 's') + strong;
+}
+/* Inline rename: swap a drone chip for a small input; Enter saves (empty
+   clears the alias), Esc cancels. All rows of the fingerprint update
+   together on the re-render. */
+function droneRename(chip) {
+  const fp = chip.getAttribute('data-fp');
+  if (!fp) return;
+  const inp = document.createElement('input');
+  inp.className = 'dedit';
+  inp.value = detAliases[fp] || chip.textContent;
+  inp.maxLength = 40;
+  chip.replaceWith(inp);
+  inp.focus(); inp.select();
+  let done = false;
+  const finish = save => {
+    if (done) return;
+    done = true;
+    if (!save) { if (detLast) renderDets(detLast); return; }
+    const alias = inp.value.trim();
+    fetch('/api/alias', { method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ fp, alias }) })
+      .then(r => r.json()).then(j => {
+        if (j.ok) {
+          detAliases = j.aliases || {};
+          if (detLast) detLast.aliases = detAliases;
+        }
+        toast(j.ok ? (alias ? 'alias saved' : 'alias cleared') : 'alias rejected');
+        if (detLast) renderDets(detLast);
+      })
+      .catch(() => { toast('alias save failed'); if (detLast) renderDets(detLast); });
+  };
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') finish(true);
+    else if (e.key === 'Escape') finish(false);
+  });
+  inp.addEventListener('blur', () => finish(true));
 }
 /* Match a detection row to its screenshot: capture names are
    <sanitized episode start>__<HHMMSS>.jpg, sanitized the same way
@@ -1557,12 +1664,14 @@ let detSig = '';                       // column signature of the built header
 function renderDets(d) {
   const rows = d.rows || [];
   const shots = d.shots || [];
+  detLast = d;
+  detAliases = d.aliases || {};
   document.getElementById('dettotal').textContent = (d.total || 0) + ' ROWS';
   // Cluster fingerprinted rows and inject the display ID, then summarize.
   const dm = droneMap(rows);
   rows.forEach(r => {
     const fp = droneFp(r);
-    if (fp) r.drone = dm[fp];
+    if (fp) { r.drone = dm[fp]; r.dronefp = fp; }
   });
   renderDetSum(rows, dm);
   // Skip columns the CSV lacks entirely (or that are blank on every row).
@@ -1596,7 +1705,7 @@ function renderDets(d) {
                        : '<td class="na">--</td>';
       if (v === undefined || v === '') return '<td class="na">--</td>';
       if (k === 'channel') return '<td>' + bchip(r.band, v) + '</td>';
-      if (k === 'drone') return '<td>' + droneChip(v) + '</td>';
+      if (k === 'drone') return '<td>' + droneChip(r.dronefp, v) + '</td>';
       if (k === 'cfo_ppm') return '<td class="num">' + esc(fmtCfo(v)) + '</td>';
       if (k === 'video_std') return '<td><span class="stdb">' + esc(v) + '</span></td>';
       if (k === 'line_us') return '<td class="num">' + fmtLine(v) + '</td>';
@@ -1622,7 +1731,7 @@ function renderDetCards(rows, cols, shots) {
   document.getElementById('detcards').innerHTML = rows.map(r => {
     let h = '<div class="dcline">';
     if (r.channel !== undefined && r.channel !== '') h += bchip(r.band, r.channel);
-    if (r.drone) h += droneChip(r.drone);
+    if (r.drone) h += droneChip(r.dronefp, r.drone);
     if (r.start_iso) h += '<span class="dcts">' + fmtISO(r.start_iso) + '</span>';
     if (r.duration_s !== undefined && r.duration_s !== '')
       h += '<span class="dcdur">' + esc(fmtDur(r.duration_s)) + '</span>';
@@ -1651,8 +1760,14 @@ function renderDetCards(rows, cols, shots) {
   }).join('');
 }
 document.querySelector('.detwrap').addEventListener('click', e => {
-  if (e.target.classList && e.target.classList.contains('shotth'))
+  if (e.target.classList && e.target.classList.contains('shotth')) {
     showShot(e.target.getAttribute('src'));
+    return;
+  }
+  if (e.target.closest && !e.target.closest('.dedit')) {
+    const chip = e.target.closest('.dchip');
+    if (chip) droneRename(chip);
+  }
 });
 document.getElementById('lightbox').addEventListener('click', () => {
   document.getElementById('lightbox').style.display = 'none';
@@ -2350,7 +2465,35 @@ def create_app() -> Flask:
     @app.get("/api/detections")
     def api_detections():
         rows, total = _det_read_rows()
-        return jsonify({"total": total, "rows": rows, "shots": _shot_list()})
+        with _aliases_lock:
+            aliases = dict(DRONE_ALIASES)
+        return jsonify({"total": total, "rows": rows, "shots": _shot_list(),
+                        "aliases": aliases})
+
+    @app.get("/api/aliases")
+    def api_aliases():
+        with _aliases_lock:
+            return jsonify(dict(DRONE_ALIASES))
+
+    @app.post("/api/alias")
+    def api_alias():
+        body = request.get_json(force=True, silent=True) or {}
+        fp = body.get("fp")
+        alias = str(body.get("alias") or "").strip()
+        if not isinstance(fp, str) or not ALIAS_FP_RE.match(fp):
+            return jsonify({"ok": False, "error": "bad fingerprint"}), 400
+        if len(alias) > ALIAS_MAX:
+            return jsonify({"ok": False, "error": "alias too long"}), 400
+        with _aliases_lock:
+            if alias:
+                DRONE_ALIASES[fp] = alias
+            else:
+                DRONE_ALIASES.pop(fp, None)
+            try:
+                _save_aliases()
+            except OSError:
+                return jsonify({"ok": False, "error": "save failed"}), 500
+            return jsonify({"ok": True, "aliases": dict(DRONE_ALIASES)})
 
     @app.post("/api/detections/clear")
     def clear_detections():
