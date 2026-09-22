@@ -28,3 +28,7 @@ bool preview_is_enabled(void);
 void preview_get_stats(uint32_t *completed, uint32_t *sent,
                        uint32_t *dropped, uint32_t *lines,
                        bool *h_locked, uint32_t *vsyncs);
+/* Grabber-tracked active-video line period in us. Returns false (blank
+ * semantics) until the grabber has a lock with a measured period, so CSV
+ * consumers can leave the cell empty instead of printing 0.00. */
+bool preview_get_line_us(float *line_us);

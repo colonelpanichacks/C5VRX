@@ -553,3 +553,11 @@ void preview_get_stats(uint32_t *completed, uint32_t *sent,
     if (h_locked) *h_locked = s_h_locked;
     if (vsyncs) *vsyncs = s_field_count;
 }
+
+bool preview_get_line_us(float *line_us)
+{
+    if (!line_us) return false;
+    bool valid = s_h_locked && s_last.line_us > 0.0f;
+    *line_us = s_last.line_us;
+    return valid;
+}

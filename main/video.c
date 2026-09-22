@@ -2087,6 +2087,20 @@ control_tail:
         bool lock_confirmed = is_locked && lock_hold >= 10; /* 10 x 50 ms */
         s_legacy_lock_confirmed = lock_confirmed;
         if (is_locked != was_locked && !is_locked) {
+            /* OSINT episode telemetry: end-of-episode carrier/decoder facts
+             * for the detection CSV. The host appends cfo_ppm, video_std and
+             * line_us columns; emit BEFORE [CARRIER] Lost so it is attributed
+             * to the still-open episode. Blank when a fact is unknown
+             * (video_std undecided, grabber never locked). */
+            float line_us = 0.0f;
+            const bool line_ok = preview_get_line_us(&line_us);
+            const float cfo_ppm = (float)s_cfo_khz * 1000.0f /
+                                  (float)rf_get_current_channel()->freq_mhz;
+            printf("[EPISODE] cfo_ppm=%+.1f video_std=%s line_us=",
+                   cfo_ppm, s_detected_video_std_valid ?
+                   (s_detected_video_std == VIDEO_STD_PAL ? "PAL" : "NTSC") : "");
+            if (line_ok) printf("%.2f", line_us);
+            printf("\n");
             printf("[CARRIER] Lost (Q=%d%%, env=%s, mod=%s, P_med=%d)\n",
                    q_phase, envelope_ok ? "ok" : "noise",
                    modulation_ok ? "ok" : "cw?", p_median);

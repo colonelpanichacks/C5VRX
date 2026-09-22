@@ -124,6 +124,8 @@ def parse_level_db(raw):
     return None
 LOCKED_RE = re.compile(r"\[CARRIER\] Locked on (\w+) \((\d+) MHz\) in (\S+)")
 LOST_RE = re.compile(r"\[CARRIER\] Lost")
+EPISODE_RE = re.compile(
+    r"\[EPISODE\] cfo_ppm=(?P<ppm>\S+) video_std=(?P<std>\S*) line_us=(?P<line>\S*)")
 SCAN_ON_RE = re.compile(r"\[SCAN\] ON")
 SCAN_OFF_RE = re.compile(r"\[SCAN\] OFF")
 # Firmware-driven scan resume: after a lost lock, or after a candidate that
@@ -241,6 +243,7 @@ DETECTIONS_HEADER = [
     "level_peak_db", "level_mean_db", "level_min_db", "level_samples",
     "video_sync", "frames_received", "max_fps",
     "skip_dead", "dwell_ms", "lock_type", "end_reason",
+    "cfo_ppm", "video_std", "line_us",
 ]
 DEFAULT_DWELL_MS = 200            # scanner full dwell (firmware video.c)
 
@@ -354,6 +357,10 @@ def _episode_start(chan: str, freq_mhz: str, band: str) -> None:
         "lock_type": ("manual"
                       if time.monotonic() - STATE.last_tune_time < 4.0
                       else "scanner"),
+        # OSINT fields, filled by the firmware [EPISODE] line emitted just
+        # before [CARRIER] Lost; blank when it never arrives (relock/retune
+        # endings) or when a fact is unknown.
+        "cfo_ppm": "", "video_std": "", "line_us": "",
     }
 
 
@@ -403,6 +410,9 @@ def _episode_end(reason: str) -> None:
         "dwell_ms": DEFAULT_DWELL_MS,
         "lock_type": ep["lock_type"],
         "end_reason": reason,
+        "cfo_ppm": ep["cfo_ppm"],
+        "video_std": ep["video_std"],
+        "line_us": ep["line_us"],
     }
     _det_write_row(row)
 
@@ -417,6 +427,7 @@ def _det_event(name: str) -> None:
         "level_samples": 0, "video_sync": "", "frames_received": "",
         "max_fps": "", "skip_dead": "", "dwell_ms": "",
         "lock_type": "event", "end_reason": name,
+        "cfo_ppm": "", "video_std": "", "line_us": "",
     })
 
 
@@ -498,6 +509,15 @@ def parse_line(line: str) -> None:
         if LOST_RE.search(line):
             STATE.locked = False
             _episode_end("signal lost")
+            return
+        em = EPISODE_RE.search(line)
+        if em:
+            # Emitted by the firmware just before [CARRIER] Lost: attach the
+            # end-of-episode facts to the still-open episode.
+            if EPISODE is not None:
+                EPISODE["cfo_ppm"] = em.group("ppm")
+                EPISODE["video_std"] = em.group("std")
+                EPISODE["line_us"] = em.group("line")
             return
         if SCAN_ON_RE.search(line) or SCAN_AUTO_RE.search(line) \
                 or SCAN_RESUME_RE.search(line):
