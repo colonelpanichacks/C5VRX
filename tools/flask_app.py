@@ -402,21 +402,35 @@ ARBITER = PortArbiter(115200)
 
 # ----- Detection episode logging (tools/detections.csv) -----
 #
-# One CSV row per detection episode (lock acquire -> lock lost), plus
-# standalone event rows (boot). Episode state is mutated only under
-# STATE.lock (parse_line / SerialManager / packet hook); the file write is a
-# single small append guarded by its own lock so the serial reader thread
-# never blocks on anything bigger than one row.
+# One CSV row per detection episode, unified across both RF bands: 5.8
+# video episodes (lock acquire -> lock lost, state mutated only under
+# STATE.lock) and 2.4 ELRS link encounters (sniffer lock rise -> fall, own
+# lock, see "ELRS encounter episodes" below), plus standalone event rows
+# (boot). The file write is a single small append guarded by its own lock
+# so the serial reader thread never blocks on anything bigger than one row.
+# _det_read_rows migrates legacy files on read: a header whose first column
+# is not "band" predates the RF-band column (its "band" was the Boscam
+# sub-band), and rows may predate trailing columns.
 
 DETECTIONS_CSV = Path(__file__).resolve().parent / "detections.csv"
 DETECTIONS_HEADER = [
+    "band",                        # RF band: "5.8" video | "2.4" ELRS link
     "start_iso", "end_iso", "duration_s",
-    "channel", "band", "freq_mhz",
+    "channel", "subband", "freq_mhz",
     "level_peak_db", "level_mean_db", "level_min_db", "level_samples",
     "video_sync", "frames_received", "max_fps",
     "skip_dead", "dwell_ms", "lock_type", "end_reason",
-    "cfo_ppm", "video_std", "line_us",
+    "cfo_ppm", "video_std", "line_us", "uid",
+    "geo_lat", "geo_lon",
 ]
+# Columns coerced to numbers on read; everything else stays a string (so
+# band "5.8" never becomes float 5.8, iso strings never get mangled).
+_DET_NUMERIC = frozenset({
+    "duration_s", "freq_mhz", "level_peak_db", "level_mean_db",
+    "level_min_db", "level_samples", "video_sync", "frames_received",
+    "max_fps", "skip_dead", "dwell_ms", "cfo_ppm", "line_us",
+    "geo_lat", "geo_lon",
+})
 DEFAULT_DWELL_MS = 200            # scanner full dwell (firmware video.c)
 
 _dets_lock = threading.Lock()
@@ -449,26 +463,46 @@ def _det_coerce(v):
 
 def _det_read_rows(limit: int = 500):
     """(rows, total): newest-first dicts in CSV column order, capped at
-    `limit`; ([], 0) when no CSV exists yet."""
+    `limit`; ([], 0) when no CSV exists yet. Migrates legacy files: a header
+    whose first column is not "band" predates the RF-band column — its own
+    "band" column was the Boscam sub-band — and rows may also predate
+    trailing columns (overflow cells map onto the missing tail in order)."""
     with _dets_lock:
         try:
             with open(DETECTIONS_CSV, newline="") as f:
-                rows = list(csv.DictReader(f))
+                rdr = csv.reader(f)
+                hdr = next(rdr, None)
+                data = list(rdr) if hdr else []
         except OSError:
             return [], 0
-    total = len(rows)
-    rows.reverse()
+    if not hdr:
+        return [], 0
+    legacy = hdr[0] != "band"
+    if legacy:
+        names = ["subband" if h == "band" else h for h in hdr]
+    else:
+        names = hdr[1:]
+    total = len(data)
+    data.reverse()
     out = []
-    for r in rows[:limit]:
-        # Legacy-header file with newer rows: DictReader parks the extra
-        # trailing cells under a None key; map them onto the header columns
-        # the file predates (cfo_ppm, video_std, line_us).
-        extra = r.pop(None, None)
-        if extra:
+    for row in data[:limit]:
+        if legacy and row and row[0] in ("5.8", "2.4"):
+            # New-style row appended to an old-header file.
+            band, cells = row[0], row[1:]
+        elif legacy:
+            band, cells = "5.8", row
+        else:
+            band, cells = (row[0] if row else ""), row[1:]
+        r = {"band": band}
+        r.update(zip(names, cells))
+        if len(cells) > len(names):
+            extra = cells[len(names):]
             missing = [k for k in DETECTIONS_HEADER if k not in r]
             for k, v in zip(missing, extra):
                 r[k] = v
-        out.append({k: _det_coerce(v) for k, v in r.items()})
+        out.append({k: (_det_coerce(r.get(k, "")) if k in _DET_NUMERIC
+                        else r.get(k, ""))
+                    for k in DETECTIONS_HEADER})
     return out, total
 
 
@@ -482,7 +516,7 @@ def _det_read_rows(limit: int = 500):
 # lock; missing/corrupt file reads as {}.
 
 DRONE_ALIASES_JSON = Path(__file__).resolve().parent / "drone_aliases.json"
-ALIAS_FP_RE = re.compile(r"^\d+\.\d{2}\|\w{0,8}$")
+ALIAS_FP_RE = re.compile(r"^(\d+\.\d{2}\|\w{0,8}|elrs:[0-9A-Fa-f]+)$")
 ALIAS_MAX = 40
 
 _aliases_lock = threading.Lock()
@@ -510,14 +544,47 @@ def _save_aliases() -> None:
     tmp.replace(DRONE_ALIASES_JSON)
 
 
+# ----- Browser geolocation (X-Geo header on /api/state polls) -----
+#
+# The HUD page asks for the browser's geolocation (permission-gated,
+# remembered in localStorage) and ships the fix as an "X-Geo: lat,lon,acc"
+# header on every state poll. The fix is sampled when a detection episode
+# opens and lands in its CSV row (geo_lat/geo_lon); a fix older than
+# GEO_STALE_S counts as absent.
+
+GEO_STALE_S = 30.0
+GEO = {"lat": None, "lon": None, "acc": None, "t": 0.0}
+_geo_lock = threading.Lock()
+
+
+def _geo_set(lat: float, lon: float, acc) -> None:
+    with _geo_lock:
+        GEO.update(lat=lat, lon=lon, acc=acc, t=time.monotonic())
+
+
+def _geo_current():
+    """(lat, lon) or None when there is no fix or it has gone stale."""
+    with _geo_lock:
+        if GEO["lat"] is None or time.monotonic() - GEO["t"] > GEO_STALE_S:
+            return None
+        return GEO["lat"], GEO["lon"]
+
+
 # ----- Video screenshots (tools/shots/) -----
 #
-# One JPEG per camera-button press. Named <episode-start>__<HHMMSS>.jpg
-# when an episode is open so the DETECTIONS tab can match shots to rows
-# (row start_iso, both sanitized to YYYY-MM-DDTHH-MM-SS); otherwise the
-# capture time is the base. Plain files, served back via /shots/<name>.
+# One JPEG per camera-button press, plus an auto-shot on the first synced
+# frame of each episode and a best-OSD frame at episode end. Named
+# <episode-start>__<tag>.jpg when an episode is open so the DETECTIONS tab
+# can match shots to rows (row start_iso, both sanitized to
+# YYYY-MM-DDTHH-MM-SS); otherwise the capture time is the base. Plain
+# files, served back via /shots/<name>.
 
 SHOTS_DIR = Path(__file__).resolve().parent / "shots"
+
+AUTO_SHOT_SUPPRESS_S = 3.0    # manual shot this recent suppresses the auto one
+OSD_MIN_SCORE = 24            # high-contrast blocks needed to keep an OSD shot
+
+_last_shot_mono = 0.0         # last shot (manual or auto), monotonic
 
 
 def _shot_stamp(ts: float) -> str:
@@ -531,6 +598,46 @@ def _shot_list() -> list:
                       if p.suffix == ".jpg")
     except OSError:
         return []
+
+
+def _save_shot(data: bytes, base: str, tag: str) -> str:
+    """Write one JPEG as <base>__<tag>.jpg (collision-suffixed); returns
+    the file name."""
+    SHOTS_DIR.mkdir(exist_ok=True)
+    name = f"{base}__{tag}.jpg"
+    path = SHOTS_DIR / name
+    n = 2
+    while path.exists():
+        name = f"{base}__{tag}_{n}.jpg"
+        path = SHOTS_DIR / name
+        n += 1
+    path.write_bytes(data)
+    return name
+
+
+def _frame_jpeg(frame: bytes, dims) -> bytes:
+    """JPEG of a raw GRAY8 canvas, scaled like the live feed."""
+    img = Image.frombytes("L", dims, frame)
+    img = img.resize((dims[0] * SCALE, dims[1] * SCALE), Image.NEAREST)
+    return make_jpeg(img)
+
+
+def _osd_score(frame: bytes, w: int, h: int) -> int:
+    """OSD-text likelihood: count of high-contrast dark-on-light 8x8 blocks
+    in the center 60% of the frame (OSD glyphs sit center-screen and are
+    near-black text on a near-white outline)."""
+    if not frame or w < 40 or h < 40:
+        return 0
+    x0, x1 = w // 5, w * 4 // 5
+    y0, y1 = h // 5, h * 4 // 5
+    score = 0
+    for by in range(y0, y1 - 7, 8):
+        for bx in range(x0, x1 - 7, 8):
+            block = b"".join(frame[y * w + bx: y * w + bx + 8]
+                             for y in range(by, by + 8))
+            if max(block) - min(block) >= 96 and sum(block) >= 64 * 128:
+                score += 1
+    return score
 
 
 def _iso(ts: float) -> str:
@@ -565,14 +672,19 @@ def _episode_start(chan: str, freq_mhz: str, band: str) -> None:
     global EPISODE
     if EPISODE is not None:
         _episode_end("relock")
+    geo = _geo_current()
     EPISODE = {
         "start": time.time(),
         "channel": chan, "band": band, "freq_mhz": freq_mhz,
         "peak": None, "min": None, "sum": 0.0, "n": 0,
         "video_sync": False,
+        "osd_best": None,          # (score, frame bytes) while synced
         "frames0": STATE.pkts_frame,
         "max_fps": 0.0,
         "skip_dead": STATE.skip_dead,
+        # Browser fix sampled at episode open; "" when absent/stale.
+        "geo_lat": "" if geo is None else round(geo[0], 6),
+        "geo_lon": "" if geo is None else round(geo[1], 6),
         # A lock right after a user/direct tune is a manual lock, not a
         # scanner find.
         "lock_type": ("manual"
@@ -599,10 +711,32 @@ def _episode_tick(level_db, fps: float) -> None:
         ep["max_fps"] = fps
 
 
-def _episode_video_sync() -> None:
-    """A GRAY8 frame arrived with descriptor flags bit0 (h_locked) set."""
-    if EPISODE is not None:
-        EPISODE["video_sync"] = True
+def _episode_video_sync(frame: bytes) -> None:
+    """A GRAY8 frame arrived while the grabber reports video sync. Caller
+    holds STATE.lock. The first synced frame of an episode triggers an
+    auto-shot (suppressed when a manual shot just happened); every synced
+    frame is OSD-scored and the best is kept for the episode's __osd.jpg."""
+    global _last_shot_mono
+    ep = EPISODE
+    if ep is None:
+        return
+    dims = (STATE.frame_w, STATE.frame_h)
+    score = _osd_score(frame, *dims)
+    best = ep["osd_best"]
+    if best is None or score > best[0]:
+        ep["osd_best"] = (score, bytes(frame))
+    if ep["video_sync"]:
+        return
+    ep["video_sync"] = True
+    now = time.monotonic()
+    if now - _last_shot_mono < AUTO_SHOT_SUPPRESS_S:
+        return
+    _last_shot_mono = now
+    try:
+        _save_shot(_frame_jpeg(frame, dims), _shot_stamp(ep["start"]),
+                   time.strftime("%H%M%S"))
+    except OSError:
+        pass
 
 
 def _episode_end(reason: str) -> None:
@@ -614,11 +748,12 @@ def _episode_end(reason: str) -> None:
     EPISODE = None
     end = time.time()
     row = {
+        "band": "5.8",
         "start_iso": _iso(ep["start"]),
         "end_iso": _iso(end),
         "duration_s": round(end - ep["start"], 1),
         "channel": ep["channel"],
-        "band": ep["band"],
+        "subband": ep["band"],
         "freq_mhz": ep["freq_mhz"],
         "level_peak_db": "" if ep["peak"] is None else round(ep["peak"], 2),
         "level_mean_db": "" if not ep["n"] else round(ep["sum"] / ep["n"], 2),
@@ -634,22 +769,126 @@ def _episode_end(reason: str) -> None:
         "cfo_ppm": ep["cfo_ppm"],
         "video_std": ep["video_std"],
         "line_us": ep["line_us"],
+        "uid": "",
+        "geo_lat": ep["geo_lat"],
+        "geo_lon": ep["geo_lon"],
     }
     _det_write_row(row)
+    best = ep["osd_best"]
+    if best is not None and best[0] > OSD_MIN_SCORE:
+        try:
+            _save_shot(_frame_jpeg(best[1], (STATE.frame_w, STATE.frame_h)),
+                       _shot_stamp(ep["start"]), "osd")
+        except OSError:
+            pass
 
 
 def _det_event(name: str) -> None:
     """Standalone notable event as its own row (e.g. firmware boot)."""
     now = _iso(time.time())
     _det_write_row({
+        "band": "5.8",
         "start_iso": now, "end_iso": now, "duration_s": 0,
-        "channel": "", "band": "", "freq_mhz": "",
+        "channel": "", "subband": "", "freq_mhz": "",
         "level_peak_db": "", "level_mean_db": "", "level_min_db": "",
         "level_samples": 0, "video_sync": "", "frames_received": "",
         "max_fps": "", "skip_dead": "", "dwell_ms": "",
         "lock_type": "event", "end_reason": name,
-        "cfo_ppm": "", "video_std": "", "line_us": "",
+        "cfo_ppm": "", "video_std": "", "line_us": "", "uid": "",
+        "geo_lat": "", "geo_lon": "",
     })
+
+
+# ----- ELRS encounter episodes -----
+#
+# The sniffer's link-lock rises/falls are detection episodes too, logged to
+# the same detections.csv as band "2.4" rows under their own lock, so the
+# sniffer thread appends without ever touching STATE. freq_mhz is the ELRS
+# 2.4 GHz sync channel the sniffer parks on; levels are sniffer RSSI.
+
+ELRS_FREQ_MHZ = 2441.4
+ELRS_EP = None                    # open ELRS episode dict, or None
+_elrs_ep_lock = threading.Lock()
+
+
+def _elrs_ep_open_locked(obj: dict) -> None:
+    """Caller holds _elrs_ep_lock."""
+    global ELRS_EP
+    rate = str(obj.get("rate") or "-").removeprefix("LoRa ")
+    iq = str(obj.get("iq") or "-")
+    geo = _geo_current()
+    ELRS_EP = {
+        "start": time.time(),
+        "channel": f"{rate}/{iq}",
+        "peak": None, "min": None, "sum": 0.0, "n": 0,
+        # Browser fix sampled at episode open; "" when absent/stale.
+        "geo_lat": "" if geo is None else round(geo[0], 6),
+        "geo_lon": "" if geo is None else round(geo[1], 6),
+    }
+
+
+def _elrs_ep_close_locked(reason: str) -> None:
+    """Caller holds _elrs_ep_lock."""
+    global ELRS_EP
+    ep = ELRS_EP
+    if ep is None:
+        return
+    ELRS_EP = None
+    with ELRS.lock:
+        uid = ELRS.uid
+    end = time.time()
+    _det_write_row({
+        "band": "2.4",
+        "start_iso": _iso(ep["start"]),
+        "end_iso": _iso(end),
+        "duration_s": round(end - ep["start"], 1),
+        "channel": ep["channel"],
+        "subband": "ELRS",
+        "freq_mhz": ELRS_FREQ_MHZ,
+        "level_peak_db": "" if ep["peak"] is None else round(ep["peak"], 2),
+        "level_mean_db": "" if not ep["n"] else round(ep["sum"] / ep["n"], 2),
+        "level_min_db": "" if ep["min"] is None else round(ep["min"], 2),
+        "level_samples": ep["n"],
+        "video_sync": "", "frames_received": "", "max_fps": "",
+        "skip_dead": "", "dwell_ms": "",
+        "lock_type": "elrs",
+        "end_reason": reason,
+        "cfo_ppm": "", "video_std": "", "line_us": "",
+        "uid": uid or "",
+        "geo_lat": ep["geo_lat"],
+        "geo_lon": ep["geo_lon"],
+    })
+
+
+def _elrs_ep_tick(obj: dict) -> None:
+    """Track sniffer objects: open an encounter on lock rise, accumulate
+    RSSI while locked, close on lock fall / explicit unlock. Called from
+    ElrsManager right after ELRS.update(obj)."""
+    t = obj.get("t")
+    with _elrs_ep_lock:
+        if t == "unlock":
+            _elrs_ep_close_locked("unlock:" + str(obj.get("why") or "?"))
+            return
+        if t != "stats":
+            return
+        if obj.get("lock"):
+            if ELRS_EP is None:
+                _elrs_ep_open_locked(obj)
+            rssi = obj.get("rssi")
+            if isinstance(rssi, (int, float)):
+                ep = ELRS_EP
+                ep["peak"] = rssi if ep["peak"] is None else max(ep["peak"], rssi)
+                ep["min"] = rssi if ep["min"] is None else min(ep["min"], rssi)
+                ep["sum"] += rssi
+                ep["n"] += 1
+        else:
+            _elrs_ep_close_locked("signal lost")
+
+
+def _elrs_ep_end(reason: str) -> None:
+    """Lock-taking wrapper for callers outside the tick path."""
+    with _elrs_ep_lock:
+        _elrs_ep_close_locked(reason)
 
 
 def parse_line(line: str) -> None:
@@ -973,7 +1212,7 @@ class SerialManager(threading.Thread):
                 if ok:
                     STATE.last_frame_flags = flags
                     if flags & 1:
-                        _episode_video_sync()
+                        _episode_video_sync(frame)
             if ok:
                 STATE.put_frame(frame, pkt.sequence)
         elif pkt.packet_type == PACKET_GRAY8_ROWS:
@@ -1007,7 +1246,7 @@ class SerialManager(threading.Thread):
                 with STATE.lock:
                     STATE.last_frame_flags = 1 if locked else 0
                     if locked:
-                        _episode_video_sync()
+                        _episode_video_sync(frame)
                 STATE.put_frame(frame, pkt.sequence)
         elif pkt.packet_type == PACKET_STREAM_INFO:
             with STATE.lock:
@@ -1187,6 +1426,7 @@ class ElrsManager(threading.Thread):
                         continue
                     if isinstance(obj, dict):
                         ELRS.update(obj)
+                        _elrs_ep_tick(obj)
             except (serial.SerialException, OSError) as exc:
                 print(f"[elrs] lost: {exc}; rediscovering in {backoff:.1f}s")
                 if self.ser is not None:
@@ -1199,6 +1439,7 @@ class ElrsManager(threading.Thread):
                 buf = b""
                 with ELRS.lock:
                     ELRS.connected = False
+                _elrs_ep_end("serial disconnect")
                 self.stop_event.wait(backoff)
                 backoff = min(backoff * 2.0, 5.0)
 
@@ -1649,6 +1890,18 @@ PAGE = """<!DOCTYPE html>
   .ltb.scanner { color:var(--grn); border-color:var(--grn); }
   .ltb.manual { color:#31c8ff; border-color:#31c8ff; }
   .ltb.event { color:var(--amb); border-color:var(--amb); }
+  .ltb.elrs { color:#31f5ff; border-color:#31f5ff; }
+  .bchip.b24 { color:#31f5ff; border-color:#31f5ff; }
+  .bchip.b58 { color:var(--grn); border-color:var(--grn); }
+  .newmark { color:var(--amb); margin-right:2px; }
+  #geobtn.on { color:var(--grn); border-color:var(--grn); }
+  #eenc { flex:1 1 0; min-width:0; padding:8px 14px; font-size:.58rem;
+          line-height:1.6; overflow:auto; border-right:1px solid var(--dim); }
+  #eenc .eenc-h { color:var(--dim); letter-spacing:.14em; margin-bottom:3px; }
+  #eenc .een { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #eenc .een .ets { color:var(--dim); margin-right:4px; }
+  #eenc .een.open { color:var(--grn); }
+  #eenc .euid { color:#31f5ff; }
   .spark { display:inline-block; position:relative; width:60px; height:14px;
            background:#050805; border:1px solid rgba(51,80,47,.5);
            border-radius:2px; vertical-align:middle; }
@@ -1831,6 +2084,7 @@ PAGE = """<!DOCTYPE html>
   <div class="emid"><canvas id="espark"></canvas><div class="esptitle">RSSI / LQ // 60S</div></div>
   <div class="ebot">
     <div id="eintelpanel"></div>
+    <div id="eenc"></div>
     <div id="elog"></div>
   </div>
 </div>
@@ -1839,6 +2093,8 @@ PAGE = """<!DOCTYPE html>
     <span class="lbl">DETECTION LOG // tools/detections.csv</span>
     <span id="dettotal">0 ROWS</span>
     <span id="detsum"></span>
+    <button id="geobtn" class="tg"
+            title="share this browser's geolocation: the fix rides state polls (X-Geo header) and is stamped on detection rows as geo_lat/geo_lon">&#128205; OFF</button>
     <button id="detnoise" class="tg" style="display:none"
             title="blip locks (under 2s, no video sync, under 15 dB) are hidden; the raw CSV keeps everything">SHOW NOISE</button>
     <a id="export" class="tg" href="/api/detections/export" download="detections.csv">EXPORT CSV</a>
@@ -1988,9 +2244,11 @@ function showTab(t) {
     document.getElementById('tab-' + x).classList.toggle('on', x === tabCur));
 }
 const DETCOLS = [
+  ['band', 'RF'],
   ['start_iso', 'START'], ['end_iso', 'END'], ['duration_s', 'DUR s'],
-  ['channel', 'CH'], ['drone', 'DRONE'], ['band', 'BAND'], ['freq_mhz', 'FREQ'],
-  ['cfo_ppm', 'CFO'], ['video_std', 'STD'], ['line_us', 'LINE'],
+  ['channel', 'CH'], ['drone', 'DRONE'], ['geo', 'GEO'], ['subband', 'BAND'],
+  ['freq_mhz', 'FREQ'],
+  ['cfo_ppm', 'CFO'], ['video_std', 'STD'], ['line_us', 'LINE'], ['uid', 'UID'],
   ['level_peak_db', 'PEAK'], ['level_mean_db', 'MEAN'], ['level_min_db', 'MIN'],
   ['video_sync', 'SYNC'], ['frames_received', 'FRAMES'], ['max_fps', 'MAXFPS'],
   ['lock_type', 'LOCK'], ['end_reason', 'END REASON'],
@@ -2006,6 +2264,12 @@ const fmtISO = v => (typeof v === 'string' && v.length >= 19 && v.charAt(10) ===
     esc(v.slice(11, 19)) + '</span>' : esc(v);
 const bchip = (band, name) =>
   '<span class="bchip b' + esc(band || '?') + '">' + esc(name) + '</span>';
+/* ELRS encounter rows show the link rate (e.g. "250Hz/i") as their CH
+   value, in cyan, tooltip-marked as the ELRS link rather than a channel. */
+const echip = name =>
+  '<span class="bchip b24" title="ELRS link">' + esc(name) + '</span>';
+const chCell = r => r.band === '2.4' ? echip(r.channel)
+                                     : bchip(r.subband, canonCh(r.channel));
 /* Canonical display name for carriers the grid knows under two channels
    (A1 5865 vs B8 5866 are 1 MHz apart): within 2 MHz of another Boscam
    grid channel, the alphabetically-first name wins, so the same carrier
@@ -2037,13 +2301,16 @@ const sparkSpan = r => {
 /* Row accent class: video-synced episodes green, standalone events amber. */
 const detRowCls = r => r.video_sync === 1 ? 'vs'
                      : r.lock_type === 'event' ? 'ev' : '';
-/* DRONE-ID clustering: fingerprint = line_us rounded to the nearest
-   0.02 us + "|" + video_std ('' when the firmware left it blank). The
-   line period comes from the camera crystal and is stable per device —
-   unlike cfo_ppm, which bounces with video content and stays display-only.
-   Rounds via integer cents (x100, snap to even) to dodge binary-float
-   ties. Rows with a blank/non-numeric line_us get no fingerprint, no ID. */
+/* DRONE-ID clustering: ELRS rows fingerprint on the link UID
+   ("elrs:<uid>"); analog rows on line_us rounded to the nearest 0.02 us +
+   "|" + video_std ('' when the firmware left it blank). The line period
+   comes from the camera crystal and is stable per device — unlike cfo_ppm,
+   which bounces with video content and stays display-only. Rounds via
+   integer cents (x100, snap to even) to dodge binary-float ties. Analog
+   rows with a blank/non-numeric line_us get no fingerprint, no ID. */
 const droneFp = r => {
+  if (r.uid !== undefined && r.uid !== null && r.uid !== '')
+    return 'elrs:' + String(r.uid).toLowerCase();
   if (r.line_us === '' || r.line_us === undefined || r.line_us === null)
     return null;
   const us = Number(r.line_us);
@@ -2078,23 +2345,29 @@ let detAliases = {};                   // fingerprint -> user alias (sidecar)
 let detLast = null;                    // last /api/detections payload
 let showNoise = false;                 // noise rows hidden by default
 /* A row is NOISE when it looks like a blip lock: under 2 s, no video
-   sync, peak under 15 dB. Hidden rows don't count in the counter or the
-   summary; the CSV/export keep everything (raw data). */
-const isNoise = r => Number(r.duration_s || 0) < 2 && !r.video_sync &&
-                     Number(r.level_peak_db || 0) < 15;
-const droneChip = (fp, id) => {
+   sync, peak under 15 dB. ELRS rows are exempt — link RSSI is a negative
+   dBm peak, so the rule would hide every encounter. Hidden rows don't
+   count in the counter or the summary; the CSV/export keep everything
+   (raw data). */
+const isNoise = r => r.band !== '2.4' && Number(r.duration_s || 0) < 2 &&
+                     !r.video_sync && Number(r.level_peak_db || 0) < 15;
+const droneChip = (fp, id, isNew) => {
   const h = droneHue(fp), al = detAliases[fp];
   return '<span class="dchip' + (al ? ' aliased' : '') + '" data-fp="' + esc(fp) + '"' +
     (al ? ' title="' + esc(id) + ' (' + esc(fp) + ')"' : '') +
     ' style="color:hsl(' + h + ',80%,62%);' +
-    'border-color:hsl(' + h + ',80%,40%)">' + esc(al || id) + '</span>';
+    'border-color:hsl(' + h + ',80%,40%)">' +
+    (isNew ? '<span class="newmark" title="first seen in the last 24 h">✦</span>' : '') +
+    esc(al || id) + '</span>';
 };
 const fmtCfo = v => (v > 0 ? '+' : '') + Number(v).toFixed(1);
 const fmtLine = v => (typeof v === 'number' ? v.toFixed(2) : esc(v)) + 'us';
 /* Header summary strip: "N drones fingerprinted · M encounters ·
    strongest: DRONE-X (peak dB)" — aliased drones show the alias with the
-   fingerprint's line period instead ("strongest: MY RIG (63.98us)").
-   Counts only the rows passed in (noise-filtered view). */
+   fingerprint's line period instead ("strongest: MY RIG (63.98us)"), and
+   when both RF bands are present a per-band encounter count is appended
+   ("· 3× 5.8 · 2× ELRS"). Counts only the rows passed in (noise-filtered
+   view). */
 function renderDetSum(rows) {
   const seen = {};
   rows.forEach(r => { if (r.drone) seen[r.drone] = 1; });
@@ -2112,9 +2385,12 @@ function renderDetSum(rows) {
     strong = al ? ' · strongest: ' + al + ' (' + best.fp.split('|')[0] + 'us)'
                 : ' · strongest: ' + best.id + ' (' + best.peak + 'dB)';
   }
+  const n24 = rows.reduce((n, r) => n + (r.band === '2.4' ? 1 : 0), 0);
+  const bands = n24 ? ' · ' + (rows.length - n24) + '× 5.8 · ' + n24 + '× ELRS'
+                    : '';
   document.getElementById('detsum').textContent =
     ids + ' drone' + (ids === 1 ? '' : 's') + ' fingerprinted · ' +
-    enc + ' encounter' + (enc === 1 ? '' : 's') + strong;
+    enc + ' encounter' + (enc === 1 ? '' : 's') + strong + bands;
 }
 /* Inline rename: swap a drone chip for a small input; Enter saves (empty
    clears the alias), Esc cancels. All rows of the fingerprint update
@@ -2153,13 +2429,14 @@ function droneRename(chip) {
   });
   inp.addEventListener('blur', () => finish(true));
 }
-/* Match a detection row to its screenshot: capture names are
-   <sanitized episode start>__<HHMMSS>.jpg, sanitized the same way
-   (YYYY-MM-DDTHH:MM:SS -> dashes). */
-const shotFor = (r, shots) => {
-  if (typeof r.start_iso !== 'string' || r.start_iso.length < 19) return null;
+/* Match a detection row to its screenshots: capture names are
+   <sanitized episode start>__<tag>.jpg, sanitized the same way
+   (YYYY-MM-DDTHH:MM:SS -> dashes). A row can have several (auto-shot,
+   manual shots, best-OSD frame). */
+const shotsFor = (r, shots) => {
+  if (typeof r.start_iso !== 'string' || r.start_iso.length < 19) return [];
   const san = r.start_iso.slice(0, 19).replace(/:/g, '-');
-  return shots.find(n => n.startsWith(san + '__')) || null;
+  return shots.filter(n => n.startsWith(san + '__'));
 };
 function showShot(src) {
   document.getElementById('lbimg').src = src;
@@ -2181,11 +2458,27 @@ function renderDets(d) {
   nzBtn.textContent = (showNoise ? 'HIDE NOISE (' : 'SHOW NOISE (') + noiseN + ')';
   document.getElementById('dettotal').textContent = view.length + ' ROWS';
   // Cluster ALL rows (noise included) so drone IDs stay stable when the
-  // noise toggle flips, then summarize the visible view only.
+  // noise toggle flips, then summarize the visible view only. Also stamp
+  // per-row: droneNew (cluster first seen <24 h ago -> ✦ on the chip) and
+  // the virtual geo cell (📍 when the row carries a browser fix).
   const dm = droneMap(rows);
+  const firstSeen = {};
   rows.forEach(r => {
     const fp = droneFp(r);
-    if (fp) { r.drone = dm[fp]; r.dronefp = fp; }
+    if (fp) {
+      r.drone = dm[fp]; r.dronefp = fp;
+      const t = String(r.start_iso || '');
+      if (!(fp in firstSeen) || t < firstSeen[fp]) firstSeen[fp] = t;
+    }
+  });
+  const nowMs = Date.now();
+  rows.forEach(r => {
+    if (r.dronefp) {
+      const t0 = Date.parse(firstSeen[r.dronefp] || '');
+      r.droneNew = isFinite(t0) && nowMs - t0 < 86400000;
+    }
+    if (typeof r.geo_lat === 'number' && typeof r.geo_lon === 'number')
+      r.geo = '📍';
   });
   renderDetSum(view);
   // Skip columns the CSV lacks entirely (or that are blank on every row).
@@ -2194,7 +2487,7 @@ function renderDets(d) {
     const li = cols.findIndex(c => c[0] === 'level_min_db');
     cols.splice(li >= 0 ? li + 1 : cols.length, 0, ['spark', 'LEVEL']);
   }
-  if (view.some(r => shotFor(r, shots))) cols.push(['shot', 'SHOT']);
+  if (view.some(r => shotsFor(r, shots).length)) cols.push(['shot', 'SHOT']);
   if (window.innerWidth <= 899) { renderDetCards(view, cols, shots); return; }
   const sig = cols.map(c => c[0]).join(',');
   if (sig !== detSig) {
@@ -2211,9 +2504,11 @@ function renderDets(d) {
     return '<tr' + (rcls ? ' class="' + rcls + '"' : '') + '>' + cols.map(c => {
       const k = c[0], v = r[k];
       if (k === 'shot') {
-        const nm = shotFor(r, shots);
-        return nm ? '<td><img class="shotth" src="/shots/' + nm + '"></td>'
-                  : '<td class="na">--</td>';
+        const nms = shotsFor(r, shots);
+        return nms.length
+          ? '<td>' + nms.map(nm =>
+              '<img class="shotth" src="/shots/' + nm + '">').join('') + '</td>'
+          : '<td class="na">--</td>';
       }
       if (k === 'spark') { const sp = sparkSpan(r); return sp ? '<td>' + sp + '</td>'
                                                               : '<td class="na">--</td>'; }
@@ -2221,8 +2516,14 @@ function renderDets(d) {
         return v === 1 ? '<td><span class="vsb y">YES</span></td>'
                        : '<td class="na">--</td>';
       if (v === undefined || v === '') return '<td class="na">--</td>';
-      if (k === 'channel') return '<td>' + bchip(r.band, canonCh(v)) + '</td>';
-      if (k === 'drone') return '<td>' + droneChip(r.dronefp, v) + '</td>';
+      if (k === 'band')
+        return '<td><span class="bchip ' + (v === '2.4' ? 'b24' : 'b58') + '">' +
+               esc(v) + '</span></td>';
+      if (k === 'geo')
+        return '<td title="' + esc(r.geo_lat) + ', ' + esc(r.geo_lon) +
+               '">📍</td>';
+      if (k === 'channel') return '<td>' + chCell(r) + '</td>';
+      if (k === 'drone') return '<td>' + droneChip(r.dronefp, v, r.droneNew) + '</td>';
       if (k === 'cfo_ppm')
         return '<td class="num" title="per-measurement carrier offset — drifts ' +
                'with video content; NOT a fingerprint">' + esc(fmtCfo(v)) + '</td>';
@@ -2246,16 +2547,19 @@ function renderDets(d) {
    chip + timestamp + duration + shot + sync; the rest stacks as
    label:value pairs in a 2-column grid. */
 function renderDetCards(rows, cols, shots) {
-  const TITLE = ['channel', 'drone', 'start_iso', 'duration_s', 'video_sync', 'shot'];
+  const TITLE = ['channel', 'drone', 'geo', 'start_iso', 'duration_s', 'video_sync', 'shot'];
   document.getElementById('detcards').innerHTML = rows.map(r => {
     let h = '<div class="dcline">';
-    if (r.channel !== undefined && r.channel !== '') h += bchip(r.band, canonCh(r.channel));
-    if (r.drone) h += droneChip(r.dronefp, r.drone);
+    if (r.channel !== undefined && r.channel !== '') h += chCell(r);
+    if (r.drone) h += droneChip(r.dronefp, r.drone, r.droneNew);
+    if (r.geo) h += '<span title="' + esc(r.geo_lat) + ', ' + esc(r.geo_lon) +
+                    '">📍</span>';
     if (r.start_iso) h += '<span class="dcts">' + fmtISO(r.start_iso) + '</span>';
     if (r.duration_s !== undefined && r.duration_s !== '')
       h += '<span class="dcdur">' + esc(fmtDur(r.duration_s)) + '</span>';
-    const nm = shotFor(r, shots);
-    if (nm) h += '<img class="shotth" src="/shots/' + nm + '">';
+    shotsFor(r, shots).forEach(nm => {
+      h += '<img class="shotth" src="/shots/' + nm + '">';
+    });
     if (r.video_sync === 1) h += '<span class="vsb y">YES</span>';
     h += '</div>';
     const sp = sparkSpan(r);
@@ -2297,6 +2601,47 @@ document.getElementById('detnoise').addEventListener('click', () => {
   showNoise = !showNoise;
   if (detLast) renderDets(detLast);
 });
+/* Browser geolocation (permission-gated, remembered in c5_geo): while ON,
+   the latest fix rides every /api/state poll as an X-Geo header and the
+   backend stamps it onto detection rows opened since. */
+let geoOn = lsGet('c5_geo') === '1';
+let geoFix = null, geoWatch = null;
+const geoBtn = document.getElementById('geobtn');
+function geoUi() {
+  geoBtn.textContent = geoOn ? '📍 ON' : '📍 OFF';
+  geoBtn.classList.toggle('on', geoOn);
+}
+function geoStart() {
+  if (!('geolocation' in navigator)) {
+    geoOn = false; lsSet('c5_geo', '0'); geoUi();
+    toast('no geolocation API');
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(p => {
+    geoFix = { lat: p.coords.latitude, lon: p.coords.longitude,
+               acc: p.coords.accuracy };
+    if (geoWatch === null)
+      geoWatch = navigator.geolocation.watchPosition(q => {
+        geoFix = { lat: q.coords.latitude, lon: q.coords.longitude,
+                   acc: q.coords.accuracy };
+      }, () => {}, { maximumAge: 5000, timeout: 10000 });
+  }, () => {
+    geoOn = false; lsSet('c5_geo', '0'); geoUi();
+    toast('geolocation denied');
+  });
+}
+geoBtn.addEventListener('click', () => {
+  geoOn = !geoOn;
+  lsSet('c5_geo', geoOn ? '1' : '0');
+  if (geoOn) geoStart();
+  else if (geoWatch !== null) {
+    navigator.geolocation.clearWatch(geoWatch);
+    geoWatch = null; geoFix = null;
+  }
+  geoUi();
+});
+if (geoOn) geoStart();
+geoUi();
 document.getElementById('detclear').addEventListener('click', async () => {
   if (!confirm('Delete ALL logged detections (tools/detections.csv)?')) return;
   try {
@@ -2379,6 +2724,39 @@ function intelItems(e) {
 let elrsHist = [];                     // {t, rssi, lq} per poll, 60 s window
 let elogSeen = 0;                      // last event seq in the tab log
 let elogRows = [];                     // newest-last HTML lines, capped
+/* Session encounter list (this page load only): one entry per link-lock
+   rise->fall with open/close wall times, uid and peak rssi/lq. The
+   persistent log is the CSV (band 2.4 rows); this is the live view. */
+let elrsEnc = [];                      // closed encounters, newest-last
+let elrsEncOpen = null;                // {t0, uid, peakRssi, peakLq}
+const encLine = en =>
+  '<div class="een' + (en.t1 ? '' : ' open') + '">' +
+  '<span class="ets">' + new Date(en.t0).toTimeString().slice(0, 8) +
+  (en.t1 ? '–' + new Date(en.t1).toTimeString().slice(0, 8) : '–…') + '</span>' +
+  '<span class="euid">' + esc(en.uid || 'uid?') + '</span> ' +
+  'rssi ' + (en.peakRssi === null || en.peakRssi === undefined ? '--' : en.peakRssi) +
+  ' · lq ' + (en.peakLq === null || en.peakLq === undefined ? '--' : en.peakLq) +
+  '</div>';
+function updElrsEnc(on, lock, rssi, lq, uid) {
+  if (lock && !elrsEncOpen) {
+    elrsEncOpen = { t0: Date.now(), uid: uid || null,
+                    peakRssi: rssi, peakLq: lq };
+  } else if (lock && elrsEncOpen) {
+    if (uid) elrsEncOpen.uid = uid;
+    if (typeof rssi === 'number')
+      elrsEncOpen.peakRssi = Math.max(elrsEncOpen.peakRssi ?? -Infinity, rssi);
+    if (typeof lq === 'number')
+      elrsEncOpen.peakLq = Math.max(elrsEncOpen.peakLq ?? -Infinity, lq);
+  } else if (elrsEncOpen) {
+    elrsEnc.push(Object.assign({ t1: Date.now() }, elrsEncOpen));
+    elrsEnc = elrsEnc.slice(-40);
+    elrsEncOpen = null;
+  }
+  document.getElementById('eenc').innerHTML =
+    '<div class="eenc-h">ENCOUNTERS // session</div>' +
+    (elrsEncOpen ? encLine(elrsEncOpen) : '') +
+    elrsEnc.slice().reverse().map(encLine).join('');
+}
 function updElrs(e, set) {
   const dot = document.getElementById('edot');
   const chip = document.getElementById('elrschip');
@@ -2435,6 +2813,7 @@ function updElrs(e, set) {
     elrsHist.push({ t: Date.now(), rssi: rssi, lq: numv(e.lq) });
     elrsHist = elrsHist.filter(h => Date.now() - h.t < 60000);
   }
+  updElrsEnc(on, !!(on && e.lock), rssi, numv(e.lq), e.uid);
 }
 /* ELRS tab sparkline: RSSI auto-range (green) + LQ 0..100 (amber), 60 s. */
 function drawElrsSpark() {
@@ -2485,7 +2864,9 @@ function drawElrsSpark() {
 
 async function poll() {
   let s;
-  try { s = await (await fetch('/api/state')).json(); }
+  const hdrs = geoFix ? { 'X-Geo': geoFix.lat + ',' + geoFix.lon + ',' +
+                                   Math.round(geoFix.acc || 0) } : {};
+  try { s = await (await fetch('/api/state', { headers: hdrs })).json(); }
   catch (e) { return; }
   S = s;
   const t = s.telemetry, set = (id, v) => document.getElementById(id).textContent = v;
@@ -3069,6 +3450,16 @@ def create_app() -> Flask:
 
     @app.get("/api/state")
     def api_state():
+        # Browser geolocation fix, if the page has permission and sends it.
+        geo_hdr = request.headers.get("X-Geo", "")
+        try:
+            parts = [float(p) for p in geo_hdr.split(",")]
+        except ValueError:
+            parts = []
+        if len(parts) >= 2 and -90.0 <= parts[0] <= 90.0 \
+                and -180.0 <= parts[1] <= 180.0:
+            acc = parts[2] if len(parts) >= 3 and parts[2] >= 0 else None
+            _geo_set(parts[0], parts[1], acc)
         with STATE.lock:
             snap = dict(STATE.telemetry)
             frame_age = (time.monotonic() - STATE.frame_time
@@ -3151,19 +3542,13 @@ def create_app() -> Flask:
 
     @app.post("/api/shot")
     def api_shot():
+        global _last_shot_mono
         data = current_jpeg()
         with STATE.lock:
             ep_start = EPISODE["start"] if EPISODE is not None else None
+        _last_shot_mono = time.monotonic()
         base = _shot_stamp(ep_start if ep_start is not None else time.time())
-        SHOTS_DIR.mkdir(exist_ok=True)
-        name = f"{base}__{time.strftime('%H%M%S')}.jpg"
-        path = SHOTS_DIR / name
-        n = 2
-        while path.exists():
-            name = f"{base}__{time.strftime('%H%M%S')}_{n}.jpg"
-            path = SHOTS_DIR / name
-            n += 1
-        path.write_bytes(data)
+        name = _save_shot(data, base, time.strftime("%H%M%S"))
         return jsonify({"ok": True, "name": name})
 
     @app.get("/shots/<path:filename>")
