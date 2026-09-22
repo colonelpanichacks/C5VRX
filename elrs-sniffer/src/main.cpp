@@ -161,6 +161,9 @@ static void stats_tick()
     uist.snr_db = last_snr;
     uist.locked = locked;
     last_rssi = -128.0f; // reset peak-hold for the next window
+#if defined(PIN_BOARD_LED)
+    digitalWrite(PIN_BOARD_LED, locked ? HIGH : LOW);
+#endif
 
     Serial.printf("{\"t\":\"stats\",\"ms\":%lu,\"rate\":\"%s\",\"iq\":\"%c\",\"rssi\":%d,"
                   "\"snr10\":%d,\"pps\":%lu,\"lq_permille\":%lu,\"lock\":%u,"
@@ -196,6 +199,10 @@ void setup()
     for (int i = 0; i < UI_TLM_LINES; i++) uist.tlm[i][0] = 0;
 
     ui_init();
+#if defined(PIN_BOARD_LED)
+    pinMode(PIN_BOARD_LED, OUTPUT);
+    digitalWrite(PIN_BOARD_LED, LOW); // LED_ON = HIGH: lit only when locked
+#endif
     elrs_decode_init(&dctx);
     sniffer_sweep_build(&sweep);
 

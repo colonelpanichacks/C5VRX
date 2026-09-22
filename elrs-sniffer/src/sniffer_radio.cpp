@@ -44,13 +44,9 @@ SnifferRadio g_radio;
 
 bool SnifferRadio::begin()
 {
-#if defined(SNIFFER_RADIO_HSPI)
-    spi = new SPIClass(HSPI);
-    spi->begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
-#else
+    // T3-S3 radio SPI bus (FSPI) at verified pins 5/3/6/7 — board_pins.h.
     spi = new SPIClass(FSPI);
-    spi->begin();
-#endif
+    spi->begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
     Module *mod = new Module(PIN_LORA_NSS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY, *spi,
                              SPISettings(8000000, MSBFIRST, SPI_MODE0));
     radio = new SnifferSX1280(mod);
@@ -59,6 +55,10 @@ bool SnifferRadio::begin()
     if (st != RADIOLIB_ERR_NONE) return false;
     // ELRS SX1280.cpp Begin(): register 0x0891 |= 0xC0 (high sensitivity)
     mod->SPIwriteRegister(0x0891, mod->SPIreadRegister(0x0891) | 0xC0);
+#if PIN_LORA_RXEN != -1
+    // PA variant: antenna switch enables (verified SX1280PA_PingPong.ino)
+    radio->setRfSwitchPins(PIN_LORA_RXEN, PIN_LORA_TXEN);
+#endif
     radio->setDio1Action(on_dio1);
     return true;
 }

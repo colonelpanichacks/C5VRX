@@ -1,106 +1,54 @@
 // =============================================================================
-// board_pins.h — pin definitions for the ELRS sniffer hardware candidates.
+// board_pins.h — LilyGo T3-S3 (ESP32-S3) SX1280 2.4 GHz variant
 //
-// !!! UNVERIFIED HARDWARE — see BOARD.md !!!
-// The exact LilyGo model and its SX1280 wiring must be confirmed against the
-// physical unit before flashing. Sections are tagged:
-//   [VERIFIED]   — taken from the manufacturer's own example source
-//   [GUESS]      — placeholder until the board is in hand / inspected
+// [VERIFIED] against the manufacturer's own source:
+//   Xinyuan-LilyGO/LilyGo-LoRa-Series, examples/T3S3Factory/utilities.h
+//   (T3_S3_V1_2_SX1280 / T3_S3_V1_2_SX1280_PA blocks, fetched 2026-09-22)
+//   and examples/LoRa/T3S3/SX1280PA_PingPong/SX1280PA_PingPong.ino
+//   (RF-switch via radio.setRfSwitchPins(RX=21, TX=10)).
+//
+// Two hardware variants share this pinout; the PA variant adds an external
+// antenna-switch PA driven by two GPIOs. Non-PA is the common "T3-S3 2.4G
+// without PA" listing; uncomment T3S3_SX1280_PA if the unit has the PA.
 // =============================================================================
 #pragma once
 
-#if defined(BOARD_LILYGO_T_EMBED_S3)
+#if !defined(BOARD_LILYGO_T3S3_SX1280)
+#define BOARD_LILYGO_T3S3_SX1280
+#endif
 
-// ---------------------------------------------------------------------------
-// LilyGo T-Embed (ESP32-S3, 1.9" ST7789 170x320 portrait / 320x170 landscape)
-//
-// DISPLAY PINS [VERIFIED] — from Xinyuan-LilyGO/T-Embed factory sketch,
-// examples/factory/pin_config.h @ main:
-//   PIN_LCD_CS=10  PIN_LCD_DC=13  PIN_LCD_CLK=12  PIN_LCD_MOSI=11
-//   PIN_LCD_RES=9  PIN_LCD_BL=15  (panel: 320x170 in the factory's landscape
-//   orientation; ST7789V)
-//
-// SX1280 PINS [GUESS] — STOCK T-Embed has NO SX1280. Its sub-GHz radio is a
-// CC1101 (RADIO_CS_PIN=17 in the factory sketch). The 2.4 GHz ELRS radio on
-// Konrad's ecosystem unit is assumed to be wired like a LilyGo T3S3 SX1280
-// (the usual LilyGo 2.4G arrangement); CONFIRM WITH A MULTIMETER / SCHEMATIC.
-// If the T-Embed runs the SX1280 on the SD-card SPI bus (pins 38-41) or the
-// NFC/RFID SPI, change the SPI section below accordingly.
-// ---------------------------------------------------------------------------
+// --- SSD1306 OLED, 0.96" 128x64, I2C [VERIFIED: factory sketch addr 0x3c] ---
+#define PIN_OLED_SDA   18
+#define PIN_OLED_SCL   17
+#define OLED_I2C_ADDR  0x3C
+// If the panel shows garbage/columns of junk, it may be an SH1106 — swap the
+// constructor in ui.cpp (U8G2_SSD1306_... -> U8G2_SH1106_128X64_NONAME_F_HW_I2C).
 
-// --- Display (ST7789, SPI) [VERIFIED pins]
-#define PIN_TFT_CS    10
-#define PIN_TFT_DC    13
-#define PIN_TFT_RST   9
-#define PIN_TFT_SCK   12
-#define PIN_TFT_MOSI  11
-#define PIN_TFT_BL    15
-#define PIN_TFT_LED   46   // [VERIFIED] PIN_POWER_ON: hold HIGH to power the board
+// --- SX1280 radio, SPI (FSPI) [VERIFIED: utilities.h T3_S3_V1_2_SX1280*] ---
+#define PIN_LORA_NSS   7    // RADIO_CS_PIN
+#define PIN_LORA_SCK   5    // RADIO_SCLK_PIN
+#define PIN_LORA_MISO  3    // RADIO_MISO_PIN
+#define PIN_LORA_MOSI  6    // RADIO_MOSI_PIN
+#define PIN_LORA_RST   8    // RADIO_RST_PIN
+#define PIN_LORA_DIO1  9    // RADIO_DIO1_PIN  (IRQ)
+#define PIN_LORA_BUSY 36    // RADIO_BUSY_PIN
 
-// --- TFT_eSPI setup block (must precede #include <TFT_eSPI.h>) ---
-// Panel: ST7789V 170x320 portrait. [VERIFIED] pins from the factory sketch;
-// offsets/driver choice may need a tweak once real hardware is on the bench
-// (if the image is shifted, try rotation or CGRAM offsets — see BOARD.md).
-#define USER_SETUP_LOADED
-#define ST7789_DRIVER
-#define TFT_WIDTH  170
-#define TFT_HEIGHT 320
-#define TFT_CS   PIN_TFT_CS
-#define TFT_DC   PIN_TFT_DC
-#define TFT_RST  PIN_TFT_RST
-#define TFT_SCLK PIN_TFT_SCK
-#define TFT_MOSI PIN_TFT_MOSI
-#define TFT_BL   PIN_TFT_BL
-#define TFT_BACKLIGHT_ON HIGH
-#define LOAD_GLCD
-#define LOAD_FONT2
-#define LOAD_FONT4
-#define SPI_FREQUENCY 40000000
-#define SNIFFER_HAS_TFT 1
-
-// --- SX1280 radio [GUESS — T3S3-style wiring, MUST confirm]
-#define PIN_LORA_NSS   7
-#define PIN_LORA_SCK   5
-#define PIN_LORA_MOSI  6
-#define PIN_LORA_MISO  3
-#define PIN_LORA_BUSY 13
-#define PIN_LORA_DIO1 14
-#define PIN_LORA_RST  12
-#define PIN_LORA_TXEN -1   // PA variant only; -1 = not fitted
-#define PIN_LORA_RXEN -1
-
-#define SNIFFER_BOARD_NAME "LilyGo T-Embed S3 [radio pins GUESSED]"
-
-#elif defined(BOARD_LILYGO_T3S3_2G4)
-
-// ---------------------------------------------------------------------------
-// LilyGo T3S3 2.4G (ESP32-S3 + SX1280, SSD1306 0.96" OLED over I2C).
-// Radio pins match LilyGo-LoRa-Series / Meshtastic tlora-t3s3-2-4g variant
-// [GUESS until flashed on real hardware]. OLED support is TODO — the TFT
-// sections below are inert with this board selected.
-// ---------------------------------------------------------------------------
-#define PIN_LORA_NSS   7
-#define PIN_LORA_SCK   5
-#define PIN_LORA_MOSI  6
-#define PIN_LORA_MISO  3
-#define PIN_LORA_BUSY 13
-#define PIN_LORA_DIO1 14
-#define PIN_LORA_RST  12
-#define PIN_LORA_TXEN -1
-#define PIN_LORA_RXEN -1
-#define PIN_OLED_SDA  18
-#define PIN_OLED_SCL  17
-
-#define SNIFFER_BOARD_NAME "LilyGo T3S3 2.4G [OLED UI TODO]"
-#define SNIFFER_HAS_TFT 0
-
+// --- PA-variant antenna switch enables [VERIFIED: SX1280PA_PingPong.ino] ---
+// Non-PA boards have no switch: leave -1. PA boards: RX=IO21, TX=IO10 and
+// MUST use these (the PA is deaf until RXEN is driven).
+#if defined(T3S3_SX1280_PA)
+#define PIN_LORA_RXEN  21   // RADIO_RX_PIN
+#define PIN_LORA_TXEN  10   // RADIO_TX_PIN
+#define SNIFFER_BOARD_NAME "LilyGo T3-S3 SX1280-PA"
 #else
-#error "Select a board: BOARD_LILYGO_T_EMBED_S3 (see BOARD.md)"
+#define PIN_LORA_RXEN  -1
+#define PIN_LORA_TXEN  -1
+#define SNIFFER_BOARD_NAME "LilyGo T3-S3 SX1280"
 #endif
 
-// RadioLib SPI: T-Embed has the display and the (modded) radio on separate
-// SPI peripherals; RadioLib gets its own SPI bus instance when the pins
-// differ from the TFT's.
-#if SNIFFER_HAS_TFT && defined(PIN_LORA_SCK) && (PIN_LORA_SCK != PIN_TFT_SCK)
-#define SNIFFER_RADIO_HSPI 1
-#endif
+// --- Extras on the same header [VERIFIED: utilities.h] ---
+#define PIN_BOARD_LED  37   // onboard LED, HIGH = on (lock indicator)
+#define PIN_VBAT_ADC    1   // battery divider (100k/100k), ADC1_CH0
+#define PIN_BUTTON      0   // BOOT button
+
+#define SNIFFER_HAS_OLED 1

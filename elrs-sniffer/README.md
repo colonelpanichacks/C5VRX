@@ -7,9 +7,10 @@ telemetry, and shows them on the onboard display + USB serial (one JSON line
 per second plus per-event lines, shaped for later fusion into the OUI-SPY
 Flask dashboard).
 
-> **STATUS: firmware-complete, hardware-unverified.** Both PlatformIO envs
-> build; the parser is host-tested; the exact radio pinout is pending — see
-> [BOARD.md](BOARD.md) for the one piece of information still needed.
+> **STATUS: firmware-complete, hardware-pinned, bench-untested.** Board is the
+> **LilyGo T3-S3 SX1280** (pins verified against LilyGo's factory sources —
+> [BOARD.md](BOARD.md)); both PlatformIO envs build; the parser is
+> host-tested. RF/OLED bring-up against a live ELRS TX is the remaining step.
 
 ## What it detects
 
@@ -57,29 +58,35 @@ CRSF spec (telemetry types).
 
 ## Hardware / wiring
 
-None — everything is onboard. **But** the SX1280 pinout is a documented
-placeholder until the physical unit is pinned: **[BOARD.md](BOARD.md)**.
-Display section of `src/board_pins.h` is verified for the T-Embed from
-LilyGo's own factory sketch; the radio section is a labeled guess.
+**LilyGo T3-S3 (ESP32-S3) SX1280 2.4 GHz + 0.96" SSD1306 OLED** — no wiring,
+everything onboard. Pinout is **[VERIFIED]** from LilyGo's factory sources:
+[BOARD.md](BOARD.md). If the unit is the **PA** variant, add
+`-D T3S3_SX1280_PA` to the build flags so the antenna-switch enables
+(RX=21/TX=10) are driven — see BOARD.md.
 
 ## Build & flash
 
 ```bash
 cd elrs-sniffer
-pio run                          # generic env compile check
-pio run -e lilygo-t-embed-s3     # candidate board env (see BOARD.md!)
-pio run -e lilygo-t-embed-s3 -t upload
-pio device monitor -b 460800
+pio run                                # generic env compile check
+./flash.sh                             # build + FULL ERASE + flash + verify
+pio device monitor -b 460800           # the JSON stream
 ```
 
-USB serial is the product interface: JSON lines at 460800 baud (native USB
-CDC on the S3 env). If `pio` is unavailable: `pip install platformio` (or
-`python3 -m pip install platformio`), then the same commands via
-`python3 -m platformio ...`.
+`flash.sh` exists because `pio run -t upload` writes only the app image —
+after the required full erase that leaves an unbootable board. The script
+writes the full canonical image set at explicit offsets (documented, with
+provenance, in [flash.md](flash.md)) and verifies. USB serial is the
+product interface: JSON lines at 460800 baud over the T3-S3's native USB
+port. If `pio` is unavailable: `pip install platformio` (or
+`python3 -m pip install platformio`); flash.sh falls back to
+`python3 -m platformio` / `python3 -m esptool` automatically.
 
 ## Serial protocol (dashboard-fusion ready)
 
-One `stats` line per second:
+Full contract — every field, units, cadence — is in
+**[PROTOCOL.md](PROTOCOL.md)** (stable schema for the dashboard
+integration; additive-only within 0.2.x). One `stats` line per second:
 
 ```json
 {"t":"stats","ms":12345,"rate":"LoRa 250Hz","iq":"i","rssi":-87,"snr10":85,"pps":243,"lq_permille":970,"lock":1,"ch":[1500,988,1501,1499],"arm":0,"uid":"a5b3c2"}
@@ -93,7 +100,7 @@ Event lines: `dwell` (sweep step), `sync` (+uid, rate, nonce), `lock` /
 reads these lines over serial and feeds the OUI-SPY Flask app the same way
 the 5.8 GHz side does — a second sensor tab with stick bars, an LQ/RSSI
 history graph, and one fused "RF picture" (video + control links) per
-detection. The JSON schema above is the contract; keep it stable.
+detection. PROTOCOL.md is the contract.
 
 ## Legality
 
@@ -107,36 +114,38 @@ The README honesty note applies in the field too: "link fingerprint" is not
 ## Repository map
 
 ```text
-├── platformio.ini        # esp32dev (CI) + lilygo-t-embed-s3 (candidate)
-├── BOARD.md              # hardware pinning: verified vs guessed, what we need
+├── platformio.ini        # esp32dev (CI) + lilygo-t3s3-sx1280 (target)
+├── BOARD.md              # T3-S3 pinout, verified against LilyGo factory sources
+├── flash.sh / flash.md   # full-erase flashing, exact offsets + provenance
+├── PROTOCOL.md           # serial JSON contract for the dashboard bridge
 ├── src/
 │   ├── elrs_defs.h       # researched constants, cited (rate table, layouts)
 │   ├── elrs_crc.h        # CRC-14/16 (Koopman polys, ELRS semantics)
 │   ├── elrs_parse.cpp/.h # classifier + stick/telemetry decoders
-│   ├── sniffer_radio.cpp/.h # RadioLib glue + sweep table
-│   ├── ui.cpp/.h         # TFT_eSPI UI, OUI-SPY dark theme
-│   ├── board_pins.h      # per-board pins + TFT setup (T-Embed pre-filled)
-│   └── main.cpp          # sweep/lock state machine, JSON out
+│   ├── sniffer_radio.cpp/.h # RadioLib glue + sweep table (+PA RF switch)
+│   ├── ui.cpp/.h         # SSD1306 128x64 OLED, OUI-SPY dark theme
+│   ├── board_pins.h      # T3-S3 SX1280 pins [VERIFIED]
+│   └── main.cpp          # sweep/lock state machine, JSON out, lock LED
 └── test/host/test_parser.cpp  # host parser tests (no hardware needed)
 ```
 
 ## Verification
 
-- `pio run -e esp32dev` and `pio run -e lilygo-t-embed-s3` — both build.
+- `pio run` — both envs (`esp32dev`, `lilygo-t3s3-sx1280`) build.
 - Host tests (`test/host`): CRC cross-formulation, 4×10 bitpack round-trip,
   OTA8/OTA4 SYNC self-acquisition, RC decode after capture, noise gate —
   all pass (`c++ -std=c++11 -o test_parser test_parser.cpp
   ../../src/elrs_parse.cpp -I../../src && ./test_parser`).
-- Not yet done (needs the board): RF bring-up, display offset check,
-  live-packet validation against a real ELRS TX.
+- Not yet done (needs the bench): RF bring-up, OLED check, live-packet
+  validation against a real ELRS TX.
 
 ## Known TODOs
 
 - 4.x/master air-format drift (sync grew a byte; RC header bit re-map) —
   parser marks these, does not fully decode.
 - FLRC listening after UID capture (256-candidate sync-word sweep).
-- T3S3 SSD1306 OLED UI (stub `SNIFFER_HAS_TFT 0`).
 - Wide-switch AUX slotting without nonce tracking (value shown unslotted).
 - GPS altitude packing variant (CRSF spec vs ELRS history).
 - 2.x "classic" 8-byte nonce-first packets: demod-length compatible, CRC
   claims unverified — marked legacy.
+- `tools/elrs_bridge.py` dashboard bridge (against PROTOCOL.md).
