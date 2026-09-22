@@ -108,8 +108,40 @@ Passive receive only — this firmware never calls a transmit API. Receiving
 in the license-free 2.4 GHz ISM band is broadly permitted; *using* decoded
 third-party telemetry may be restricted where you operate (privacy,
 direction-finding, interception laws). You are responsible for compliance.
-The README honesty note applies in the field too: "link fingerprint" is not
+The UI honesty note applies in the field too: "link fingerprint" is not
 "identified pilot".
+
+## OSINT
+
+The sniffer's endgame is zero-prior-knowledge link capture: sync packets
+leak `UID[3..5]` in the clear (fingerprint), the hop sequence is seeded by
+the UID, and the full UID recovers the **binding phrase** that names the
+pilot's setup:
+
+```bash
+python3 tools/phrase_crack.py 61ace1        # tail from a captured sync
+python3 tools/phrase_crack.py --uids captures.txt --wordlist extra_words.txt
+```
+
+`phrase_crack.py` (stdlib only) runs the exact ELRS derivation
+`UID = md5("-DMY_BINDING_PHRASE=\"<phrase>\"")[:6]` over a built-in
+dictionary (defaults, FPV vocabulary, ~300 first names × `["", "1", "123",
+"2023", "2024", "2025", "!"]`) plus any custom wordlist. ~1.3M hashes/s
+single-threaded. A GPU or large-wordlist attack on MD5 is trivially
+possible — the dictionary exists because it covers the realistic cases;
+the phrase is anti-collision, not a secret.
+
+**Legal posture:** the cracker is an *offline* attack on *your own passive
+captures*. It exists to suggest a human-readable label for a link the
+sniffer legitimately heard (dashboard alias candidate) — not to enable
+impersonation: knowing a binding phrase lets you *receive* a link, never
+control it (control requires the TX's model setup, and driving someone
+else's craft is a crime regardless of protocol). Only run it against
+captures you are legally allowed to possess, and follow your jurisdiction's
+rules on intercepting and using third-party radio traffic.
+
+OSINT pipeline in one line: `fp`/`sync` event → `uid_tail` →
+`phrase_crack.py` → suggested alias (dashboard auto-labeling).
 
 ## Repository map
 
