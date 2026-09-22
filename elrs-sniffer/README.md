@@ -121,15 +121,28 @@ pilot's setup:
 ```bash
 python3 tools/phrase_crack.py 61ace1        # tail from a captured sync
 python3 tools/phrase_crack.py --uids captures.txt --wordlist extra_words.txt
+python3 tools/phrase_crack.py 61ace1 --wordnums --leet --case   # human patterns
+python3 tools/phrase_crack.py 61ace1 --alnum 5                  # brute [a-z0-9]^5
 ```
 
 `phrase_crack.py` (stdlib only) runs the exact ELRS derivation
-`UID = md5("-DMY_BINDING_PHRASE=\"<phrase>\"")[:6]` over a built-in
-dictionary (defaults, FPV vocabulary, ~300 first names × `["", "1", "123",
-"2023", "2024", "2025", "!"]`) plus any custom wordlist. ~1.3M hashes/s
-single-threaded. A GPU or large-wordlist attack on MD5 is trivially
-possible — the dictionary exists because it covers the realistic cases;
-the phrase is anti-collision, not a secret.
+`UID = md5("-DMY_BINDING_PHRASE=\"<phrase>\"")[:6]` over, in order: the
+built-in dictionary (defaults, FPV vocabulary, ~300 first names × `["", "1",
+"123", "2023", "2024", "2025", "!"]`); `--leet` (l33tspeak variants, single
++ double `a4 e3 i1 o0 s5`); `--case` (Capitalized + UPPER); `--wordnums`
+(`word+d`, `d+word`, `word_d` for d 0..9999 — the classic "freestyle23",
+"sarah2023" pattern, ~9M hashes); and `--alnum N` (full `[a-z0-9]^N` brute
+across all cores — N=5 is 60M ≈ seconds-to-tens-of-seconds multicore,
+N=6 is 36⁶ ≈ 2.2e9 ≈ a few minutes; an ETA prints before it starts).
+Tail-only hits are reported "PROBABLE, verify with more captures".
+~1.3M hashes/s per core single-threaded (~15M/s on a 10-core box).
+
+Realistic coverage: dictionary + wordnums + leet + case handles what
+humans actually type; `--alnum 6` sweeps every short lowercase-alphanumeric
+phrase. Beyond that (7+, mixed case, symbols) the math explodes — use
+targeted wordlists from your own intel (`--wordlist`), not more compute.
+A GPU attack on MD5 is trivially possible; this tool stays stdlib-only
+because the dictionary covers the realistic OSINT cases.
 
 **Legal posture:** the cracker is an *offline* attack on *your own passive
 captures*. It exists to suggest a human-readable label for a link the
