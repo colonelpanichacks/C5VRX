@@ -1,0 +1,162 @@
+menu "C5VRX-2 firmware mode"
+
+choice C5VRX2_MODE
+    prompt "Boot mode"
+    default C5VRX2_MODE_LIVE
+
+    config C5VRX2_MODE_LIVE
+        bool "Live MODEM_DIAG IQ to recovered CVBS"
+
+    config C5VRX2_MODE_RF_ORACLE
+        bool "RF vendor pre-trigger oracle"
+
+    config C5VRX2_MODE_RF_WRAP
+        bool "RF physical-wrap phase diagnostic"
+
+    config C5VRX2_MODE_RF_DMA
+        bool "RF MAC-owned SRAM GDMA visibility diagnostic"
+
+    config C5VRX2_MODE_RF_DMA_CPU_OWNED
+        bool "RF GDMA visibility while HP CPU retains SRAM ownership"
+
+    config C5VRX2_MODE_MODEM_DIAG
+        bool "RF modem diagnostic bus activity probe"
+
+    config C5VRX2_MODE_MODEM_CAPTURE
+        bool "Capture XIAO-native candidate Q4/I4 modem bytes"
+
+    config C5VRX2_MODE_MODEM_PARLIO
+        bool "Capture proven Q4/I4 bus with PARLIO RX"
+
+    config C5VRX2_MODE_MODEM_WBFM
+        bool "Capture PARLIO-attached adjacent-FM output"
+
+    config C5VRX2_MODE_TX_WBFM_TEST
+        bool "Byte-exact PARLIO TX WBFM decorator test"
+
+    config C5VRX2_MODE_AV_STATIC
+        bool "AV static DAC code"
+
+    config C5VRX2_MODE_AV_PAL_MONO
+        bool "AV synthetic monochrome PAL"
+
+    config C5VRX2_MODE_AV_PAL_COLOR
+        bool "AV synthetic PAL colour bars"
+
+    config C5VRX2_MODE_TX_80M_ORACLE
+        bool "PARLIO TX 80 MHz hardware timing and loopback oracle"
+
+    config C5VRX2_MODE_LINEAR80_ORACLE
+        bool "Bounded Phase5 interpolator byte/FIFO/throughput oracle (RF off)"
+endchoice
+
+config C5VRX2_AV_STATIC_CODE
+    int "Static DAC code"
+    depends on C5VRX2_MODE_AV_STATIC
+    range 0 63
+    default 18
+
+config C5VRX2_ISSUE11_CAPTURE
+    bool "Issue 11 bounded RF acquisition and actual PR10 DAC replay capture"
+    depends on C5VRX2_MODE_LIVE
+    default n
+
+config C5VRX2_LINEAR80
+    bool "Experimental Phase5 four-point reconstruction at 80 MS/s"
+    depends on C5VRX2_MODE_LIVE
+    default n
+    help
+        Preserve 40 MB/s raw input and the complete Phase5 centroid table.
+        Six BitScrambler bundles produce four distinct interpolation points
+        per 50 ns. Requires hardware throughput/FIFO validation before use.
+
+config C5VRX2_LIVE_SNAPSHOT_ONCE
+    bool "Persist one live raw Q4/I4 ring for offline diagnosis"
+    depends on C5VRX2_MODE_LIVE
+    default n
+    help
+        Start the live input transport, snapshot the 16384-byte raw Q4/I4
+        ring, then explicitly stop RF/PARLIO and persist it in diagcap. This
+        is a bounded hardware diagnostic only; normal live firmware remains
+        continuous and never writes its realtime ring to flash.
+
+config C5VRX2_LIVE_SNAPSHOT_RAW_Q4
+    bool "Bypass TX WBFM/DAC while taking the raw snapshot"
+    depends on C5VRX2_LIVE_SNAPSHOT_ONCE
+    default n
+    help
+        Bypass the BitScrambler and DAC for the bounded snapshot and persist
+        the exact 40-MS/s MODEM_DIAG Q4/I4 bytes. This isolates input sample
+        integrity from adjacent-FM, rate conversion, gain and clamping.
+
+config C5VRX2_WBFM_SELFTEST_ONCE
+    bool "Run bounded Q4 WBFM BitScrambler loopback self-test"
+    depends on C5VRX2_MODE_LIVE
+    default n
+    help
+        Feed deterministic Q4/I4 bytes to the exact production BitScrambler
+        program through its hardware loopback, compare against the C reference,
+        and persist input/actual/expected data in diagcap. RF is not started.
+
+config C5VRX2_WBFM_TRUE40
+    bool "Test True 40 MS/s adjacent demodulator (issue 17 candidate)"
+    depends on C5VRX2_MODE_LIVE || C5VRX2_MODE_TX_WBFM_TEST
+    default n
+    help
+        Two-bundle 40 MS/s IQ to true 40 MS/s DAC candidate with an embedded
+        adjacent 5-bit Cartesian/polar discriminator LUT. Emits two distinct
+        adjacent demodulated DAC codes every 50 ns (25 ns DAC cadence),
+        achieving full 40 MS/s DAC resolution without PARLIO overclocking.
+
+config C5VRX2_WBFM_TRAJECTORY
+    bool "Test middle-sample trajectory LUT (issue 9 candidate)"
+    depends on C5VRX2_MODE_LIVE || C5VRX2_MODE_TX_WBFM_TEST
+    default n
+    help
+        Two-bundle 40 MS/s IQ to 20 MS/s DAC candidate with an embedded
+        phase4/middle-signs/phase4 trajectory table. Overrides phase5 when
+        enabled. Fixed gain=2, pedestal=20, current-minus-previous polarity.
+        The shipped uniform geometry prior is NOT capture-trained. Keep
+        phase5 as the default until independent capture and hardware A/B
+        validation pass. Uses bounded TX oracle variant 8 in test mode.
+
+config C5VRX2_TX_ORACLE_HIGH_NIBBLE
+    bool "Capture trajectory oracle output bits 4..7"
+    depends on C5VRX2_MODE_TX_WBFM_TEST && C5VRX2_WBFM_TRAJECTORY
+    default n
+    help
+        Complement the default low-nibble oracle with the high output bank.
+        VALID consumes an RX lane, so both banks need separate deterministic
+        runs. TX pin order, rate and embedded program remain identical.
+        Diagnostic record version 10 is low bank, 11 is high bank.
+
+config C5VRX2_WBFM_PHASE5_QUALITY
+    bool "Use uniform five-bit polar WBFM core"
+    depends on C5VRX2_MODE_LIVE || C5VRX2_MODE_TX_WBFM_TEST
+    default y
+    help
+        Use an embedded dual-purpose LUT that maps the complete Q4/I4 byte to
+        uniform five-bit phase before FM differencing. A one-time prime is
+        followed by a two-bundle steady-state pipeline. Disable this to use
+        the physically proven Q3/I2 Cartesian fallback.
+
+config C5VRX2_WBFM_PHASE5_100NS
+    bool "Use 100 ns discriminator on uniform five-bit polar WBFM core"
+    depends on C5VRX2_MODE_LIVE || C5VRX2_MODE_TX_WBFM_TEST
+    default n
+    help
+        Doubles the discriminator span from 50 ns to 100 ns across odd/even
+        alternating history registers. Halves high-frequency FM noise and static
+        while maintaining 20 MS/s output and 40 MS/s DAC cadence.
+
+config C5VRX2_PARLIO_RX_NEG_EDGE
+    bool "Sample MODEM_DIAG on the opposite PARLIO RX clock edge"
+    depends on C5VRX2_MODE_LIVE
+    default n
+    help
+        Hardware A/B for GPIO-matrix setup/hold margin. The ESP-IDF edge
+        labels have changed semantics on some C5 revisions, so POS/NEG are
+        treated only as two physical candidates. This does not change the
+        40 MS/s receive rate or the 20 MS/s DAC rate.
+
+endmenu

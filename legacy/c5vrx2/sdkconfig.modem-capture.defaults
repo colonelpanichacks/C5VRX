@@ -1,0 +1,3 @@
+# Capture DIAG[6:9]/[16:19] plus the post-stop RF dump ring.
+# CONFIG_C5VRX2_MODE_LIVE is not set
+CONFIG_C5VRX2_MODE_MODEM_CAPTURE=y

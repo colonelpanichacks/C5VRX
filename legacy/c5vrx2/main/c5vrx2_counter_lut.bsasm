@@ -1,0 +1,29 @@
+# Hardware self-test stages 6/7: load a controlled byte into counter A, route
+# A0..A7 into LUT bank 1, and emit its low byte. Stage 6 loads an identity LUT;
+# stage 7 loads the production gain/pedestal/clamp LUT.
+cfg prefetch true
+cfg eof_on downstream
+cfg trailing_bytes 0
+cfg lut_width_bits 16
+
+load_counter:
+    set 16..23 0..7,
+    read 8,
+    LDCTIAL
+
+address:
+    set 16 A0,
+    set 17 A1,
+    set 18 A2,
+    set 19 A3,
+    set 20 A4,
+    set 21 A5,
+    set 22 A6,
+    set 23 A7,
+    set 24 H,
+    set 25 L
+
+emit:
+    set 0..7 L0..L7,
+    write 8,
+    jmp load_counter

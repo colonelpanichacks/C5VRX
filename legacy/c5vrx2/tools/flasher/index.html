@@ -1,0 +1,854 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>C5VRX Flasher</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #16191c;
+      --top: #202428;
+      --panel: #22262a;
+      --panel-2: #1b1f22;
+      --terminal: #101214;
+      --border: #343a40;
+      --border-strong: #474e55;
+      --text: #e4e7ea;
+      --muted: #969da4;
+      --accent: #22b8cf;
+      --accent-hover: #36c7dc;
+      --ok: #63c174;
+      --warn: #d7a94d;
+      --danger: #df6b69;
+      --radius: 3px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    button, input, select { font: inherit; }
+
+    .topbar {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 0 24px;
+      background: var(--top);
+      border-bottom: 1px solid #090a0b;
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 18px;
+      min-width: 0;
+    }
+
+    .logo {
+      font-size: 28px;
+      line-height: 1;
+      font-weight: 800;
+      font-style: italic;
+      letter-spacing: -1.4px;
+      white-space: nowrap;
+    }
+
+    .logo .c5 { color: #f1f3f4; }
+    .logo .vrx { color: var(--accent); }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .connection {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      height: 30px;
+      padding: 0 10px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      color: #c9ced3;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .connection-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #6e7479;
+    }
+
+    .connection.connected .connection-dot { background: var(--ok); }
+
+    .app {
+      width: min(1040px, calc(100% - 32px));
+      margin: 26px auto 36px;
+    }
+
+    .page-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      margin: 0 0 12px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 600;
+    }
+
+    .page-note {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: 16px;
+    }
+
+    .panel-header {
+      min-height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 14px;
+      background: var(--panel-2);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .panel-title {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .035em;
+    }
+
+    .panel-body { padding: 16px; }
+
+    .field-label {
+      display: block;
+      margin: 0 0 7px;
+      color: #c4c9ce;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .file-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+    }
+
+    .file-display {
+      min-width: 0;
+      height: 38px;
+      display: flex;
+      align-items: center;
+      padding: 0 11px;
+      background: #171a1d;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      color: #d9dde0;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    #firmware { position: absolute; opacity: 0; pointer-events: none; }
+
+    .calibration {
+      margin-top: 18px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .calibration-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .calibration-note { color: var(--muted); font-size: 11px; }
+
+    .calibration-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px 20px;
+    }
+
+    .calibration-control {
+      min-width: 0;
+      padding: 11px;
+      background: #1a1d20;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    .calibration-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 9px;
+      color: #c4c9ce;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .calibration-value {
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+    }
+
+    input[type="range"] { width: 100%; accent-color: var(--accent); }
+
+    select {
+      width: 100%;
+      height: 34px;
+      padding: 0 8px;
+      color: var(--text);
+      background: #171a1d;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+    }
+
+    .preset-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin-top: 12px;
+    }
+
+    .preset-row button { min-height: 30px; padding: 0 10px; font-size: 11px; }
+
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    button, .file-button {
+      min-height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 0 13px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      background: #2b3035;
+      color: #e1e4e7;
+      font-weight: 600;
+      cursor: pointer;
+      user-select: none;
+      transition: background .12s ease, border-color .12s ease;
+    }
+
+    button:hover:not(:disabled), .file-button:hover {
+      background: #343a40;
+      border-color: #5b646c;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #081014;
+    }
+
+    button.primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+
+    button:disabled {
+      opacity: .38;
+      cursor: default;
+    }
+
+    .progress-section {
+      display: grid;
+      grid-template-columns: 1fr 88px;
+      gap: 12px;
+      align-items: end;
+      margin-top: 18px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .progress-wrap {
+      height: 9px;
+      overflow: hidden;
+      background: #111315;
+      border: 1px solid #3d444a;
+      border-radius: 2px;
+    }
+
+    .progress-bar {
+      height: 100%;
+      width: 0;
+      background: var(--accent);
+      transition: width .08s linear;
+    }
+
+    .progress-value {
+      color: #bcc2c7;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .status-strip {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      align-items: center;
+      gap: 12px;
+      min-height: 44px;
+      margin-top: 14px;
+      padding: 0 12px;
+      background: #1a1d20;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 8px;
+      border: 1px solid #4a5157;
+      border-radius: 2px;
+      color: #cbd0d4;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    .status-badge.ok { border-color: #3c7447; color: #8fd59b; }
+    .status-badge.busy { border-color: #497f89; color: #7ed6e4; }
+    .status-badge.error { border-color: #8b4746; color: #f09a98; }
+
+    .status-text {
+      min-width: 0;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .terminal-actions {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .terminal-actions button {
+      min-height: 29px;
+      padding: 0 10px;
+      font-size: 12px;
+    }
+
+    pre {
+      min-height: 360px;
+      max-height: 58vh;
+      margin: 0;
+      overflow: auto;
+      padding: 14px;
+      background: var(--terminal);
+      color: #cfd4d8;
+      border: 0;
+      border-radius: 0 0 var(--radius) var(--radius);
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      color: #737b82;
+      font-size: 11px;
+      padding: 2px 1px 0;
+    }
+
+    .footer strong { color: #9ba2a8; font-weight: 600; }
+
+    @media (max-width: 720px) {
+      .topbar { height: auto; min-height: 64px; padding: 14px 16px; align-items: flex-start; }
+      .brand { flex-direction: column; gap: 4px; }
+      .subtitle { white-space: normal; }
+      .app { width: min(100% - 20px, 1040px); margin-top: 18px; }
+      .page-title { align-items: flex-start; flex-direction: column; gap: 5px; }
+      .file-row { grid-template-columns: 1fr; }
+      .file-button { width: 100%; }
+      .calibration-grid { grid-template-columns: 1fr; }
+      .calibration-head { align-items: flex-start; flex-direction: column; }
+      .button-row > button { flex: 1 1 180px; }
+      .footer { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-label="C5VRX"><span class="c5">C5</span><span class="vrx">VRX</span></div>
+      <div class="subtitle">ESP32-C5 Analog FPV Receiver</div>
+    </div>
+    <div id="connection" class="connection">
+      <span class="connection-dot"></span>
+      <span id="connectionText">Disconnected</span>
+    </div>
+  </header>
+
+  <main class="app">
+    <div class="page-title">
+      <h1>Firmware Flasher</h1>
+      <div class="page-note">Merged ESP32-C5 image · flash address 0x00000000 · Web Serial</div>
+    </div>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Firmware</div>
+      </div>
+      <div class="panel-body">
+        <label class="field-label" for="firmware">Firmware file</label>
+        <div class="file-row">
+          <div id="fileDisplay" class="file-display">No firmware selected</div>
+          <button id="latestFirmware" type="button">Use continuous-IQ build</button>
+          <label class="file-button" for="firmware">Browse…</label>
+          <input id="firmware" type="file" accept=".bin,application/octet-stream">
+        </div>
+
+        <div class="calibration">
+          <div class="calibration-head">
+            <span class="field-label" style="margin:0">Pre-flash IQ / CVBS calibration</span>
+            <span class="calibration-note">Live AV rate is measured RF / 4; USB never paces the stream</span>
+          </div>
+          <div class="calibration-grid">
+            <div class="calibration-control">
+              <label class="calibration-label" for="pedestal">
+                <span>Pedestal / zero level</span>
+                <output id="pedestalValue" class="calibration-value">20</output>
+              </label>
+              <input id="pedestal" type="range" min="12" max="28" step="1" value="20">
+            </div>
+            <div class="calibration-control">
+              <label class="calibration-label" for="gain">
+                <span>FM discriminator gain</span>
+                <output id="gainValue" class="calibration-value">2x</output>
+              </label>
+              <input id="gain" type="range" min="1" max="4" step="1" value="2">
+            </div>
+            <div class="calibration-control">
+              <label class="calibration-label" for="polarity"><span>Discriminator polarity</span></label>
+              <select id="polarity">
+                <option value="0" selected>Current - previous (measured)</option>
+                <option value="1">Previous - current (reverse)</option>
+              </select>
+            </div>
+          </div>
+          <div class="preset-row" aria-label="Calibration presets">
+            <button type="button" data-preset="measured">Measured default</button>
+            <button type="button" data-preset="soft">Lower gain</button>
+            <button type="button" data-preset="strong">Higher gain</button>
+            <button type="button" data-preset="reverse">Reverse polarity</button>
+          </div>
+        </div>
+
+        <div class="button-row">
+          <button id="connect">1. Connect for Flashing</button>
+          <button id="flash" class="primary" disabled>2. Flash Firmware</button>
+          <button id="terminal">Open Terminal (no flash)</button>
+          <button id="stopTerminal" disabled>Stop Terminal</button>
+        </div>
+
+        <div class="progress-section">
+          <div>
+            <div class="field-label">Flash progress</div>
+            <div class="progress-wrap"><div id="progressBar" class="progress-bar"></div></div>
+          </div>
+          <div id="progressValue" class="progress-value">0%</div>
+        </div>
+
+        <div class="status-strip">
+          <span id="statusBadge" class="status-badge">Ready</span>
+          <span id="statusText" class="status-text">Select firmware and connect the ESP32-C5 bootloader.</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title">Terminal / Log</div>
+        <div class="terminal-actions">
+          <button id="clear">Clear</button>
+        </div>
+      </div>
+      <pre id="log"></pre>
+    </section>
+
+    <div class="footer">
+      <span><strong>C5VRX Web Flasher</strong></span>
+      <span>Terminal 115200 baud · Flash 460800 baud</span>
+    </div>
+  </main>
+
+<script type="module">
+  let ESPLoader = null;
+  let Transport = null;
+
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log");
+  const progressBar = $("progressBar");
+  const progressValue = $("progressValue");
+  const statusBadge = $("statusBadge");
+  const statusText = $("statusText");
+  const connection = $("connection");
+  const connectionText = $("connectionText");
+  const fileDisplay = $("fileDisplay");
+
+  const CALIBRATION_ADDRESS = 0x00110000;
+  const CALIBRATION_SIZE = 0x1000;
+  const CALIBRATION_MAGIC = 0x41433543;
+  const CALIBRATION_VERSION = 1;
+
+  let port = null;
+  let transport = null;
+  let loader = null;
+  let terminalReader = null;
+  let terminalRunning = false;
+  let selectedFirmware = null;
+
+  function log(text = "") {
+    logEl.textContent += String(text);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function line(text = "") { log(text + "\n"); }
+
+  function setProgress(value) {
+    const percent = Math.max(0, Math.min(100, Number(value) || 0));
+    progressBar.style.width = `${percent}%`;
+    progressValue.textContent = `${Math.round(percent)}%`;
+  }
+
+  function setStatus(kind, label, text) {
+    statusBadge.className = `status-badge${kind ? ` ${kind}` : ""}`;
+    statusBadge.textContent = label;
+    statusText.textContent = text;
+  }
+
+  function setConnected(connected, label = "Connected") {
+    connection.classList.toggle("connected", connected);
+    connectionText.textContent = connected ? label : "Disconnected";
+  }
+
+  function error(err) {
+    const message = err?.message ?? String(err);
+    setStatus("error", "Error", message);
+    line("ERROR: " + message);
+  }
+
+  function calibrationValues() {
+    return {
+      pedestal: Number($("pedestal").value),
+      gain: Number($("gain").value),
+      // Kept in the on-flash v1 record for compatibility. Live firmware
+      // derives AV Fs from measured RF Fs and deliberately ignores this field.
+      clockKHz: 20000,
+      polarity: Number($("polarity").value),
+    };
+  }
+
+  function calibrationText(values = calibrationValues()) {
+    const polarity = values.polarity === 0 ? "current-previous" : "previous-current";
+    return `pedestal=${values.pedestal} gain=${values.gain}x polarity=${polarity} AV-rate=measured-RF/4`;
+  }
+
+  function updateCalibrationLabels() {
+    const values = calibrationValues();
+    $("pedestalValue").textContent = String(values.pedestal);
+    $("gainValue").textContent = `${values.gain}x`;
+    try { localStorage.setItem("c5vrx2Calibration", JSON.stringify(values)); } catch (_) {}
+  }
+
+  function crc32(bytes, length) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < length; ++i) {
+      crc ^= bytes[i];
+      for (let bit = 0; bit < 8; ++bit)
+        crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function buildCalibrationImage() {
+    const values = calibrationValues();
+    const image = new Uint8Array(CALIBRATION_SIZE);
+    image.fill(0xff);
+    const view = new DataView(image.buffer);
+    view.setUint32(0, CALIBRATION_MAGIC, true);
+    view.setUint16(4, CALIBRATION_VERSION, true);
+    view.setUint16(6, 20, true);
+    view.setUint8(8, values.pedestal);
+    view.setUint8(9, values.gain);
+    view.setUint8(10, values.polarity);
+    view.setUint8(11, 0);
+    view.setUint32(12, values.clockKHz * 1000, true);
+    view.setUint32(16, crc32(image, 16), true);
+    return image;
+  }
+
+  const presets = {
+    measured: { pedestal: 20, gain: 2, clockKHz: 20000, polarity: 0 },
+    soft: { pedestal: 20, gain: 1, clockKHz: 20000, polarity: 0 },
+    strong: { pedestal: 20, gain: 3, clockKHz: 20000, polarity: 0 },
+    reverse: { pedestal: 20, gain: 2, clockKHz: 20000, polarity: 1 },
+  };
+
+  function applyCalibration(values) {
+    $("pedestal").value = values.pedestal;
+    $("gain").value = values.gain;
+    $("polarity").value = values.polarity;
+    updateCalibrationLabels();
+  }
+
+  window.addEventListener("error", (event) => error(event.error || event.message));
+  window.addEventListener("unhandledrejection", (event) => error(event.reason));
+
+  const loaderTerminal = {
+    clean() {},
+    write(data) { log(data); },
+    writeLine(data) { line(data); },
+  };
+
+  async function stopTerminal() {
+    terminalRunning = false;
+    if (terminalReader) {
+      try { await terminalReader.cancel(); } catch (_) {}
+      try { terminalReader.releaseLock(); } catch (_) {}
+      terminalReader = null;
+    }
+    if (port?.readable || port?.writable) {
+      try { await port.close(); } catch (_) {}
+    }
+    port = null;
+    $("stopTerminal").disabled = true;
+    setConnected(false);
+  }
+
+  async function disconnectLoader() {
+    if (transport) {
+      try { await transport.disconnect(); } catch (_) {}
+    }
+    transport = null;
+    loader = null;
+    port = null;
+    $("flash").disabled = true;
+    setConnected(false);
+  }
+
+  $("firmware").addEventListener("change", () => {
+    const file = $("firmware").files[0];
+    selectedFirmware = file || null;
+    fileDisplay.textContent = file ? file.name : "No firmware selected";
+    if (file) setStatus("", "Ready", `${file.name} selected. Connect bootloader to continue.`);
+  });
+
+  $("latestFirmware").onclick = async () => {
+    try {
+      setStatus("busy", "Loading", "Loading bundled IDF 6.0.1 / 40 MHz firmware...");
+      const response = await fetch("c5vrx2-iq-fm-idf601-40.bin", {cache: "no-store"});
+      if (!response.ok) throw new Error(`Bundled firmware HTTP ${response.status}`);
+      selectedFirmware = new File([await response.blob()],
+                                  "c5vrx2-iq-fm-idf601-40.bin",
+                                  {type: "application/octet-stream"});
+      fileDisplay.textContent = selectedFirmware.name;
+      setStatus("", "Ready", "Continuous pre-trigger IQ firmware selected. Connect bootloader to continue.");
+      line(`Selected bundled ${selectedFirmware.name} (${selectedFirmware.size} bytes).`);
+    } catch (e) {
+      error(e);
+    }
+  };
+
+  for (const id of ["pedestal", "gain", "polarity"])
+    $(id).addEventListener("input", updateCalibrationLabels);
+  for (const button of document.querySelectorAll("[data-preset]"))
+    button.addEventListener("click", () => applyCalibration(presets[button.dataset.preset]));
+
+  $("connect").onclick = async () => {
+    try {
+      if (!("serial" in navigator)) throw new Error("Web Serial unavailable. Use Chrome or Edge over HTTPS/localhost.");
+      setStatus("busy", "Connecting", "Opening ESP32-C5 bootloader…");
+      await stopTerminal();
+      await disconnectLoader();
+      // requestPort() must run directly from the button gesture. Ask for the
+      // device before loading esptool so Edge/Chrome always shows its chooser.
+      port = await navigator.serial.requestPort();
+      setStatus("busy", "Loading", "Loading Espressif flasher support…");
+      if (!ESPLoader || !Transport) {
+        const esptool = await import("https://unpkg.com/esptool-js@0.6.1/bundle.js");
+        ESPLoader = esptool.ESPLoader;
+        Transport = esptool.Transport;
+      }
+      transport = new Transport(port, true);
+      loader = new ESPLoader({
+        transport,
+        baudrate: 460800,
+        terminal: loaderTerminal,
+        debugLogging: false,
+      });
+      line("Connecting bootloader...");
+      const chip = await loader.main();
+      line(`Connected: ${chip}`);
+      setConnected(true, chip || "ESP32-C5");
+      setStatus("ok", "Connected", `${chip || "ESP32-C5"} bootloader ready.`);
+      $("flash").disabled = false;
+    } catch (e) {
+      error(e);
+      await disconnectLoader();
+    }
+  };
+
+  $("flash").onclick = async () => {
+    try {
+      if (!loader) throw new Error("Connect bootloader first.");
+      const file = selectedFirmware || $("firmware").files[0];
+      if (!file) throw new Error("Choose firmware or click Use IDF 6.0.1 / 40 MHz safe build first.");
+      if (!/\.bin$/i.test(file.name)) throw new Error("Firmware must be a .bin file.");
+      const data = new Uint8Array(await file.arrayBuffer());
+      if (data.length < 4096) throw new Error("File is too small to be a merged firmware image.");
+      const calibration = buildCalibrationImage();
+      const totalBytes = data.length + calibration.length;
+
+      setProgress(0);
+      setStatus("busy", "Flashing", `${file.name} + IQ/CVBS calibration`);
+      line(`Flashing ${file.name} (${data.length} bytes) at 0x00000000...`);
+      line(`Calibration ${calibrationText()} at 0x${CALIBRATION_ADDRESS.toString(16).padStart(8, "0")}...`);
+      await loader.writeFlash({
+        fileArray: [
+          { data, address: 0x0 },
+          { data: calibration, address: CALIBRATION_ADDRESS },
+        ],
+        flashMode: "keep",
+        flashFreq: "keep",
+        flashSize: "keep",
+        eraseAll: false,
+        compress: true,
+        reportProgress: (fileIndex, written) => {
+          const completed = (fileIndex === 0 ? 0 : data.length) + written;
+          setProgress(completed * 100 / totalBytes);
+        },
+      });
+      setProgress(100);
+      setStatus("ok", "Complete", "Flash finished. Press RESET once, then open Terminal.");
+      line("Flash complete. Disconnecting bootloader...");
+      await disconnectLoader();
+      line("Press RESET once without holding BOOT. Wait 2 seconds, then Open Terminal and select the port again.");
+    } catch (e) {
+      error(e);
+    }
+  };
+
+  $("terminal").onclick = async () => {
+    try {
+      if (loader) {
+        await disconnectLoader();
+        setStatus("busy", "Reset required", "Press RESET once without BOOT, wait 2 seconds, then click Open Terminal again.");
+        line("Bootloader disconnected. Press RESET once without holding BOOT. Wait 2 seconds, then click Open Terminal again.");
+        return;
+      }
+      await disconnectLoader();
+      await stopTerminal();
+      // A reset re-enumerates native USB Serial/JTAG as a new device. Always
+      // ask the browser for the current port instead of reusing a stale one.
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 115200 });
+      terminalRunning = true;
+      $("stopTerminal").disabled = false;
+      setConnected(true, "Terminal");
+      setStatus("ok", "Terminal", "Serial terminal open at 115200 baud.");
+      line("--- terminal 115200 ---");
+      const decoder = new TextDecoder();
+      terminalReader = port.readable.getReader();
+      while (terminalRunning) {
+        const { value, done } = await terminalReader.read();
+        if (done) break;
+        if (value) log(decoder.decode(value, { stream: true }));
+      }
+    } catch (e) {
+      if (terminalRunning) error(e);
+    } finally {
+      terminalRunning = false;
+      if (terminalReader) {
+        try { terminalReader.releaseLock(); } catch (_) {}
+        terminalReader = null;
+      }
+      if (port?.readable || port?.writable) {
+        try { await port.close(); } catch (_) {}
+      }
+      port = null;
+      $("stopTerminal").disabled = true;
+      setConnected(false);
+    }
+  };
+
+  $("stopTerminal").onclick = async () => {
+    await stopTerminal();
+    setStatus("", "Ready", "Terminal stopped.");
+    line("--- terminal stopped ---");
+  };
+
+  $("clear").onclick = () => { logEl.textContent = ""; };
+
+  try {
+    const saved = JSON.parse(localStorage.getItem("c5vrx2Calibration"));
+    if (saved && Number.isFinite(saved.pedestal) && Number.isFinite(saved.gain) &&
+        Number.isFinite(saved.clockKHz) && Number.isFinite(saved.polarity))
+      applyCalibration(saved);
+    else
+      applyCalibration(presets.measured);
+  } catch (_) {
+    applyCalibration(presets.measured);
+  }
+
+  setProgress(0);
+  if (!("serial" in navigator)) {
+    setStatus("error", "Unsupported", "Web Serial unavailable. Use Chrome or Edge over HTTPS/localhost.");
+    line("Web Serial unavailable: use Chrome/Edge on HTTPS or localhost.");
+  } else {
+    setStatus("", "Ready", "Select firmware and connect the ESP32-C5 bootloader.");
+    line("C5VRX Web Flasher ready.");
+  }
+</script>
+</body>
+</html>

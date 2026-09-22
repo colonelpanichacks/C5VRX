@@ -1,0 +1,16 @@
+{
+  "status": "PROVEN_STATICALLY_OVERWRITTEN_BEFORE_ENABLE",
+  "register": "0x600a9008",
+  "written_bits": "23:21",
+  "overwriting_bits": "24:17",
+  "entries": [
+    {"field":0,"argument_pair":[0,1],"written_value":"0x00000000","static_interpretation":"transient; overwritten by dump-mode selector","confidence":"PROVEN STATICALLY","physical_measurement_required":true},
+    {"field":1,"argument_pair":[2,3],"written_value":"0x00200000","static_interpretation":"transient; overwritten by dump-mode selector","confidence":"PROVEN STATICALLY","physical_measurement_required":true},
+    {"field":2,"argument_pair":[4,5],"written_value":"0x00400000","static_interpretation":"transient; overwritten by dump-mode selector","confidence":"PROVEN STATICALLY","physical_measurement_required":true},
+    {"field":3,"argument_pair":[6,7],"written_value":"0x00600000","static_interpretation":"transient; overwritten by dump-mode selector","confidence":"PROVEN STATICALLY","physical_measurement_required":true},
+    {"field":4,"argument_pair":[8,9],"written_value":"0x00800000","static_interpretation":"transient; overwritten by dump-mode selector","confidence":"PROVEN STATICALLY","physical_measurement_required":true},
+    {"field":5,"argument_pair":[10,11],"written_value":"0x00a00000","static_interpretation":"transient; overwritten by dump-mode selector","confidence":"PROVEN STATICALLY","physical_measurement_required":true},
+    {"field":6,"argument_pair":[12,13],"written_value":"0x00c00000","static_interpretation":"transient; overwritten by dump-mode selector","confidence":"PROVEN STATICALLY","physical_measurement_required":true},
+    {"field":7,"argument_pair":[14,15],"written_value":"0x00e00000","static_interpretation":"transient; overwritten by dump-mode selector","confidence":"PROVEN STATICALLY","physical_measurement_required":true}
+  ]
+}

@@ -1,0 +1,75 @@
+# Continuous packed C5 Q10/I10 -> adjacent-sample WBFM -> real 4:1 boxcar.
+#
+# Every input IQ word participates in the discriminator. O6..O10 persist a
+# five-bit previous-IQ state across output groups and across the cyclic GDMA
+# descriptor boundary. Successive samples alternate Q3/I2 and Q2/I3 compact
+# states; LUT address bit 10 tells the LUT which mapping is current. Counter A
+# accumulates four signed adjacent phase differences around four times DAC
+# code 20, then A2..A7 perform the real four-sample boxcar/decimation.
+
+cfg prefetch true
+cfg eof_on downstream
+cfg trailing_bytes 0
+cfg lut_width_bits 8
+
+init:
+    # Prime previous-IQ from the first word.  The first group consequently
+    # contains three genuine intervals and one zero transient; no later group
+    # or physical SRAM wrap resets this state.
+    # Prime previous with the Q2/I3 mapping. sample1 uses Q3/I2.
+    set 6..7 8..9,
+    set 8..10 17..19,
+    read 32,
+    LDCTDAL 80
+
+sample1:
+    # current Q3/I2, previous Q2/I3, LUT bank 0
+    set 6..8 7..9,
+    set 9..10 18..19,
+    set 21..23 7..9,
+    set 24..25 18..19,
+    set 26..30 O6..O10,
+    set 31 L,
+    read 32,
+    ADDCTIAL
+
+sample2:
+    # current Q2/I3, previous Q3/I2, LUT bank 1
+    set 6..7 8..9,
+    set 8..10 17..19,
+    set 21..22 8..9,
+    set 23..25 17..19,
+    set 26..30 O6..O10,
+    set 31 H,
+    read 32,
+    ADDCTIAL
+
+sample3:
+    set 6..8 7..9,
+    set 9..10 18..19,
+    set 21..23 7..9,
+    set 24..25 18..19,
+    set 26..30 O6..O10,
+    set 31 L,
+    read 32,
+    ADDCTIAL
+
+sample4:
+    set 6..7 8..9,
+    set 8..10 17..19,
+    set 21..22 8..9,
+    set 23..25 17..19,
+    set 26..30 O6..O10,
+    set 31 H,
+    read 32,
+    ADDCTIAL
+
+emit:
+    set 0..5 A2..A7,
+    set 6..10 O6..O10,
+    set 21..31 O21..O31,
+    write 8,
+    LDCTDAL 80
+
+loop:
+    jmp sample1

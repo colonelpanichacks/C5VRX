@@ -1,0 +1,83 @@
+# Two-bundle steady-state quality WBFM core for 40 MS/s packed Q4/I4 input
+# and 20 MS/s six-bit CVBS output. There are three instructions in ROM, but
+# address_phase executes only once to prime the LUT pipeline. The repeating
+# path is address_delta -> emit_and_address_phase, so it has the same two
+# bundles/output budget as the physically proven compact-IQ core.
+#
+# LUT words are deliberately dual-purpose:
+#   LUT[raw_q4_i4].bits[12:8] = uniform five-bit polar phase
+#   LUT[(previous_phase << 5) | current_phase].bits[5:0] = DAC code
+#
+# This lets the complete eight-bit Cartesian input reach an atan2-derived
+# phase quantizer before the 32 x 32 discriminator lookup. The second table
+# uses the measured circular centroid of every Q4 phase cluster at phase8
+# precision instead of assuming perfectly uniform bin centers. All 32 phase
+# states remain valid; confidence cannot steal a circular phase code without
+# creating a discontinuity. O8..O12 retains state across every pair/ring
+# boundary. The selected bytes are input 1,3,5,..., so the discriminator spans
+# two coherent 40-MS/s input intervals.
+
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 9
+cfg lut_width_bits 16
+
+# Keep the complete dual-purpose table in the TX program image. Hardware
+# oracle version 9 proved that embedded 16-bit LUT data is byte-exact at
+# 20 MS/s, while loading this table before PARLIO starts is not retained by
+# the active TX run on ESP32-C5/IDF 6.0.1.
+lut 1044 1562 1823 1830 1836 2098 2105 2110 6207 6207 6207 6463 6463 6463 6719 7231 512 1024 1280 1536 1536 1792 1792 1792 6400 6400 6400 6656 6656 6915 7177 7694 270 788 1049 1312 1318 1580 1587 1592 6718 6719 6719 6975 6975 7231 7487 7999 319 512 768 1024 1280 1280 1280 1536 6656 6912 6912 6912 7168 7424 7683 7944 265 527 788 795 1057 1319 1326 1331 6969 6975 6975 7231 7487 7487 7743 7999 63 319 512 768 768 1024 1024 1280 6912 7168 7168 7168 7424 7680 7936 3 2 264 525 788 794 1056 1063 1068 7218 7224 7229 7487 7487 7743 7999 63 63 319 575 512 768 768 1024 1024 7168 7168 7424 7424 7680 7680 7936 0 4096 3842 3591 3598 3348 3354 3105 3110 5164 5170 4919 4925 4671 4671 4415 4159 4159 3903 3647 3391 3328 3072 3072 3072 5120 5120 5120 4864 4864 4608 4352 4096 4096 3840 3585 3336 3342 3092 3099 2848 5414 5164 5169 4919 4926 4671 4415 4159 3903 3647 3391 3391 3135 3072 2816 2816 5376 5376 5376 5120 4864 4864 4608 4352 3840 3584 3328 3073 2823 2829 2836 2585 5663 5413 5419 5425 5175 4925 4671 4415 3903 3391 3135 2879 2879 2623 2560 2560 5632 5632 5632 5376 5376 5120 4864 4352 3584 3072 2816 2560 2562 2312 2319 2324 5914 5920 5925 5675 5682 5432 5183 4671 3135 2623 2367 2367 2367 2111 2111 2048 6144 6144 6144 5888 5888 5888 5632 5120 0 0 0 0 0 2 9 14 20 26 31 37 44 50 57 62 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 0 3 8 14 20 25 31 38 44 51 56 62 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 0 3 9 15 20 26 33 39 46 51 57 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 0 3 9 14 20 27 33 40 45 51 57 62 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 0 2 7 13 20 26 33 38 44 50 55 62 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 7 14 20 27 32 38 44 49 56 62 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 7 13 20 25 31 37 43 49 55 61 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 0 2 8 15 20 26 32 37 44 50 56 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 0 2 9 14 20 26 31 38 44 50 57 62 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 3 8 14 20 25 32 38 44 51 56 62 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 3 9 15 20 27 33 39 46 51 57 63 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 2 8 13 20 26 32 39 44 50 56 61 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 2 7 14 20 26 33 38 44 50 55 62 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 1 8 14 20 27 32 38 44 49 56 62 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 1 7 13 20 25 31 37 43 49 55 62 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 2 8 15 20 26 32 37 44 50 57 63 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 2 9 14 20 26 31 38 44 51 57 62 62 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 3 8 14 20 25 32 38 45 51 56 57 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 3 9 15 20 27 33 40 46 51 50 56 61 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 2 8 13 20 26 33 39 44 44 50 55 62 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 2 7 14 20 27 33 38 37 43 49 55 61 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 7 13 20 26 31 31 37 43 49 55 61 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 1 7 14 20 25 26 32 37 44 50 56 63 63 63 63 63 63 63 63 63 0 0 0 0 0 0 0 0 0 0 0 0 0 2 9 15 20
+
+address_phase:
+    # One-time pipeline prime: preserve reset phase zero in O26..O30 and address
+    # the first selected byte. Subsequent phase addresses are issued by emit.
+    set 26..30 L,
+    set 16 8,
+    set 17 9,
+    set 18 10,
+    set 19 11,
+    set 20 12,
+    set 21 13,
+    set 22 14,
+    set 23 15,
+    set 24..25 L,
+    read 16
+
+address_delta:
+    # First lookup's high five bits are current phase (L8..L12). Preserve them
+    # in O26..O30 and address LUT[(previous << 5) | current].
+    set 26..30 L8..L12,
+    set 16 L8,
+    set 17 L9,
+    set 18 L10,
+    set 19 L11,
+    set 20 L12,
+    set 21 O26,
+    set 22 O27,
+    set 23 O28,
+    set 24 O29,
+    set 25 O30,
+    set 31 L
+
+emit:
+    # Second lookup's low six bits are the complete calibrated DAC code (L0..L5).
+    # Emit two 8-bit DAC samples at 40 MS/s: Byte 0 (bits 0..5) and
+    # Byte 1 (bits 8..13). Identical bytes retain a 50 ns analog hold.
+    set 0..5 L0..L5,
+    set 6..7 L,
+    set 8..13 L0..L5,
+    set 14..15 L,
+    set 26..30 O26..O30,
+    set 16 8,
+    set 17 9,
+    set 18 10,
+    set 19 11,
+    set 20 12,
+    set 21 13,
+    set 22 14,
+    set 23 15,
+    set 24..25 L,
+    set 31 L,
+    read 16,
+    write 16,
+    jmp address_delta

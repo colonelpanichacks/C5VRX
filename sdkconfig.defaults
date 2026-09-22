@@ -1,0 +1,53 @@
+# C5VRX-3 production sdkconfig.defaults
+# Ultra-minimal single-purpose MODEM_DIAG -> Phase5 -> DAC receiver.
+# Reference: Seamless Golden 16K (build-golden-notel, proven best live build).
+# All receiver parameters are FIXED here. No Kconfig options for DSP/ring/edge.
+
+CONFIG_IDF_TARGET="esp32c5"
+
+# ----- CPU & clock -----
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# ----- Flash -----
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# ----- Partition table -----
+# Minimal: bootloader + phy_init + factory app only.
+# No calib, no trace, no diagcap.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ----- Console / USB -----
+# USB-Serial/JTAG for boot messages only. Silent after startup.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ----- FreeRTOS -----
+CONFIG_FREERTOS_HZ=1000
+
+# ----- Logging -----
+# WARNING level globally. Will be set to NONE after startup stamp.
+CONFIG_LOG_DEFAULT_LEVEL_WARNING=y
+
+# ----- Wi-Fi -----
+# RAM-only storage (no NVS). No networking features.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE_DYNAMIC=y
+CONFIG_ESP_WIFI_STA_DISCONNECTED_PM_ENABLE=n
+
+# ----- Wireless (Wi-Fi only, no Bluetooth, no 802.15.4, no Coex) -----
+CONFIG_IEEE802154_ENABLED=n
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+# ----- PHY -----
+CONFIG_ESP_PHY_ENABLE_CERT_TEST=y
+CONFIG_ESP_PHY_DEBUG=y
+CONFIG_ESP_PHY_DISABLE_PLL_TRACK=y
+
+# ----- Power management -----
+CONFIG_PM_ENABLE=n
+
+
+

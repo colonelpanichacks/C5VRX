@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+# C5VRX Receiver Console for Seeed Studio XIAO ESP32-C5.
+#
+# This is a complete board profile, not an overlay for the DevKit/WROOM build.
+# The XIAO has 8 MB flash; reserve a 6 MiB factory-app slot and leave the
+# remaining flash unallocated for a future data/upgrade policy.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_xiao_receiver_console.csv"
+CONFIG_C5VRX_BOARD_PROFILE="xiao-esp32c5"
+
+# Boot on A4 / 5805 MHz exact Wi-Fi center, then retune from the Receiver
+# Console. The guarded RF producer is enabled by sdkconfig.defaults.rf_deep_probe.
+CONFIG_C5VRX_RF_BACKEND_WIFI5=y
+CONFIG_C5VRX_TARGET_BAND_A=y
+CONFIG_C5VRX_TARGET_CHANNEL=1
+CONFIG_C5VRX_RX_HT40=y
+
+# Native USB-C uses ESP32-C5 GPIO13 D- and GPIO14 D+.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_PHY_ENABLE_CERT_TEST=y
+
+# Keep arbitrary undocumented retuning and boot-time raw capture off. Both are
+# controlled explicitly by the fail-closed diagnostic commands when needed.
+# CONFIG_C5VRX_EXPERIMENTAL_DIRECT_TUNE is not set
+# CONFIG_C5VRX_EXPERIMENTAL_ADC_DUMP is not set
+
+# Full live/diagnostic CVBS output on XIAO header pins D4..D9. This is the same
+# D0..D5 resistor-DAC ordering used by the output-only XIAO proof image.
+CONFIG_C5VRX_EXPERIMENTAL_CVBS_PARLIO=y
+CONFIG_C5VRX_CVBS_DAC_BITS=6
+CONFIG_C5VRX_CVBS_D0_GPIO=23
+CONFIG_C5VRX_CVBS_D1_GPIO=24
+CONFIG_C5VRX_CVBS_D2_GPIO=11
+CONFIG_C5VRX_CVBS_D3_GPIO=12
+CONFIG_C5VRX_CVBS_D4_GPIO=8
+CONFIG_C5VRX_CVBS_D5_GPIO=9
+CONFIG_C5VRX_CVBS_D6_GPIO=-1
+CONFIG_C5VRX_CVBS_D7_GPIO=-1
+
+# The board includes 8 MB PSRAM, but this profile intentionally does not enable
+# it. RF dump RAM is fixed internal memory and the current PARLIO/GDMA buffers
+# are deliberately kept in DMA-capable internal RAM until hardware benchmarks
+# justify another memory path.

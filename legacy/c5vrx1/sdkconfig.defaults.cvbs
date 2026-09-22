@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+# Dedicated ESP32-C5-DevKitC analog-output proof image.
+#
+# This configuration deliberately skips RF/Wi-Fi bring-up and starts the PAL
+# 625/50 CVBS test immediately at boot. The six GPIOs below are broken out on
+# the DevKitC and avoid the documented USB Serial/JTAG and boot-strapping pins.
+
+CONFIG_ESP_PHY_ENABLE_CERT_TEST=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_C5VRX_BOARD_PROFILE="devkit-wroom"
+
+CONFIG_C5VRX_EXPERIMENTAL_CVBS_PARLIO=y
+CONFIG_C5VRX_CVBS_OUTPUT_ONLY_TEST=y
+CONFIG_C5VRX_CVBS_TEST_COLOR_BURST=y
+# ESP32-C5-DevKitC-1 v1.2: D0..D5 are J1 pins 5,6,7,9,10,11.
+# Do not use v1.1 header positions; that board also has unsupported C5 rev0.1.
+CONFIG_C5VRX_CVBS_DAC_BITS=6
+
+# D0 = LSB, D5 = MSB.
+CONFIG_C5VRX_CVBS_D0_GPIO=0
+CONFIG_C5VRX_CVBS_D1_GPIO=1
+CONFIG_C5VRX_CVBS_D2_GPIO=6
+CONFIG_C5VRX_CVBS_D3_GPIO=8
+CONFIG_C5VRX_CVBS_D4_GPIO=9
+CONFIG_C5VRX_CVBS_D5_GPIO=10
+CONFIG_C5VRX_CVBS_D6_GPIO=-1
+CONFIG_C5VRX_CVBS_D7_GPIO=-1

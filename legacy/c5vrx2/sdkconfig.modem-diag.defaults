@@ -1,0 +1,4 @@
+# Observe C5 vendor-derived modem diagnostic bus states while the autonomous
+# A1 RF producer remains armed exactly once.
+# CONFIG_C5VRX2_MODE_LIVE is not set
+CONFIG_C5VRX2_MODE_MODEM_DIAG=y

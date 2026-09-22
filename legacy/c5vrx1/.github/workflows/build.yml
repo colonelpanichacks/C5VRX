@@ -1,0 +1,350 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: C5VRX CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: Realtime primitives and host protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+      - run: python3 -m py_compile tools/*.py
+
+  firmware-build:
+    name: ESP32-C5 / ESP-IDF v6.0.2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ESP32-C5 firmware
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32c5
+          path: .
+
+  proof-firmware:
+    name: Build A4 proof-test firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build preconfigured A4 / 5805 MHz image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32c5
+          path: .
+          command: >-
+            SDKCONFIG_DEFAULTS="sdkconfig.defaults.flasher;sdkconfig.defaults.rf_deep_probe"
+            idf.py -D SDKCONFIG=/tmp/c5vrx-console-sdkconfig set-target esp32c5 build &&
+            mkdir -p firmware_bundle &&
+            cp build/flasher_args.json firmware_bundle/ &&
+            cp build/bootloader/bootloader.bin firmware_bundle/bootloader.bin &&
+            cp build/partition_table/partition-table.bin firmware_bundle/partition-table.bin &&
+            cp build/*.bin firmware_bundle/ &&
+            cp research/a4-bench-test.md firmware_bundle/TESTING.md &&
+            cp research/first-hardware-test.md firmware_bundle/FIRST-HARDWARE-TEST.md &&
+            cp research/codex-hardware-lab.md firmware_bundle/codex-hardware-lab.md &&
+            cp firmware_profiles/devkit-wroom.json firmware_bundle/profile.json &&
+            cp tools/c5vrx_bench.py firmware_bundle/ &&
+            cp tools/c5vrx_lab.py tools/c5vrx_usb_protocol.py firmware_bundle/
+
+      - name: Upload proof firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: c5vrx-proof-firmware
+          path: firmware_bundle/
+          if-no-files-found: error
+
+  rf-deep-probe-firmware:
+    name: Build guarded RF producer/profile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build hash-pinned RF diagnostics and ring source
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32c5
+          path: .
+          command: >-
+            SDKCONFIG_DEFAULTS="sdkconfig.defaults.flasher;sdkconfig.defaults.rf_deep_probe"
+            idf.py -D SDKCONFIG=/tmp/c5vrx-rf-sdkconfig set-target esp32c5 build
+
+      - name: Verify fixed dump-RAM safety assertion is present
+        run: >-
+          grep -q 'static DRAM overlaps RF dump guard/ring'
+          main/c5vrx_rf_dump_memory.ld
+
+  cvbs-proof-firmware:
+    name: Build PAL CVBS output-proof firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build output-only PAL image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32c5
+          path: .
+          command: >-
+            cp sdkconfig.defaults.cvbs sdkconfig.defaults &&
+            idf.py set-target esp32c5 &&
+            idf.py build &&
+            mkdir -p cvbs_firmware_bundle &&
+            cp build/flasher_args.json cvbs_firmware_bundle/ &&
+            cp build/bootloader/bootloader.bin cvbs_firmware_bundle/bootloader.bin &&
+            cp build/partition_table/partition-table.bin cvbs_firmware_bundle/partition-table.bin &&
+            cp build/*.bin cvbs_firmware_bundle/ &&
+            cp research/devkit-cvbs-proof.md cvbs_firmware_bundle/WIRING.md
+
+      - name: Upload PAL output proof firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: c5vrx-pal-cvbs-proof-firmware
+          path: cvbs_firmware_bundle/
+          if-no-files-found: error
+
+  xiao-cvbs-proof-firmware:
+    name: Build XIAO PAL CVBS proof firmware
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build XIAO output-only PAL image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32c5
+          path: .
+          command: >-
+            cp sdkconfig.defaults.xiao_cvbs sdkconfig.defaults &&
+            idf.py set-target esp32c5 &&
+            idf.py build &&
+            mkdir -p xiao_cvbs_firmware_bundle &&
+            cp build/flasher_args.json xiao_cvbs_firmware_bundle/ &&
+            cp build/bootloader/bootloader.bin xiao_cvbs_firmware_bundle/bootloader.bin &&
+            cp build/partition_table/partition-table.bin xiao_cvbs_firmware_bundle/partition-table.bin &&
+            cp build/*.bin xiao_cvbs_firmware_bundle/ &&
+            cp research/xiao-c5-cvbs-proof.md xiao_cvbs_firmware_bundle/WIRING.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c5vrx-xiao-pal-cvbs-proof-firmware
+          path: xiao_cvbs_firmware_bundle/
+          if-no-files-found: error
+
+  xiao-receiver-console-firmware:
+    name: Build XIAO Receiver Console firmware
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build guarded RF receiver with XIAO AV map
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32c5
+          path: .
+          command: >-
+            SDKCONFIG_DEFAULTS="sdkconfig.defaults.xiao_receiver_console;sdkconfig.defaults.rf_deep_probe"
+            idf.py -D SDKCONFIG=/tmp/c5vrx-xiao-console-sdkconfig set-target esp32c5 build &&
+            grep -q 'CONFIG_C5VRX_BOARD_PROFILE=.*xiao-esp32c5' /tmp/c5vrx-xiao-console-sdkconfig &&
+            grep -q '^CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y$' /tmp/c5vrx-xiao-console-sdkconfig &&
+            grep -q '^CONFIG_C5VRX_CVBS_D0_GPIO=23$' /tmp/c5vrx-xiao-console-sdkconfig &&
+            grep -q '^CONFIG_C5VRX_CVBS_D5_GPIO=9$' /tmp/c5vrx-xiao-console-sdkconfig &&
+            python -m esp_idf_size --format json2 -o build/c5vrx-size.json build/C5VRX.map &&
+            python tools/check_esp32c5_limits.py
+            --size-json build/c5vrx-size.json
+            --binary build/C5VRX.bin
+            --bootloader build/bootloader/bootloader.bin &&
+            mkdir -p xiao_console_firmware_bundle &&
+            cp build/flasher_args.json xiao_console_firmware_bundle/ &&
+            cp build/bootloader/bootloader.bin xiao_console_firmware_bundle/bootloader.bin &&
+            cp build/partition_table/partition-table.bin xiao_console_firmware_bundle/partition-table.bin &&
+            cp build/*.bin xiao_console_firmware_bundle/ &&
+            cp firmware_profiles/xiao-esp32c5.json xiao_console_firmware_bundle/profile.json &&
+            cp research/xiao-c5-cvbs-proof.md xiao_console_firmware_bundle/WIRING.md &&
+            cp research/first-hardware-test.md xiao_console_firmware_bundle/FIRST-HARDWARE-TEST.md &&
+            cp research/codex-hardware-lab.md xiao_console_firmware_bundle/codex-hardware-lab.md &&
+            cp tools/c5vrx_bench.py xiao_console_firmware_bundle/ &&
+            cp tools/c5vrx_lab.py tools/c5vrx_usb_protocol.py xiao_console_firmware_bundle/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c5vrx-xiao-receiver-console-firmware
+          path: xiao_console_firmware_bundle/
+          if-no-files-found: error
+
+  windows-flasher:
+    name: Build C5VRX Windows flasher
+    runs-on: windows-latest
+    needs: proof-firmware
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download proof firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: c5vrx-proof-firmware
+          path: firmware
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install flasher dependencies
+        run: python -m pip install --disable-pip-version-check pyinstaller pyserial esptool numpy
+
+      - name: Build one-file Receiver Console
+        shell: pwsh
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name C5VRX-Receiver-Console
+          --collect-all esptool
+          --add-data "firmware;firmware"
+          tools/C5VRX_Flasher.py
+
+      - name: Upload Windows flasher
+        uses: actions/upload-artifact@v4
+        with:
+          name: C5VRX-Receiver-Console-Windows
+          path: dist/C5VRX-Receiver-Console.exe
+          if-no-files-found: error
+
+  windows-xiao-flasher:
+    name: Build XIAO C5VRX Windows console
+    runs-on: windows-latest
+    needs: xiao-receiver-console-firmware
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download XIAO Receiver Console firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: c5vrx-xiao-receiver-console-firmware
+          path: firmware
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install console dependencies
+        run: python -m pip install --disable-pip-version-check pyinstaller pyserial esptool numpy
+
+      - name: Build board-specific one-file Receiver Console
+        shell: pwsh
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name C5VRX-XIAO-Receiver-Console
+          --paths tools
+          --collect-all esptool
+          --add-data "firmware;firmware"
+          tools/C5VRX_XIAO_Flasher.py
+
+      - name: Upload XIAO Windows console
+        uses: actions/upload-artifact@v4
+        with:
+          name: C5VRX-XIAO-Receiver-Console-Windows
+          path: dist/C5VRX-XIAO-Receiver-Console.exe
+          if-no-files-found: error
+
+  phy-analysis:
+    name: ESP32-C5 PHY reverse engineering
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract ESP32-C5 PHY/RF-test report
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32c5
+          path: .
+          command: >-
+            python tools/analyze_phy.py --out phy-analysis.md &&
+            python tools/audit_rf_streamability.py --out rf-streamability-audit.md
+
+      - name: Upload PHY analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32c5-phy-analysis
+          path: |
+            phy-analysis.md
+            rf-streamability-audit.md
+          if-no-files-found: error
+
+  host-tools:
+    name: Host-side DSP / tables
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install DSP dependency
+        run: python -m pip install --disable-pip-version-check numpy
+
+      - name: Stream queue and CVBS conditioner tests
+        run: make test
+
+      - name: WBFM discriminator self-test
+        run: python tools/wbfm_demod.py --self-test
+
+      - name: ADC dump decoder self-test
+        run: python tools/decode_adc_dump.py --self-test
+
+      - name: Capture diagnostics self-test
+        run: python tools/analyze_iq_capture.py --self-test
+
+      - name: Hardware bench runner parser self-test
+        run: python tools/c5vrx_bench.py --self-test
+
+      - name: USB-C lab session and Codex bundle self-test
+        run: python tools/c5vrx_lab.py self-test
+
+      - name: BitScrambler FM approximation self-test
+        run: python tools/bitlut_fm.py --self-test
+
+      - name: Validate embedded 4:1 BitScrambler program
+        run: python tools/validate_wbfm_bsasm.py
+
+      - name: Finite CVBS scanline renderer self-test
+        run: python tools/render_cvbs_lines.py --self-test
+
+      - name: PAL CVBS streamed-raster self-test
+        run: python tools/pal_cvbs_reference.py --self-test
+
+      - name: Branded scanline renderer self-test
+        run: python tools/cvbs_brand_reference.py
+
+      - name: Reject full-frame CVBS firmware allocations
+        run: >-
+          ! grep -R -E 'uint8_t[^;]*\[[^]]*(800000|FRAME.*SAMPLES)' main/c5vrx_cvbs_out.c
+
+      - name: Minimal CVBS DAC model self-test
+        run: python tools/minimal_cvbs_dac.py --self-test
+
+      - name: Generate FPV channel report
+        run: python tools/fpv_channel_report.py

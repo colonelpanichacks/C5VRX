@@ -1,0 +1,4 @@
+# Bounded VTX-on raw-Q4 capture for discriminator/headroom/boundary analysis.
+# Layer this after sdkconfig.quality.defaults.
+CONFIG_C5VRX2_LIVE_SNAPSHOT_ONCE=y
+CONFIG_C5VRX2_LIVE_SNAPSHOT_RAW_Q4=y

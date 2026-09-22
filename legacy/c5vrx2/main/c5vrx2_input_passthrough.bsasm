@@ -1,0 +1,12 @@
+# Hardware oracle: byte-perfect low-end input FIFO passthrough. This is the
+# same prefetch/read ordering used by Espressif's official trivial example.
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 8
+cfg lut_width_bits 16
+
+loop:
+    set 0..7 0..7,
+    read 8,
+    write 8,
+    jmp loop

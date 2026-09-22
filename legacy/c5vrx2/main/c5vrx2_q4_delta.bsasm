@@ -1,0 +1,37 @@
+# Hardware self-test stage 4: one adjacent modulo phase difference per input
+# sample. Counter A receives phase[n] plus the retained -phase[n-1].
+cfg prefetch true
+cfg eof_on downstream
+cfg trailing_bytes 0
+cfg lut_width_bits 16
+
+address:
+    set 8..15 O8..O15,
+    set 16 0,
+    set 17 1,
+    set 18 2,
+    set 19 3,
+    set 20 4,
+    set 21 5,
+    set 22 6,
+    set 23 7,
+    set 24..25 L,
+    read 8,
+    LDCTDAL 0
+
+add_current:
+    set 0..7 L8..L15,
+    set 8..15 O8..O15,
+    set 16..23 L0..L7,
+    ADDCTIAL
+
+add_previous:
+    set 0..7 O0..O7,
+    set 16..23 O8..O15,
+    ADDCTIAL
+
+emit:
+    set 0..7 A0..A7,
+    set 8..15 O0..O7,
+    write 8,
+    jmp address

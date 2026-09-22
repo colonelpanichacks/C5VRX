@@ -1,0 +1,16 @@
+{
+  "evidence": "synthetic 6-bit coherent tone; no hardware/RF claim",
+  "tone_hz": 3579101.5625,
+  "held_20Ms": {
+    "mean_codes": 20.0,
+    "fundamental_peak_codes": 7.645373241810377,
+    "first_image_dBc": -12.650530582677916
+  },
+  "linear_80Ms": {
+    "mean_codes": 19.77734375,
+    "fundamental_peak_codes": 7.273938472070449,
+    "first_image_dBc": -25.220800613427926
+  },
+  "extra_image_suppression_dB": 12.57027003075001,
+  "fundamental_change_dB": -0.4325813809060636
+}

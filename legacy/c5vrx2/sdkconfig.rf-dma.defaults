@@ -1,0 +1,3 @@
+# Dedicated MAC-owned RF SRAM -> AHB-GDMA visibility diagnostic.
+# CONFIG_C5VRX2_MODE_LIVE is not set
+CONFIG_C5VRX2_MODE_RF_DMA=y

@@ -1,0 +1,15 @@
+build/
+build-*/
+sdkconfig
+sdkconfig.old
+managed_components/
+.DS_Store
+__pycache__/
+*.pyc
+research/generated/
+_package_stage/
+build_stable_a1/
+dist/
+firmware/
+sdkconfig.stable_a1
+session_artifacts/

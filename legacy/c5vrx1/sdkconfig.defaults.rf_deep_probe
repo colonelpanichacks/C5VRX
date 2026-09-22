@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+# Explicit opt-in build for the audited ESP-IDF v6.0.2 ESP32-C5 producer.
+# CMake additionally verifies the exact librftest.a SHA-256 and fails closed.
+# Finite capture is command-triggered only. Never seize RF SRAM automatically
+# during boot; USB control and A1 tuning must remain available first.
+# CONFIG_C5VRX_EXPERIMENTAL_ADC_DUMP is not set
+CONFIG_C5VRX_EXPERIMENTAL_RF_DUMP_PRODUCER=y

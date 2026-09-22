@@ -1,0 +1,24 @@
+# Hardware self-test stage: packed Q4/I4 byte -> LUT0 absolute phase byte.
+# The LUT index is established one cycle before its output is emitted.
+cfg prefetch true
+cfg eof_on downstream
+cfg trailing_bytes 0
+cfg lut_width_bits 16
+
+address:
+    # For a 16-bit LUT C5 uses O16..O25 as address bits 0..9.
+    set 16 0,
+    set 17 1,
+    set 18 2,
+    set 19 3,
+    set 20 4,
+    set 21 5,
+    set 22 6,
+    set 23 7,
+    set 24..25 L,
+    read 8
+
+emit:
+    set 0..7 L0..L7,
+    write 8,
+    jmp address

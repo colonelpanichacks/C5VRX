@@ -1,0 +1,83 @@
+# Two-bundle steady-state Phase5 WBFM core.
+# Full Q4/I4 (8-bit Cartesian) input at 40 MS/s.
+# 20 MS/s unique 6-bit CVBS output, duplicated as [D,D] at 40 MHz DAC clock.
+#
+# Three instructions total:
+#   address_phase  - one-time prime
+#   address_delta  - steady-state bundle 1
+#   emit           - steady-state bundle 2 (loops back to address_delta)
+#
+# LUT layout (dual-purpose 16-bit words):
+#   LUT[packed_q4i4].bits[12:8]          = 5-bit Phase5 state (uniform polar bins)
+#   LUT[(prev_phase5<<5)|curr_phase5]    = 6-bit DAC code (centroid delta, P20/G2)
+#
+# O8..O12 holds the previous Phase5 state across ALL ring/DMA boundaries.
+# cfg eof_on downstream + cfg trailing_bytes 0 ensures PARLIO TX loop_transmission
+# never generates a downstream EOF, so the BitScrambler runs uninterrupted forever.
+#
+# Reference: Seamless Golden 16K (build-golden-notel) -- proven best live build.
+# P20 pedestal, G2 gain, current-minus-previous polarity.
+
+cfg prefetch true
+cfg eof_on downstream
+cfg trailing_bytes 0
+cfg lut_width_bits 16
+
+# Embedded 1044-entry LUT. Hardware oracle v9 proved embedded LUT data is
+# byte-exact at 20 MS/s; a separately preloaded LUT is NOT retained by the
+# active PARLIO TX run on ESP32-C5 / IDF 6.0.x.
+lut 1044 1562 1823 1830 1836 2098 2105 2110 6207 6204 6192 6436 6420 6420 6676 7188 532 1044 1300 1556 1556 1810 1806 1800 6400 6400 6400 6656 6656 6915 7177 7694 270 788 1049 1312 1318 1580 1587 1592 6718 6719 6716 6960 6948 7188 7444 7956 276 532 788 1044 1300 1300 1298 1550 6664 6912 6912 6912 7168 7424 7683 7944 265 527 788 795 1057 1319 1326 1331 6969 6975 6975 7228 7472 7460 7700 7956 20 276 532 788 788 1044 1044 1298 6926 7176 7168 7168 7424 7680 7936 3 2 264 525 788 794 1056 1063 1068 7218 7224 7229 7487 7484 7728 7972 20 20 276 532 532 788 788 1044 1044 7186 7182 7432 7424 7680 7680 7936 0 4096 3842 3591 3598 3348 3354 3105 3110 5164 5170 4919 4925 4671 4668 4400 4132 4116 3860 3604 3348 3348 3092 3092 3092 5140 5138 5134 4872 4864 4608 4352 4096 4096 3840 3585 3336 3342 3092 3099 2848 5414 5164 5169 4919 4926 4671 4412 4144 3876 3604 3348 3348 3092 3092 2836 2836 5396 5396 5394 5134 4872 4864 4608 4352 3840 3584 3328 3073 2823 2829 2836 2585 5663 5413 5419 5425 5175 4925 4671 4412 3888 3364 3092 2836 2836 2580 2580 2580 5652 5652 5652 5394 5390 5128 4864 4352 3584 3072 2816 2560 2562 2312 2319 2324 5914 5920 5925 5675 5682 5432 5183 4671 3132 2608 2340 2324 2324 2068 2068 2068 6164 6164 6164 5908 5906 5902 5640 5120 0 0 0 0 0 2 9 14 20 26 31 37 44 50 57 62 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 8 0 0 0 0 0 3 8 14 20 25 31 38 44 51 56 62 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 14 8 0 0 0 0 0 3 9 15 20 26 33 39 46 51 57 63 63 60 48 36 20 20 20 20 20 20 20 20 20 18 18 14 8 0 0 0 0 0 3 9 14 20 27 33 40 45 51 57 62 63 60 48 36 20 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 7 13 20 26 33 38 44 50 55 62 63 60 48 36 20 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 1 7 14 20 27 32 38 44 49 56 62 63 60 48 36 20 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 0 7 13 20 25 31 37 43 49 55 61 63 60 48 36 20 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 8 15 20 26 32 37 44 50 56 63 63 60 48 36 20 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 9 14 20 26 31 38 44 50 57 62 63 60 48 36 20 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 3 8 14 20 25 32 38 44 51 56 62 63 60 48 36 20 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 3 9 15 20 27 33 39 46 51 57 63 63 60 48 36 20 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 8 13 20 26 32 39 44 50 56 61 63 60 48 36 20 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 7 14 20 26 33 38 44 50 55 62 63 60 48 36 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 1 8 14 20 27 32 38 44 49 56 62 63 60 48 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 1 7 13 20 25 31 37 43 49 55 62 63 60 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 8 15 20 26 32 37 44 50 57 63 63 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 9 14 20 26 31 38 44 51 57 62 62 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 3 8 14 20 25 32 38 45 51 56 57 63 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 3 9 15 20 27 33 40 46 51 50 56 61 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 8 13 20 26 33 39 44 44 50 55 62 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 7 14 20 27 33 38 37 43 49 55 61 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 0 7 13 20 26 31 31 37 43 49 55 61 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 1 7 14 20 25 26 32 37 44 50 56 63 63 60 48 36 20 20 20 20 20 20 20 20 20 18 14 8 0 0 0 0 0 2 9 15 20
+
+address_phase:
+    # One-time pipeline prime: preserve previous phase in O26..O30 and address
+    # the first selected byte. Subsequent phase addresses are issued by emit.
+    set 26..30 O26..O30,
+    set 16 8,
+    set 17 9,
+    set 18 10,
+    set 19 11,
+    set 20 12,
+    set 21 13,
+    set 22 14,
+    set 23 15,
+    set 24..25 L,
+    read 16
+
+address_delta:
+    # First lookup's high five bits are current phase (L8..L12). Preserve them
+    # in O26..O30 and address LUT[(previous << 5) | current].
+    set 26..30 L8..L12,
+    set 16 L8,
+    set 17 L9,
+    set 18 L10,
+    set 19 L11,
+    set 20 L12,
+    set 21 O26,
+    set 22 O27,
+    set 23 O28,
+    set 24 O29,
+    set 25 O30,
+    set 31 L
+
+emit:
+    # Second lookup's low six bits are the complete calibrated DAC code (L0..L5).
+    # Emit two 8-bit DAC samples at 40 MS/s: Byte 0 (bits 0..5) and
+    # Byte 1 (bits 8..13). Identical bytes retain a 50 ns analog hold [D,D].
+    set 0..5 L0..L5,
+    set 6..7 L,
+    set 8..13 L0..L5,
+    set 14..15 L,
+    set 26..30 O26..O30,
+    set 16 8,
+    set 17 9,
+    set 18 10,
+    set 19 11,
+    set 20 12,
+    set 21 13,
+    set 22 14,
+    set 23 15,
+    set 24..25 L,
+    set 31 L,
+    read 16,
+    write 16,
+    jmp address_delta

@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+# C5VRX one-click control firmware
+# The production target is ESP32-C5-WROOM-1U-N4. Reserve a 3 MiB factory-app
+# slot instead of IDF's 1 MiB default; the remaining 960 KiB stays unused for
+# future data/upgrade policy rather than being silently consumed by the app.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_receiver_console.csv"
+CONFIG_C5VRX_BOARD_PROFILE="devkit-wroom"
+
+# Boot on A4 / 5805 MHz exact Wi-Fi center, then retune at runtime from the PC UI.
+CONFIG_C5VRX_RF_BACKEND_WIFI5=y
+CONFIG_C5VRX_TARGET_BAND_A=y
+CONFIG_C5VRX_TARGET_CHANNEL=4
+CONFIG_C5VRX_RX_HT40=y
+
+# Native USB-C control path on ESP32-C5 (GPIO13 D-, GPIO14 D+).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Keep arbitrary undocumented retuning disabled by default. Non-exact FPV
+# channels use the nearest standard 5 GHz Wi-Fi center and can be compensated
+# later in host/on-chip DSP.
+# CONFIG_C5VRX_EXPERIMENTAL_DIRECT_TUNE is not set
+
+# Link Espressif's RF certification/test library. This is required for the
+# recovered set_dump_mode()/adctrig() finite IQ capture path.
+CONFIG_ESP_PHY_ENABLE_CERT_TEST=y
+
+# Do NOT dump thousands of samples automatically on every boot. The Windows
+# control panel can trigger finite captures on demand with CAPTURE <N>.
+# CONFIG_C5VRX_EXPERIMENTAL_ADC_DUMP is not set
+
+# Compile the experimental finite-chain -> WBFM -> sample-domain CVBS route.
+# It starts only after the explicit NEARLIVE START command and is never called
+# a continuous RF source.
+CONFIG_C5VRX_EXPERIMENTAL_CVBS_PARLIO=y
+# ESP32-C5-DevKitC-1 v1.2: D0..D5 are J1 pins 5,6,7,9,10,11.
+# The logical GPIO map also applies to a custom WROOM-1/1U board.
+CONFIG_C5VRX_CVBS_DAC_BITS=6
+CONFIG_C5VRX_CVBS_D0_GPIO=0
+CONFIG_C5VRX_CVBS_D1_GPIO=1
+CONFIG_C5VRX_CVBS_D2_GPIO=6
+CONFIG_C5VRX_CVBS_D3_GPIO=8
+CONFIG_C5VRX_CVBS_D4_GPIO=9
+CONFIG_C5VRX_CVBS_D5_GPIO=10
+CONFIG_C5VRX_CVBS_D6_GPIO=-1
+CONFIG_C5VRX_CVBS_D7_GPIO=-1

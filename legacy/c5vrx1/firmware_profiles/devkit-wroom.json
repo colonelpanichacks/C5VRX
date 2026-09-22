@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "profile_id": "devkit-wroom",
+  "display_name": "ESP32-C5 DevKitC-1 v1.2 / WROOM-1(U)",
+  "av_pin_summary": "D0..D5 = GPIO0/1/6/8/9/10",
+  "flash_size_mb": 4
+}

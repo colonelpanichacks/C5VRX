@@ -1,0 +1,80 @@
+name: C5VRX XIAO Stable Console
+
+on:
+  pull_request:
+    paths:
+      - tools/C5VRX_XIAO_Flasher.py
+      - tools/C5VRX_Flasher.py
+      - tools/c5vrx_lab.py
+      - tools/c5vrx_usb_protocol.py
+      - sdkconfig.defaults.xiao_receiver_console
+      - sdkconfig.defaults.rf_deep_probe
+      - firmware_profiles/xiao-esp32c5.json
+      - main/**
+      - .github/workflows/xiao-stable-console.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    name: Build XIAO Receiver firmware
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build XIAO receiver image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.2
+          target: esp32c5
+          path: .
+          command: >-
+            SDKCONFIG_DEFAULTS="sdkconfig.defaults.xiao_receiver_console;sdkconfig.defaults.rf_deep_probe"
+            idf.py -D SDKCONFIG=/tmp/c5vrx-xiao-stable-sdkconfig set-target esp32c5 build &&
+            mkdir -p firmware &&
+            cp build/flasher_args.json firmware/ &&
+            cp build/bootloader/bootloader.bin firmware/bootloader.bin &&
+            cp build/partition_table/partition-table.bin firmware/partition-table.bin &&
+            cp build/*.bin firmware/ &&
+            cp firmware_profiles/xiao-esp32c5.json firmware/profile.json &&
+            cp research/xiao-c5-cvbs-proof.md firmware/WIRING.md &&
+            cp research/first-hardware-test.md firmware/FIRST-HARDWARE-TEST.md &&
+            cp research/codex-hardware-lab.md firmware/codex-hardware-lab.md &&
+            cp tools/c5vrx_bench.py firmware/ &&
+            cp tools/c5vrx_lab.py tools/c5vrx_usb_protocol.py firmware/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c5vrx-xiao-stable-firmware
+          path: firmware/
+          if-no-files-found: error
+
+  windows:
+    name: Build hardened XIAO Windows console
+    runs-on: windows-latest
+    needs: firmware
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: c5vrx-xiao-stable-firmware
+          path: firmware
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check pyinstaller pyserial esptool numpy
+      - name: Build hardened one-file console
+        shell: pwsh
+        run: >-
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name C5VRX-XIAO-Stable-Receiver-Console
+          --paths tools
+          --collect-all esptool
+          --add-data "firmware;firmware"
+          tools/C5VRX_XIAO_Flasher.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: C5VRX-XIAO-Stable-Receiver-Console-Windows
+          path: dist/C5VRX-XIAO-Stable-Receiver-Console.exe
+          if-no-files-found: error

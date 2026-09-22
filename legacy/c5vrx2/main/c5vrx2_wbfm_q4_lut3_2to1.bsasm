@@ -1,0 +1,50 @@
+# Three-bundle Q4/I4 WBFM core for 40 MS/s input and 20 MS/s CVBS output.
+# LUT bank 0 maps the selected Q4/I4 byte to a four-bit circular phase.  LUT
+# bank 1 maps (previous_phase4,current_phase4) directly to the calibrated,
+# clamped six-bit DAC code.  O8..O11 is persistent phase state.
+
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 9
+cfg lut_width_bits 16
+
+address_phase:
+    set 8..11 O8..O11,
+    set 12..15 L,
+    set 16 8,
+    set 17 9,
+    set 18 10,
+    set 19 11,
+    set 20 12,
+    set 21 13,
+    set 22 14,
+    set 23 15,
+    set 24..25 L,
+    read 16
+
+address_delta:
+    # Bank 1 index = 0x100 | (previous_phase4 << 4) | current_phase4.
+    # Source O8..O11 still refers to the preceding instruction cycle here.
+    set 8 L0,
+    set 9 L1,
+    set 10 L2,
+    set 11 L3,
+    set 12..15 L,
+    set 16 L0,
+    set 17 L1,
+    set 18 L2,
+    set 19 L3,
+    set 20 O8,
+    set 21 O9,
+    set 22 O10,
+    set 23 O11,
+    set 24 H,
+    set 25 L
+
+emit:
+    set 0..5 L0..L5,
+    set 6..7 L,
+    set 8..11 O8..O11,
+    set 12..15 L,
+    write 8,
+    jmp address_phase

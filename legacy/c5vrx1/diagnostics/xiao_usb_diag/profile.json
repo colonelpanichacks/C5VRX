@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "profile_id": "xiao-esp32c5",
+  "display_name": "XIAO ESP32-C5 USB diagnostic",
+  "av_pin_summary": "USB-only diagnostic; no RF or AV output",
+  "flash_size_mb": 8
+}

@@ -1,0 +1,52 @@
+name: C5VRX Long Capture Windows
+
+on:
+  push:
+    branches:
+      - agent/fix-c5-ht40-startup
+    paths:
+      - tools/C5VRX_LongCapture.py
+      - tools/c5vrx_usb_protocol.py
+      - .github/workflows/long-capture-windows.yml
+  pull_request:
+    paths:
+      - tools/C5VRX_LongCapture.py
+      - tools/c5vrx_usb_protocol.py
+      - .github/workflows/long-capture-windows.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip pyserial pyinstaller
+
+      - name: Test USB protocol
+        run: python tools/c5vrx_usb_protocol.py --self-test
+
+      - name: Build one-file Windows helper
+        run: >-
+          pyinstaller
+          --noconfirm
+          --clean
+          --onefile
+          --windowed
+          --paths tools
+          --name C5VRX_LongCapture
+          tools/C5VRX_LongCapture.py
+
+      - name: Upload Windows helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: C5VRX-Long-Capture-Windows
+          path: dist/C5VRX_LongCapture.exe
+          if-no-files-found: error

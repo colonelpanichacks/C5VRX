@@ -1,0 +1,14 @@
+# Bounded direct PARLIO-TX BitScrambler throughput/EOF probe.
+# Emit byte 1 of each two-byte input group.  This mirrors Espressif's
+# supported 32-to-8 PARLIO test while exercising the exact 40 MB/s input and
+# 20 MS/s output rates required by the Q4 WBFM production program.
+
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 9
+
+loop:
+    set 0..7 8..15,
+    write 8,
+    read 16,
+    jmp loop

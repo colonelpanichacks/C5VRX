@@ -1,0 +1,59 @@
+name: C5VRX-3 Production CI
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Architectural & DSP Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify Architectural Constraints
+        run: python tools/validate_build.py
+
+  build:
+    name: Build Production Firmware (ESP32-C5)
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.0.2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build C5VRX-3 Firmware
+        shell: bash
+        run: |
+          . /opt/esp/idf/export.sh
+          idf.py build
+
+      - name: Prepare Release Artifacts
+        shell: bash
+        run: |
+          mkdir -p release
+          cp build/bootloader/bootloader.bin release/
+          cp build/partition_table/partition-table.bin release/
+          cp build/c5vrx3.bin release/
+          cp build/flasher_args.json release/
+          cd release
+          sha256sum * > SHA256SUMS
+
+      - name: Upload Production Firmware Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: c5vrx3-production-firmware
+          path: release/
+          if-no-files-found: error

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+# C5VRX needs Espressif's RF certification library linked so we can use the
+# public non-signalling RX harness while reverse-engineering the deeper RX path.
+CONFIG_ESP_PHY_ENABLE_CERT_TEST=y
+
+# Keep logs readable during bring-up.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# USB Serial/JTAG console is convenient on many C5 dev boards. If your board
+# uses an external USB-UART bridge, change the console selection in menuconfig.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

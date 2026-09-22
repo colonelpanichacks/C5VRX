@@ -1,0 +1,2 @@
+# Append after TX oracle + trajectory defaults; complements low-bank test.
+CONFIG_C5VRX2_TX_ORACLE_HIGH_NIBBLE=y

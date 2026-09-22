@@ -1,0 +1,5 @@
+# Optional CPU-clock A/B only; does not establish a faster BitScrambler clock.
+# Layer after flash40 defaults. No CPU sample processing is introduced.
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160 is not set
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240

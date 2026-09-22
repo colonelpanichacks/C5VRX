@@ -1,0 +1,28 @@
+build/
+build-*/
+managed_components/
+sdkconfig
+sdkconfig.old
+*.bin
+*.elf
+*.map
+__pycache__/
+*.pyc
+*.bsbin
+scratch/
+*_log.txt
+packages/
+
+# Runtime data (dashboard CSV export + captured frames — never commit)
+tools/detections.csv
+tools/shots/
+
+# OS / editor droppings
+.DS_Store
+
+# Local Python environments (.pyc/__pycache__ above)
+.venv/
+venv/
+
+# Scratch output under /tmp is outside the repo by definition; nothing
+# here should ever reference absolute /tmp paths in tracked files.

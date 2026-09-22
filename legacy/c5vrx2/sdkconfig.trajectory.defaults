@@ -1,0 +1,2 @@
+# Opt-in candidate; layer after normal live or TX-oracle defaults.
+CONFIG_C5VRX2_WBFM_TRAJECTORY=y

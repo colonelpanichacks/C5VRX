@@ -1,0 +1,4 @@
+# Dedicated producer-only soak. This intentionally excludes PARLIO and any
+# heap allocation after the autonomous RF writer has been armed.
+# CONFIG_C5VRX2_MODE_LIVE is not set
+CONFIG_C5VRX2_MODE_RF_WRAP=y

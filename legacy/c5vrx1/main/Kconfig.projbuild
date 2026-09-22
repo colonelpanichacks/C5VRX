@@ -1,0 +1,252 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+menu "C5VRX analog receiver research"
+
+config C5VRX_BOARD_PROFILE
+    string "Board/profile identifier"
+    default "generic"
+    help
+        Machine-readable identifier printed at boot and in STATUS. Release
+        profiles override this so the Receiver Console can make the selected
+        AV-output wiring explicit. This does not perform board autodetection.
+
+choice C5VRX_RF_BACKEND
+    prompt "RF bring-up backend"
+    default C5VRX_RF_BACKEND_WIFI5
+    help
+        The public Wi-Fi driver is the default because ESP-IDF officially
+        supports 5 GHz operation on ESP32-C5. The certification/test RX API
+        currently documents only channel numbers 1-14 and is therefore kept
+        as a separate research backend rather than being treated as a proven
+        5 GHz tuner.
+
+config C5VRX_RF_BACKEND_WIFI5
+    bool "Public ESP-IDF 5 GHz Wi-Fi driver (recommended)"
+
+config C5VRX_RF_BACKEND_CERT_TEST
+    bool "RF certification/test PHY (experimental; documented channels 1-14)"
+
+endchoice
+
+choice C5VRX_TARGET_BAND
+    prompt "Default analog FPV band"
+    default C5VRX_TARGET_BAND_R
+
+config C5VRX_TARGET_BAND_A
+    bool "A / Boscam A"
+config C5VRX_TARGET_BAND_B
+    bool "B / Boscam B"
+config C5VRX_TARGET_BAND_E
+    bool "E / Boscam E"
+config C5VRX_TARGET_BAND_F
+    bool "F / FatShark"
+config C5VRX_TARGET_BAND_R
+    bool "R / RaceBand"
+
+endchoice
+
+config C5VRX_TARGET_CHANNEL
+    int "Default FPV channel"
+    range 1 8
+    default 5
+    help
+        Channel number inside the selected analog FPV band.
+
+config C5VRX_RX_HT40
+    bool "Use 40 MHz Wi-Fi RX bandwidth for bootstrap"
+    default y
+    help
+        Wide bootstrap bandwidth makes early analog-FPV experiments tolerant
+        of offsets between the requested FPV center and a normal Wi-Fi center.
+
+config C5VRX_EXPERIMENTAL_DIRECT_TUNE
+    bool "Enable undocumented phy_set_freq() retune experiment"
+    default n
+    help
+        EXPERIMENTAL. After a receive backend is active on the nearest standard
+        Wi-Fi center, call the weak two-argument phy_set_freq(freq_mhz, offset)
+        hook to attempt an arbitrary-frequency retune. Leave disabled until
+        testing with a controlled RF source.
+
+config C5VRX_EXPERIMENTAL_ADC_DUMP
+    bool "Run one finite vendor ADC/IQ dump after RF bring-up"
+    default n
+    help
+        EXPERIMENTAL. ESP-IDF v6.0.2 static analysis identifies a 64 KiB
+        vendor RF-test capture buffer with packed signed 10-bit I/Q samples.
+        This option triggers one finite capture after the RF backend starts.
+        The path is not yet validated on physical ESP32-C5 hardware.
+
+config C5VRX_EXPERIMENTAL_RF_DUMP_PRODUCER
+    bool "Enable hash-pinned non-blocking RF dump producer probes"
+    default n
+    help
+        HIGH-RISK HARDWARE DIAGNOSTIC. Enables a source reconstruction pinned
+        to ESP-IDF v6.0.2 and the audited C5 librftest.a SHA-256 shown by RF
+        DEEP PROBE. It reproduces only vendor-observed automatic-gain modes
+        0, 11 and 12. It never forces the overwritten historical rate field.
+
+config C5VRX_ADC_DUMP_SAMPLES
+    int "ADC/IQ samples per finite capture"
+    range 256 16384
+    default 8192
+    depends on C5VRX_EXPERIMENTAL_ADC_DUMP
+    help
+        Number of complex 32-bit dump words to process. The recovered vendor
+        buffer at 0x40830000 is 64 KiB, so the maximum is 16384 samples.
+
+config C5VRX_ADC_DUMP_PRINT_RAW
+    bool "Print raw capture words as IQ:xxxxxxxx lines"
+    default n
+    depends on C5VRX_EXPERIMENTAL_ADC_DUMP
+    help
+        Emit machine-readable raw 32-bit dump words over the console. This is
+        intentionally disabled by default because thousands of serial lines are
+        slow. Enable it for captures that will be decoded on a host PC.
+
+config C5VRX_EXPERIMENTAL_CVBS_PARLIO
+    bool "Enable analog-first PARLIO CVBS resistor-DAC output"
+    default n
+    help
+        EXPERIMENTAL OUTPUT-SIDE TEST. Adds the CVBS TEST / CVBS STOP USB
+        commands and the optional output-only boot mode.
+
+        The generator streams a PAL 625/50 monochrome raster at 20 MS/s with
+        horizontal and vertical sync, a branded splash, calibration pattern
+        and optional PAL-frequency burst. Two PARLIO/GDMA buffers are switched
+        continuously so a full-frame framebuffer is not required.
+
+        The reference architecture transports one byte per sample but uses six
+        physical low-order GPIO bits and a weighted resistor network into a
+        known 75-ohm terminated video input. No external DAC IC is required.
+
+        A short-trace passive output is the baseline. Long cables, ESD targets
+        or strict production video-drive requirements may justify an optional
+        buffer later, but a buffer is not assumed to be mandatory.
+
+config C5VRX_CVBS_OUTPUT_ONLY_TEST
+    bool "Boot directly into PAL CVBS output test (skip RF bring-up)"
+    default n
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+    help
+        Start the PAL output proof immediately after boot and skip Wi-Fi/RF
+        initialization. Use this for the dedicated DevKit resistor-DAC hardware
+        test so RF activity cannot interfere with output validation.
+
+config C5VRX_CVBS_TEST_COLOR_BURST
+    bool "Add PAL-frequency swinging burst to the monochrome test frame"
+    default y
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+    help
+        Add a 4.43361875 MHz alternating-phase burst during the back porch.
+        This is an analog bandwidth/lock stress signal only. The active picture
+        remains monochrome and C5VRX does not claim complete PAL color encoding.
+
+config C5VRX_CVBS_DAC_BITS
+    int "Physical CVBS resistor-DAC bits"
+    range 2 8
+    default 6
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+    help
+        Number of physical GPIO/resistor bits used for composite output.
+        PARLIO still transports one byte per sample; unused upper GPIOs remain
+        disconnected.
+
+        Six bits are the analog-first reference target. This gives 64 output
+        codes while requiring only six GPIOs. Lower bit depths remain useful
+        for BOM/quality experiments; 7-8 bits should only be used if measured
+        video quality justifies the extra pins and passives.
+
+config C5VRX_CVBS_D0_GPIO
+    int "CVBS DAC bit 0 GPIO"
+    range -1 28
+    default -1
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+config C5VRX_CVBS_D1_GPIO
+    int "CVBS DAC bit 1 GPIO"
+    range -1 28
+    default -1
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+config C5VRX_CVBS_D2_GPIO
+    int "CVBS DAC bit 2 GPIO"
+    range -1 28
+    default -1
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+config C5VRX_CVBS_D3_GPIO
+    int "CVBS DAC bit 3 GPIO"
+    range -1 28
+    default -1
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+config C5VRX_CVBS_D4_GPIO
+    int "CVBS DAC bit 4 GPIO"
+    range -1 28
+    default -1
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+config C5VRX_CVBS_D5_GPIO
+    int "CVBS DAC bit 5 GPIO"
+    range -1 28
+    default -1
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+config C5VRX_CVBS_D6_GPIO
+    int "CVBS DAC bit 6 GPIO"
+    range -1 28
+    default -1
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+config C5VRX_CVBS_D7_GPIO
+    int "CVBS DAC bit 7 GPIO"
+    range -1 28
+    default -1
+    depends on C5VRX_EXPERIMENTAL_CVBS_PARLIO
+
+config C5VRX_LIVE_CVBS_BIAS_Q8
+    int "Live RF conditioner bias (Q8)"
+    range 0 16383
+    default 8192
+    help
+        Calibratable phase-delta bias. 8192 represents discriminator code 32.
+
+config C5VRX_LIVE_CVBS_GAIN_Q8
+    int "Live RF conditioner gain (Q8)"
+    range 1 4096
+    default 256
+    help
+        Placeholder calibration gain; 256 is unity. Measure with real RF.
+
+config C5VRX_LIVE_CVBS_INVERT
+    bool "Invert live RF discriminator polarity"
+    default n
+
+choice C5VRX_WBFM_KERNEL
+    prompt "Continuous hardware WBFM phase kernel"
+    default C5VRX_WBFM_KERNEL_PHASE8
+    help
+        Both candidates retain every fourth IQ sample and use the same
+        BitScrambler/GDMA dataplane. Phase8 preserves additional discriminator
+        precision before the final 6-bit CVBS mapping. Confirm headroom and
+        burst fidelity on hardware before marking the production gate passed.
+
+config C5VRX_WBFM_KERNEL_PHASE6
+    bool "phase6 reference"
+config C5VRX_WBFM_KERNEL_PHASE8
+    bool "phase8 high-fidelity candidate"
+endchoice
+
+config C5VRX_LIVE_CVBS_CLAMP_MIN
+    int "Live RF conditioner minimum output code"
+    range 0 63
+    default 0
+
+config C5VRX_LIVE_CVBS_CLAMP_MAX
+    int "Live RF conditioner maximum output code"
+    range 0 63
+    default 63
+
+config C5VRX_LIVE_CVBS_FILTER_SHIFT
+    int "Live RF lightweight IIR shift (0 disables)"
+    range 0 8
+    default 0
+    help
+        Optional one-pole sample-domain filter. Final setting requires a real
+        VTX capture and bandwidth measurement.
+
+endmenu

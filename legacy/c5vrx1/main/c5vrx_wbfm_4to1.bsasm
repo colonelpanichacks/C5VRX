@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+# C5VRX packed IQ -> 20 MS/s biased phase-delta proof.
+#
+# Input word layout recovered from the C5 RF-test dump:
+#   bits  0..9  Q signed 10-bit
+#   bits 10..19 I signed 10-bit
+#
+# The program consumes four 32-bit input words for every one output byte. At an
+# 80 MS/s design-case upstream IQ rate this produces a 20 MS/s stream, matching the current
+# CVBS PARLIO target. The first output after reset is a priming sample.
+#
+# The 1024 x 16-bit LUT is loaded separately through bitscrambler_load_lut():
+#   L0..L5   phase6 from coarse I5/Q5
+#   L8..L13  (32 - phase6) modulo 64
+#
+# Counter B low six bits implement modulo-64 phase subtraction:
+#   B = 32 - previous_phase
+#   B += current_phase
+#   output B0..B5 = 32 + current_phase - previous_phase
+#
+# Important source-mux detail:
+# The phase-add cycle stores (32-current_phase) in O0..O5 while adding the
+# current phase to counter B through O16..O21. The following cycle can emit
+# counter B and reload B from the previous-output register without combining
+# LUT and counter sources in one instruction bundle.
+
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 0
+cfg lut_width_bits 16
+
+init:
+    LDCTDBL 32
+
+sample_address:
+    set 22..26 5..9,
+    set 27..31 15..19,
+    read 32,
+    jmp phase_add
+
+phase_add:
+    set 0..5 L8..L13,
+    set 16..21 L0..L5,
+    read 32,
+    ADDCTIBL
+
+emit_and_remember:
+    set 0..5 B0..B5,
+    set 16..21 O0..O5,
+    read 32,
+    write 8,
+    LDCTIBL
+
+decimate_fourth:
+    read 32,
+    jmp sample_address

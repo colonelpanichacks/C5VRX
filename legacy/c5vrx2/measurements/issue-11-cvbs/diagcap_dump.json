@@ -1,0 +1,26 @@
+{
+  "capture_sha256": "e96e163e78b41b22be9b699ad4e2a7aa612e15fbb9838cb4a356c47272c2af4a",
+  "evidence": "actual six-bit DAC GPIO capture of bounded PR10 hardware replay; NOT simultaneous live RX/TX",
+  "rate_basis": "configured PLL-derived rates; no external timebase measurement",
+  "raw_bytes": 32768,
+  "output_samples": 12000,
+  "raw_duration_us": 819.1999999999999,
+  "alignment_offset": 15698,
+  "hardware_reference_mismatches": 337,
+  "compared_samples": 12000,
+  "raw_irq_status": 2,
+  "output_irq_status": 2,
+  "threshold_codes": 10.363636363636365,
+  "detected_syncs": 9,
+  "line_length_us": {
+    "min": 63.39450549450549,
+    "max": 64.02692307692304,
+    "mean": 63.59807692307692,
+    "std": 0.18070790245708768
+  },
+  "hsync_fit_residual_ns": {
+    "rms": 112.87492691177032,
+    "pkpk": 452.1057692307295
+  },
+  "warning": "No signal-quality conclusion if byte comparison fails. Burst fit is an estimate; weak/noisy fits do not establish color phase. Replay seam excluded; no long-run/frame claim."
+}

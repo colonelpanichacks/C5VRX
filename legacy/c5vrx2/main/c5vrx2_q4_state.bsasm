@@ -1,0 +1,26 @@
+# Hardware self-test stage 3: prove that the LUT high byte survives through
+# the exact previous-output register lane used by the production program.
+cfg prefetch true
+cfg eof_on downstream
+cfg trailing_bytes 0
+cfg lut_width_bits 16
+
+address:
+    set 16 0,
+    set 17 1,
+    set 18 2,
+    set 19 3,
+    set 20 4,
+    set 21 5,
+    set 22 6,
+    set 23 7,
+    set 24..25 L,
+    read 8
+
+capture:
+    set 8..15 L8..L15
+
+emit:
+    set 0..7 O8..O15,
+    write 8,
+    jmp address

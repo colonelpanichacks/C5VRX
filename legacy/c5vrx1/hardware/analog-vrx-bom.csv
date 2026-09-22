@@ -1,0 +1,26 @@
+Reference,Qty,Value/Function,Manufacturer,MPN,Package,Populate,Notes
+U1,1,ESP32-C5 module 4MB external antenna,Espressif,ESP32-C5-WROOM-1U-N4,Module,YES,RF CPU flash crystal matching and U.FL/MHF-I compatible connector
+U2,1,3.3V 1A LDO,Texas Instruments,TLV75733PDBVR,SOT-23-5,YES,USB 5V to 3V3
+D1,1,Dual USB ESD 0.7pF,Texas Instruments,TPD2EUSB30DRTR,DRT 1x1mm,YES,USB D+/D-
+D2,1,Single CVBS ESD 0.5pF,Texas Instruments,TPD1E05U06DYAR,SOD-523 DYA,YES,Place at AV connector
+J1,1,USB-C USB2 receptacle,Generic,USB-C-16P,SMT 16-pin,YES,Power plus native USB Serial/JTAG
+J2,1,Composite video output,Generic,RCA-or-keyed-AV,TH/SMT,YES,VIDEO plus GND
+SW1,1,Reset momentary switch,Generic,TACT-SW,SMT,YES,EN to GND
+SW2,1,Boot momentary switch,Generic,TACT-SW,SMT,YES,GPIO28 to GND
+R1,1,7.87k 1%,Generic,,0603,YES,CVBS D0 GPIO0
+R2,1,3.92k 1%,Generic,,0603,YES,CVBS D1 GPIO1
+R3,1,1.96k 1%,Generic,,0603,YES,CVBS D2 GPIO6
+R4,1,976R 1%,Generic,,0603,YES,CVBS D3 GPIO8
+R5,1,487R 1%,Generic,,0603,YES,CVBS D4 GPIO9
+R6,1,243R 1%,Generic,,0603,YES,CVBS D5 GPIO10
+R7,1,191R 1%,Generic,,0603,YES,VIDEO node to GND; source-match shunt
+R8 R9,2,5.1k 1%,Generic,,0603,YES,USB-C CC1/CC2 Rd
+R10 R11,2,22R,Generic,,0402/0603,YES,USB D-/D+ initial series value
+R12,1,10k,Generic,,0603,YES,EN pull-up
+C1,1,1uF X7R,Generic,,0603,YES,EN delay to GND
+C2,1,10uF X5R/X7R 10V,Generic,,0805,YES,VBUS entrance bulk
+C3,1,1uF X7R 10V,Generic,,0603,YES,LDO input local
+C4,1,10uF X5R/X7R 6.3V,Generic,,0805,YES,3V3 bulk close to module
+C5,1,0.1uF X7R,Generic,,0402/0603,YES,3V3 HF bypass
+CUSB1 CUSB2,2,DNI USB shunt capacitor footprint,Generic,,0402,DNI,Reserve per Espressif USB layout guidance
+TP1 TP2 TP3 TP4,4,Test pad,Generic,,Pad,YES,5V 3V3 CVBS GND

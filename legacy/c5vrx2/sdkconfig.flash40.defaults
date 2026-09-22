@@ -1,0 +1,13 @@
+# Conservative flash clock for ESP32-C5 rev1 startup testing.
+# Loaded after the normal sdkconfig snapshot by the dedicated build command.
+# CONFIG_ESPTOOLPY_FLASHFREQ_80M is not set
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+CONFIG_ESPTOOLPY_FLASHFREQ="40m"
+
+# ESP32-C5 rev1 on this board locks in pvt_func_enable() before app_main.
+# Use the documented debug fallback (fixed dbias) and a conservative CPU
+# clock; RF and PARLIO clocks remain independently configured.
+# CONFIG_ESP_ENABLE_PVT is not set
+# CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240 is not set
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160

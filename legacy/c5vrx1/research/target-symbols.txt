@@ -1,0 +1,45 @@
+# High-value symbols already observed in current ESP32-C5 vendor/ROM artifacts.
+# Do NOT assume prototypes from names alone; establish calling conventions first.
+
+# librftest.a / RF test helpers
+adctrig
+sampledeal
+accumiq
+dc_iq_est_test
+get_iq_est_pwr
+get_rx_buffer
+get_rx_data_addr
+set_dump_mode
+print_dump_data
+loop_dump_test
+fedump_rd_rxmem
+fedump_rd_txmem
+
+# ESP32-C5 ROM / PHY sample / dump symbols
+phy_chan_dump_cfg
+phy_chan_dump_cfg_752
+phy_adc_rate_set
+phy_fe_adc_on
+phy_iq_est_enable_new
+phy_iq_est_disable
+phy_dc_iq_est_new
+phy_rxiq_get_mis
+phy_get_iq_est_snr
+phy_fft_scale_force
+phy_csidump_force_lltf_cfg
+phy_set_rx_pbus_freq
+phy_get_rx_pbus_freq
+
+# ESP32-C5 frequency-control leads
+phy_set_freq
+phy_set_chanfreq
+phy_set_rfpll_freq
+phy_set_channel_rfpll_freq_new
+phy_write_chan_freq
+phy_freq_to_chan
+phy_chan_to_freq
+phy_chip_set_chan
+phy_chip_set_chan_ana
+phy_chip_set_chan_offset
+phy_freq_mem_change_5g_
+phy_freq_start_cal_5g_code

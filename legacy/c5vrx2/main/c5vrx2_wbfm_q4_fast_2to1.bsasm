@@ -1,0 +1,52 @@
+# Four-bundle continuous packed Q4/I4 -> adjacent WBFM boxcar -> six-bit CVBS.
+#
+# For two adjacent discriminator results the intermediate phase cancels:
+#   (phase1 - phase0) + (phase2 - phase1) = phase2 - phase0
+# Therefore one absolute-phase lookup per two input bytes is sufficient.  The
+# low LUT byte is phase2 and the high byte is -phase2.  O8..O15 preserves
+# -phase0 across loop iterations.  Loading counter A with twice the pedestal
+# and emitting A1..A6 performs the real-domain divide-by-two.
+
+cfg prefetch true
+cfg eof_on upstream
+cfg trailing_bytes 9
+cfg lut_width_bits 16
+
+address_selected:
+    set 8..15 O8..O15,
+    set 16 8,
+    set 17 9,
+    set 18 10,
+    set 19 11,
+    set 20 12,
+    set 21 13,
+    set 22 14,
+    set 23 15,
+    set 24..25 L,
+    read 16,
+    LDCTDAL 40
+
+add_previous:
+    # Save both halves of the selected sample's LUT result while adding the
+    # negative phase retained from the preceding selected sample.
+    set 0..7 L0..L7,
+    set 8..15 L8..L15,
+    set 16..23 O8..O15,
+    ADDCTIAL
+
+add_current:
+    set 8..15 O8..O15,
+    set 16..23 O0..O7,
+    ADDCTIAL
+
+emit:
+    set 0 A1,
+    set 1 A2,
+    set 2 A3,
+    set 3 A4,
+    set 4 A5,
+    set 5 A6,
+    set 6..7 L,
+    set 8..15 O8..O15,
+    write 8,
+    jmp address_selected

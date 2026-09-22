@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "profile_id": "xiao-esp32c5",
+  "display_name": "Seeed Studio XIAO ESP32-C5",
+  "av_pin_summary": "D0..D5 = XIAO D4/D5/D6/D7/D8/D9 (GPIO23/24/11/12/8/9)",
+  "flash_size_mb": 8
+}

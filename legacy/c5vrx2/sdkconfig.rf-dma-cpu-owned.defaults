@@ -1,0 +1,4 @@
+# Test whether the RF dump master can write while normal HP CPU ownership is
+# retained. The autonomous writer and MAC_DUMP_ALLOC offset stay unchanged.
+# CONFIG_C5VRX2_MODE_LIVE is not set
+CONFIG_C5VRX2_MODE_RF_DMA_CPU_OWNED=y
