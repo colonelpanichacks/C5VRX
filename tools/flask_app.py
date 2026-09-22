@@ -57,6 +57,7 @@ sys.path.insert(
 )
 from c5vrx_usb_protocol import (  # noqa: E402
     FRAME_DESCRIPTOR,
+    MAGIC,
     PACKET_GRAY8_FRAME,
     PACKET_GRAY8_ROWS,
     PACKET_STREAM_END,
@@ -248,6 +249,155 @@ class State:
 
 
 STATE = State()
+
+
+# ----- Unified serial port arbitration -----
+#
+# Two USB devices may be present: the OUI-SPY board (binary C5VRX-magic
+# packets + "[TAG]" console text at the configured baud) and the ELRS
+# sniffer dongle (JSON lines at 460800). Either reader blindly opening the
+# other's port wedges both (field case: the dongle alone on the configured
+# default port was grabbed by the main reader, leaving elrs offline), so
+# NO reader may open a port without positive evidence. PortArbiter owns
+# discovery for both: claim() probes each unclaimed port at both bauds
+# (~1.1 s per baud) and classifies by content; a port is claimed only on a
+# positive match for the caller's kind. Unclassified ports are closed and
+# retried on the caller's next backoff cycle. Readers release their claim
+# on disconnect; a port classified as the other device is remembered
+# (known) so its reader tries it first next pass.
+
+ELRS_BAUD = 460800
+BOARD_TAGS = (b"C5VRX-3", b"[SWEEP]", b"[AGC:", b"[CARRIER]", b"[PREVIEW]")
+
+
+def classify_evidence(buf: bytes):
+    """bytes -> "board" | "elrs" | None. ELRS = an LF-delimited line that
+    parses as a JSON object with a string "t" key; board = the binary
+    C5VRX magic, the boot banner, or a console tag."""
+    for line in buf.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(b"{"):
+            continue
+        try:
+            obj = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("t"), str):
+            return "elrs"
+    if MAGIC in buf:
+        return "board"
+    for tag in BOARD_TAGS:
+        if tag in buf:
+            return "board"
+    return None
+
+
+class PortArbiter:
+    """See the notes above. Probing happens outside the lock; claimed and
+    known are the only shared state."""
+
+    PROBE_PER_BAUD_S = 1.1
+
+    def __init__(self, board_baud: int) -> None:
+        self.board_baud = board_baud
+        self.lock = threading.Lock()
+        self.claimed = {}            # port -> "board" | "elrs"
+        self.known = {}              # port -> last classification
+        self.last_class = None       # (port, kind, monotonic) debug
+
+    def _order(self, kind: str, hint) -> list:
+        """Unclaimed ports: configured hint first, then ports previously
+        classified as this kind, then the rest."""
+        with self.lock:
+            free = [p for p in sorted(glob.glob("/dev/cu.usbmodem*"))
+                    if p not in self.claimed]
+            known_match = [p for p in free if self.known.get(p) == kind]
+        rest = [p for p in free if p != hint and p not in known_match]
+        return ([hint] if hint in free else []) + known_match + rest
+
+    @staticmethod
+    def _open_raw(port: str, baud: int):
+        # dtr/rts deasserted before open: probing must not reset either
+        # device with a control-line pulse.
+        ser = serial.Serial()
+        ser.port = port
+        ser.baudrate = baud
+        ser.timeout = 0.1
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
+        return ser
+
+    def _probe(self, port: str):
+        """(kind, open serial at the matching baud) or (None)."""
+        for baud in (ELRS_BAUD, self.board_baud):
+            try:
+                ser = self._open_raw(port, baud)
+            except (serial.SerialException, OSError):
+                continue
+            try:
+                deadline = time.monotonic() + self.PROBE_PER_BAUD_S
+                buf = b""
+                while time.monotonic() < deadline:
+                    chunk = ser.read(1024)
+                    if chunk:
+                        buf += chunk
+                        kind = classify_evidence(buf)
+                        if kind:
+                            return kind, ser
+            except (serial.SerialException, OSError):
+                pass
+            try:
+                ser.close()
+            except OSError:
+                pass
+        return None
+
+    def claim(self, kind: str, hint=None):
+        """First free port with positive evidence for `kind`, open at the
+        right baud and claimed; None when nothing classifies right now."""
+        for port in self._order(kind, hint):
+            found = self._probe(port)
+            if found is None:
+                continue
+            cls, ser = found
+            with self.lock:
+                self.known[port] = cls
+                self.last_class = (port, cls, time.monotonic())
+            print(f"[arbiter] classified {port} as {cls}")
+            if cls != kind:
+                try:
+                    ser.close()
+                except OSError:
+                    pass
+                continue
+            with self.lock:
+                if port in self.claimed:   # lost a claim race while probing
+                    try:
+                        ser.close()
+                    except OSError:
+                        pass
+                    continue
+                self.claimed[port] = kind
+            return ser
+        return None
+
+    def release(self, port) -> None:
+        with self.lock:
+            self.claimed.pop(port, None)
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        with self.lock:
+            last = None
+            if self.last_class:
+                p, k, t = self.last_class
+                last = {"port": p, "kind": k, "age_s": round(now - t, 1)}
+            return {"claimed": dict(self.claimed), "known": dict(self.known),
+                    "last": last}
+
+
+ARBITER = PortArbiter(115200)
 
 
 # ----- Detection episode logging (tools/detections.csv) -----
@@ -646,27 +796,20 @@ class SerialManager(threading.Thread):
         self._last_supervisor = 0.0
         self._last_age = time.monotonic()
 
-    def _resolve_port(self) -> str:
-        """Use the configured port if present; otherwise discover any
-        /dev/cu.usbmodem* node (the usbmodem suffix changes when the board
-        is replugged into a different physical USB port)."""
-        if os.path.exists(self.port):
-            return self.port
-        candidates = sorted(glob.glob("/dev/cu.usbmodem*"))
-        if candidates:
-            if candidates[0] != self.port:
-                print(f"[serial] {self.port} missing; discovered {candidates[0]}")
-            return candidates[0]
-        return self.port  # let the open fail and retry with backoff
-
     def _open(self) -> None:
-        port = self._resolve_port()
-        ser = serial.Serial(port, self.baud, timeout=0.2)
+        """Claim a port via the shared arbitrator. The configured port is
+        only a preference HINT: no port is opened without positive board
+        evidence (banner/console tag/binary magic), so an ELRS-only port
+        can never be grabbed by this reader."""
+        ser = ARBITER.claim("board", hint=self.port)
+        if ser is None:
+            raise serial.SerialException("no port with board evidence")
+        ser.timeout = 0.2
         ser.reset_input_buffer()
         self.ser = ser
         with STATE.lock:
             STATE.connected = True
-            STATE.serial_port = port
+            STATE.serial_port = ser.port
         with STATE.frame_cond:
             STATE.frame_cond.notify_all()
 
@@ -796,11 +939,12 @@ class SerialManager(threading.Thread):
                             STATE.parse_errors += 1
             except (serial.SerialException, OSError) as exc:
                 print(f"[serial] lost: {exc}; retrying in {backoff:.1f}s")
-                try:
-                    if self.ser is not None:
+                if self.ser is not None:
+                    ARBITER.release(self.ser.port)
+                    try:
                         self.ser.close()
-                except OSError:
-                    pass
+                    except OSError:
+                        pass
                 self.ser = None
                 decoder = StreamDecoder()  # resync framing on the new connection
                 with STATE.lock:
@@ -894,28 +1038,23 @@ class SerialManager(threading.Thread):
         # Clean shutdown: stop the reader thread. The firmware stream is
         # always-on and ignores 'p', so there is nothing to stop over serial.
         self.stop_event.set()
-        try:
-            if self.ser is not None:
+        if self.ser is not None:
+            ARBITER.release(self.ser.port)
+            try:
                 self.ser.close()
-        except OSError:
-            pass
+            except OSError:
+                pass
 
 
 # ----- ELRS sniffer (second serial port, elrs-sniffer/) -----
 #
 # A LilyGo T3-S3 running the elrs-sniffer firmware streams one JSON object
 # per line at 460800 8N1 on its own /dev/cu.usbmodem* node (contract:
-# elrs-sniffer/PROTOCOL.md, v0.2.x). ElrsManager auto-discovers it among
-# the usbmodem ports the main board reader has NOT claimed, identifying it
-# by content: a line that UTF-8 decodes, starts with '{' and parses as a
-# JSON object with a string "t" key. The OUI-SPY board only emits binary
-# C5VRX-magic packets and "[TAG]" console text, so it can never match.
-# The thread mirrors the main reader's reconnect/backoff shape but is
-# fully independent: own lock, own port, read-only (it never writes to
-# the dongle), and never touches STATE or the video/frame path.
+# elrs-sniffer/PROTOCOL.md, v0.2.x). Port discovery/claim is handled by
+# the shared PortArbiter above (JSON "t"-line evidence); this thread only
+# reads the claimed port, mirrors the main reader's reconnect/backoff
+# shape, and never writes to the dongle or touches STATE/frame paths.
 
-ELRS_BAUD = 460800
-ELRS_SNIFF_S = 2.5            # discovery window per candidate port
 ELRS_MAX_EVENTS = 8           # last_events ring exposed via /api/state
 ELRS_TLM_TYPES = ("gps", "batt", "atti", "fm", "tlm", "linkstats", "sync")
 
@@ -1004,64 +1143,13 @@ ELRS = ElrsState()
 
 
 class ElrsManager(threading.Thread):
-    """Discovers and reads the ELRS sniffer dongle (see notes above)."""
+    """Reads the ELRS sniffer dongle on the port the arbiter classified
+    as "elrs" (see the arbitration notes above)."""
 
-    def __init__(self, exclude: str) -> None:
+    def __init__(self) -> None:
         super().__init__(daemon=True)
-        self.exclude = exclude    # main board's configured port
         self.ser = None
         self.stop_event = threading.Event()
-
-    @staticmethod
-    def is_elrs_line(raw: bytes) -> bool:
-        """Discovery discriminator: True only for a protocol JSON line
-        (UTF-8, '{...}', object with a string "t" key)."""
-        try:
-            text = raw.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            return False
-        if not text.startswith("{"):
-            return False
-        try:
-            obj = json.loads(text)
-        except ValueError:
-            return False
-        return isinstance(obj, dict) and isinstance(obj.get("t"), str)
-
-    def _candidates(self) -> list:
-        with STATE.lock:
-            main_port = STATE.serial_port
-        return [p for p in sorted(glob.glob("/dev/cu.usbmodem*"))
-                if p != main_port and p != self.exclude]
-
-    def _discover(self):
-        """Sniff each unclaimed usbmodem port for a protocol line; return
-        the open serial port of the ELRS dongle, or None."""
-        for port in self._candidates():
-            try:
-                ser = serial.Serial(port, ELRS_BAUD, timeout=0.2)
-            except (serial.SerialException, OSError):
-                continue
-            try:
-                deadline = time.monotonic() + ELRS_SNIFF_S
-                buf = b""
-                while time.monotonic() < deadline:
-                    chunk = ser.read(1024)
-                    if not chunk:
-                        continue
-                    buf += chunk
-                    while b"\n" in buf:
-                        line, buf = buf.split(b"\n", 1)
-                        if self.is_elrs_line(line):
-                            print(f"[elrs] identified sniffer on {port}")
-                            return ser
-            except (serial.SerialException, OSError):
-                pass
-            try:
-                ser.close()
-            except OSError:
-                pass
-        return None
 
     def run(self) -> None:
         backoff = 0.5
@@ -1069,13 +1157,14 @@ class ElrsManager(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 if self.ser is None:
-                    ser = self._discover()
+                    ser = ARBITER.claim("elrs")
                     if ser is None:
                         self.stop_event.wait(min(backoff, 3.0))
                         backoff = min(backoff * 2.0, 5.0)
                         continue
                     backoff = 0.5
                     buf = b""
+                    ser.timeout = 0.2
                     self.ser = ser
                     with ELRS.lock:
                         ELRS.connected = True
@@ -1100,11 +1189,12 @@ class ElrsManager(threading.Thread):
                         ELRS.update(obj)
             except (serial.SerialException, OSError) as exc:
                 print(f"[elrs] lost: {exc}; rediscovering in {backoff:.1f}s")
-                try:
-                    if self.ser is not None:
+                if self.ser is not None:
+                    ARBITER.release(self.ser.port)
+                    try:
                         self.ser.close()
-                except OSError:
-                    pass
+                    except OSError:
+                        pass
                 self.ser = None
                 buf = b""
                 with ELRS.lock:
@@ -1114,11 +1204,12 @@ class ElrsManager(threading.Thread):
 
     def close(self) -> None:
         self.stop_event.set()
-        try:
-            if self.ser is not None:
+        if self.ser is not None:
+            ARBITER.release(self.ser.port)
+            try:
                 self.ser.close()
-        except OSError:
-            pass
+            except OSError:
+                pass
 
 
 def make_jpeg(image: Image.Image) -> bytes:
@@ -3023,6 +3114,7 @@ def create_app() -> Flask:
             }
         body["fps"] = round(STATE.fps(), 2)
         body["elrs"] = ELRS.snapshot()   # own lock; independent of STATE
+        body["arbiter"] = ARBITER.snapshot()   # port classification debug
         return jsonify(body)
 
     @app.post("/api/key/<k>")
@@ -3152,10 +3244,11 @@ def main() -> None:
     args = ap.parse_args()
 
     SERIAL = SerialManager(args.serial_port, args.baud)
+    ARBITER.board_baud = args.baud
     SERIAL.start()
-    # Second reader: auto-discovers the ELRS sniffer on the usbmodem ports
-    # the main board has not claimed. Fully independent of SERIAL.
-    elrs_mgr = ElrsManager(args.serial_port)
+    # Second reader: the shared arbiter classifies usbmodem ports by
+    # evidence, so both readers always land on their own device.
+    elrs_mgr = ElrsManager()
     elrs_mgr.start()
     app = create_app()
     try:
