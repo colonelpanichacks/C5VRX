@@ -34,8 +34,16 @@ grayscale video preview over USB to a phone-friendly Flask dashboard.
 
 ## Hardware
 
-- **Seeed Studio XIAO ESP32-C5** (ESP32-C5, RISC-V, 5 GHz Wi-Fi PHY used as
-  the RF front-end — the Wi-Fi radio is a 5.8 GHz receiver in disguise).
+**Get the OUI-SPY PCB at [colonelpanic.tech](https://colonelpanic.tech)** —
+it carries the XIAO ESP32-C5, routes the 5.8 GHz antenna, and breaks out the
+buzzer pad. Bill of materials:
+
+- **Seeed Studio XIAO ESP32-C5** — ESP32-C5, RISC-V, 5 GHz Wi-Fi PHY used as
+  the RF front-end (the Wi-Fi radio is a 5.8 GHz receiver in disguise).
+- **3V passive buzzer** — the foxhunt proximity beeper (driven by LEDC PWM).
+- The OUI-SPY PCB (antenna matching + carrier for the XIAO + buzzer).
+- Any 5.8 GHz FPV antenna (RP-SMA/SMA pigtail).
+
 - **OUI-SPY board add-ons:**
   | Function | GPIO | XIAO pad |
   |:---|:---:|:---:|
