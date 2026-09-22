@@ -43,6 +43,8 @@ buzzer pad. Bill of materials:
 - **3V passive buzzer** — the foxhunt proximity beeper (driven by LEDC PWM).
 - The OUI-SPY PCB (antenna matching + carrier for the XIAO + buzzer).
 - Any 5.8 GHz FPV antenna (RP-SMA/SMA pigtail).
+- **U.FL (IPEX-1) to SMA or RP-SMA female bulkhead pigtail** — joins the
+  XIAO's U.FL RF pad to the antenna bulkhead on the OUI-SPY PCB.
 
 - **OUI-SPY board add-ons:**
   | Function | GPIO | XIAO pad |
