@@ -19,9 +19,13 @@
 #define RADIO_INIT_TIMEOUT_MS 15000u
 #define RADIO_PROBE_TIMEOUT_MS 5000u
 #define RADIO_RETRY_MS 15000u
-#define DWELL_MS 1500u             // fixed dwell per rate (sync can be seconds apart)
-#define DWELL_WATCHDOG_MS 4000u    // wedged dwell -> radio restart + advance
-#define REDWELL_RSSI_DB -80        // dwells hotter than this get one repeat
+#define DWELL_MIN_MS 2000u        // initial dwell per rate (sync can be seconds apart)
+#define DWELL_CHUNK_MS 2000u      // adaptive dwell grows in these steps...
+#define DWELL_MAX_MS 20000u       // ...up to this cap
+#define EXTEND_RSSI_DB -85        // hot dwells (or any packets) extend
+#define AWAIT_PKT_MS 3000u        // packets-for-this-long-without-sync = patient
+#define AWAIT_LOG_MS 5000u        // awaiting_sync heartbeat interval
+#define DWELL_WATCHDOG_GRACE_MS 2000u // wedged dwell -> restart + advance
 #define RSSI_SAMPLE_MS 200u        // <=5 Hz live energy sampling
 #define RSSI_MAX_FAILS 3           // consecutive SPI errors -> stop for this dwell
 #define PREF_NAMESPACE "elrs-sniffer"
@@ -48,7 +52,11 @@ static float dwell_rssi_max = -128.0f;
 static float window_rssi_max = -128.0f;
 static float rssi_now = -128.0f;
 static uint32_t last_sample_ms;
-static bool redwell_scheduled;
+static uint32_t dwell_len_ms;      // current adaptive dwell length
+static uint32_t dwell_pkts;        // classified packets this dwell
+static uint32_t dwell_first_pkt_ms;
+static uint32_t last_await_log_ms;
+static uint8_t last_good_step;     // re-enter here after a lock drops
 static bool sampling_enabled;   // per-dwell; cleared after RSSI_MAX_FAILS errors
 static uint8_t sample_fails;
 static bool g_rx_busy;          // read_packet SPI in progress — don't sample
@@ -66,6 +74,9 @@ static void dwell_begin(uint8_t i)
     g_radio.start_rx();
     step_entered_ms = millis();
     dwell_rssi_max = -128.0f;
+    dwell_len_ms = DWELL_MIN_MS;
+    dwell_pkts = 0;
+    dwell_first_pkt_ms = 0;
     sampling_enabled = true;
     sample_fails = 0;
     snprintf(uist.rate, sizeof(uist.rate), "%s", s.rate->name);
@@ -73,8 +84,7 @@ static void dwell_begin(uint8_t i)
     uist.freq_hz = ELRS_2G4_SYNC_FREQ_HZ;
 }
 
-// End the current dwell: print its energy fingerprint, then either re-dwell
-// the same rate once (it showed energy — catch the sync window) or advance.
+// End the current dwell: print its energy fingerprint and advance.
 static void dwell_advance()
 {
     const sniffer_step_t &s = sweep.steps[step_idx];
@@ -82,13 +92,7 @@ static void dwell_advance()
                   "\"rssi_max\":%d}\n",
                   step_idx, s.rate->name, s.iq_inverted ? 'i' : 'n',
                   s.legacy_2x ? 1 : 0, (int)dwell_rssi_max);
-    if (dwell_rssi_max > REDWELL_RSSI_DB && !redwell_scheduled) {
-        redwell_scheduled = true;   // hot dwell: listen once more, same rate
-        dwell_begin(step_idx);
-    } else {
-        redwell_scheduled = false;
-        dwell_begin(step_idx + 1);
-    }
+    dwell_begin(step_idx + 1);
 }
 
 // jump the sweep straight to a rate index heard in a sync packet
@@ -115,6 +119,7 @@ static void on_sync(const elrs_packet_t &pkt)
                   pkt.sync.rate_index, pkt.sync.switch_mode, pkt.sync.tlm_ratio,
                   pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5);
     if (!good) return;
+    last_good_step = step_idx; // sweep re-enters here first after a drop
     if (!locked) {
         locked = true;
         lock_total_pkts = 0;
@@ -605,6 +610,8 @@ void loop()
             if (ok) { // classified only: junk must not extend dwells/locks
                 last_pkt_ms = millis();
                 window_pkts++;
+                dwell_pkts++;
+                if (!dwell_first_pkt_ms) dwell_first_pkt_ms = millis();
                 if (locked) lock_total_pkts++;
                 switch (pkt.type) {
                 case ELRS_PKT_SYNC: on_sync(pkt); break;
@@ -615,23 +622,43 @@ void loop()
             }
         }
 
-        if (!locked && millis() - step_entered_ms > DWELL_MS) {
-            dwell_advance();
+        const sniffer_step_t &cur = sweep.steps[step_idx];
+        if (!locked) {
+            // adaptive dwell: hot (or packet-bearing) dwells extend in
+            // 2 s chunks up to the cap — a sync can be up to ~16 s away.
+            if (millis() - step_entered_ms > dwell_len_ms) {
+                bool active = dwell_rssi_max > EXTEND_RSSI_DB || dwell_pkts > 0;
+                if (active && dwell_len_ms < DWELL_MAX_MS) {
+                    dwell_len_ms += DWELL_CHUNK_MS;
+                    Serial.printf("{\"t\":\"dwell_ext\",\"rate\":\"%s\",\"iq\":\"%c\",\"rssi_max\":%d,\"dwell_ms\":%u}\n",
+                                  cur.rate->name, cur.iq_inverted ? 'i' : 'n',
+                                  (int)dwell_rssi_max, dwell_len_ms);
+                } else {
+                    dwell_advance();
+                }
+            }
+            // patience heartbeat: packets flowing for >3 s, no sync yet
+            if (dwell_pkts > 0 && dwell_first_pkt_ms &&
+                millis() - dwell_first_pkt_ms > AWAIT_PKT_MS &&
+                millis() - last_pkt_ms < 1500 &&
+                millis() - last_await_log_ms >= AWAIT_LOG_MS) {
+                last_await_log_ms = millis();
+                Serial.printf("{\"t\":\"event\",\"what\":\"awaiting_sync\",\"rate\":\"%s\",\"iq\":\"%c\"}\n",
+                              cur.rate->name, cur.iq_inverted ? 'i' : 'n');
+            }
         }
-        // dwell watchdog: a dwell that never completes wedges the sweep —
-        // force a radio restart on this step and move on, visibly.
-        if (!locked && radio_ok && millis() - step_entered_ms > DWELL_WATCHDOG_MS) {
-            const sniffer_step_t &s = sweep.steps[step_idx];
+        // dwell watchdog: past cap+grace with no progress -> restart + move on
+        if (!locked && radio_ok && millis() - step_entered_ms > dwell_len_ms + DWELL_WATCHDOG_GRACE_MS) {
             Serial.printf("{\"t\":\"error\",\"what\":\"dwell_timeout\",\"rate\":\"%s\",\"iq\":\"%c\",\"ms\":%lu}\n",
-                          s.rate->name, s.iq_inverted ? 'i' : 'n',
+                          cur.rate->name, cur.iq_inverted ? 'i' : 'n',
                           (unsigned long)(millis() - step_entered_ms));
-            g_radio.recover(s, ELRS_2G4_SYNC_FREQ_HZ);
+            g_radio.recover(cur, ELRS_2G4_SYNC_FREQ_HZ);
             dwell_advance();
         }
         if (locked && millis() - last_pkt_ms > 5000) {
             locked = false;
             Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
-            dwell_advance();
+            dwell_begin(last_good_step); // re-enter sweep at the last good rate+IQ
         }
     }
 

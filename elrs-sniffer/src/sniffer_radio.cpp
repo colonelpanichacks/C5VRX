@@ -19,17 +19,20 @@ public:
 void sniffer_sweep_build(sniffer_sweep_t *sw)
 {
     sw->count = 0;
-    // IQ-normal first, then inverted: bound links split ~50/50 by UID[5]&1,
-    // bind-mode links are always inverted (rx_main.cpp SetRFLinkRate).
-    for (uint8_t iq = 0; iq < 2; iq++) {
-        for (uint8_t i = 0; i < ELRS_RATES_3X_COUNT; i++) {
-            sw->steps[sw->count++] = { &ELRS_RATES_3X[i], iq != 0, false };
-        }
+    // Likelihood-ordered first pass — most-deployed rates first, each with
+    // normal IQ then inverted (invertIQ = UID[5]&1 splits real links ~50/50).
+    // FLRC/DVDA rates are absent: their 32-bit sync word is UID-derived
+    // (elrs_defs.h); hunting them stays a post-capture TODO.
+    static const uint8_t order3x[ELRS_RATES_3X_COUNT] = { 2, 0, 3, 5, 1, 4 };
+    //                         table idx ->   250, 500, 150, 50, 333-8, 100-8
+    for (uint8_t k = 0; k < ELRS_RATES_3X_COUNT; k++) {
+        uint8_t i = order3x[k];
+        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], false, false };
+        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], true, false };
     }
-    for (uint8_t iq = 0; iq < 2; iq++) {
-        for (uint8_t i = 0; i < ELRS_RATES_2X_COUNT; i++) {
-            sw->steps[sw->count++] = { &ELRS_RATES_2X[i], iq != 0, true };
-        }
+    for (uint8_t i = 0; i < ELRS_RATES_2X_COUNT; i++) {
+        sw->steps[sw->count++] = { &ELRS_RATES_2X[i], false, true };
+        sw->steps[sw->count++] = { &ELRS_RATES_2X[i], true, true };
     }
 }
 

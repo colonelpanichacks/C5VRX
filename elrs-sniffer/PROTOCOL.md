@@ -42,14 +42,18 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 ## Events
 
 `dwell` — emitted when a sweep dwell ENDS, carrying that dwell's energy
-fingerprint (fixed 1.5 s dwells; a dwell whose `rssi_max` exceeds −80 dBm
-is immediately repeated once before advancing, to catch the sync window):
+fingerprint. Dwells start at 2 s and extend in 2 s chunks (cap 20 s) while
+the dwell shows energy (`rssi_max` > −85 dBm) or classified packets — sync
+packets can be up to ~16 s apart, so hot dwells are patient:
 ```json
-{"t":"dwell","step":7,"rate":"LoRa 250Hz","iq":"i","legacy":0,"rssi_max":-71}
+{"t":"dwell","step":0,"rate":"LoRa 250Hz","iq":"n","legacy":0,"rssi_max":-71}
+{"t":"dwell_ext","rate":"LoRa 250Hz","iq":"n","rssi_max":-69,"dwell_ms":4000}
+{"t":"event","what":"awaiting_sync","rate":"LoRa 250Hz","iq":"n"}
 ```
-`rssi_max` −128 means "no sample" (radio fault); with a working front end
-the noise floor reads ≈ −120…−110, and a nearby TX produces bursts well
-above −80 on its rate — so this line is the per-rate RF-health signature.
+`awaiting_sync` repeats every 5 s while packets flow without a sync yet.
+After a lock drops, the sweep re-enters at the last good rate+IQ before
+continuing. `rssi_max` −128 means "no sample" (radio fault); with a working
+front end the noise floor reads ≈ −120…−110.
 
 `sync` — a sync packet decoded (`ok=1` means the ELRS software CRC validated):
 ```json
