@@ -17,11 +17,18 @@ flashes leave stale Arduino/PHY state that looks like firmware bugs.
 | `bootloader.bin` | **0x0** | ESP32-S3 bootloader offset is 0x0 (verified in `~/.platformio/platforms/espressif32/builder/frameworks/espidf.py`: `"0x1000" if mcu in [esp32,esp32s2] else ("0x2000" if c5/p4 else "0x0")` → esp32s3 → 0x0) |
 | `partitions.bin` | **0x8000** | standard partition-table offset (platform default `upload.partition_table_offset`) |
 | `boot_app0.bin`  | **0xe000** | Arduino OTA-rollback marker; part of the canonical merged image (platform `esp32_create_combined_bin` layout) |
-| `firmware.bin`   | **0x10000** | app offset from parsing `default_8MB.csv` (`ESP32_APP_OFFSET`; also the platform's merged-image layout) |
+| `firmware.bin`   | **0x10000** | app offset from parsing the partition table (`ESP32_APP_OFFSET`; also the platform's merged-image layout) |
 
-Flash params: `--flash-mode qio --flash-freq 80m --flash-size 8MB` — taken
-from the `esp32-s3-devkitc-1` board manifest (`build.flash_mode=qio`,
-`f_flash=80MHz`, `upload.flash_size=8MB`).
+Flash params: `--flash-mode qio --flash-freq 80m --flash-size 4MB` — the
+confirmed board has **4 MB embedded flash (XMC)** (esptool: "Embedded Flash
+4MB"); mode/freq come from the `esp32-s3-devkitc-1` manifest. The PlatformIO
+env pins this too: `board_build.flash_size = 4MB` and
+`board_build.partitions = default.csv` (the 4 MB table; consumed by the
+framework's `tools/platformio-build.py`, app0 @ 0x10000 size 0x140000).
+**Do not** flash an 8 MB table/binary config onto this chip: the earlier
+8 MB build wrote a partition table describing space that doesn't exist and
+an image header claiming 8 MB — a plausible contributor to the silent-boot
+failure this script's full erase now clears.
 
 > Why not `pio run -t upload`: PlatformIO's Arduino-framework upload writes
 > **only** `firmware.bin @ 0x10000` (`UPLOADCMD='$UPLOADER $UPLOADERFLAGS
@@ -50,7 +57,27 @@ The T3-S3's USB-C is the **native USB** of the ESP32-S3 (VID:PID
 
 ## PA-variant note
 
-If the board is the SX1280 **PA** variant, build with `-D T3S3_SX1280_PA`
-(add it to `build_flags` in `platformio.ini` or in `common.build_flags`
-before running flash.sh) so the antenna-switch enables (RX=21/TX=10) are
-driven. See `src/board_pins.h`.
+The confirmed board ("ranging" store listing) is the **PA** variant, so the
+`t3s3` env defaults to `-D T3S3_SX1280_PA` (drives the antenna switch
+RX=21/TX=10). For a non-PA board, remove that define from
+`[common] build_flags` in `platformio.ini` and rebuild — the banner and the
+`boot` JSON event state which variant the firmware was *built* for, so a
+wrong guess is visible on both serial and OLED instead of silently deaf.
+
+## Boot observability (v0.2.2+): what you should see, where
+
+The firmware prints a banner within ~1.5 s of reset, **before** any radio
+or display init, and the 1 Hz `stats` JSON never stops (even with a dead
+radio: `radio:0, pps:0, lock:0`). Failure signatures after a good flash:
+
+| situation | USB serial | OLED |
+|---|---|---|
+| healthy | banner + `boot`/`ready` + 1 Hz stats | splash, then sweep UI |
+| radio fault (no SX1280 ACK) | banner + `error{what:"radio_init",detail,pins}` + stats with `radio:0`, retried every 15 s (`radio_up` on recovery) | splash, then inverted **RADIO FAULT** banner with the detail line |
+| OLED dead | banner + `error{what:"oled_init",detail}` + stats | (dark) |
+| both dead | banner + both errors + 1 Hz stats | (dark) |
+| truly silent (no banner) | — | — |
+
+A truly silent board after this flash = still a boot-stage problem (bad
+image, flash-mode mismatch, or hardware), not an app init stall: re-check
+`verify_flash` output and try download mode (BOOT+RST).

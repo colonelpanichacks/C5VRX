@@ -29,12 +29,16 @@ pins), fetched 2026-09-22. Encoded in `src/board_pins.h`.
 
 ## Non-PA vs PA
 
-The common "T3-S3 2.4G **without PA**" has no antenna switch — the
-RXEN/TXEN pins don't exist; `board_pins.h` sets them to -1 and nothing is
-driven. The **PA** variant needs its switch enabled or it is deaf:
-add `-D T3S3_SX1280_PA` to `build_flags` (there is a marked spot in
-`platformio.ini`); the firmware then calls RadioLib `setRfSwitchPins(21, 10)`
-— the exact call from LilyGo's own SX1280PA example.
+The confirmed board ("ranging" listing) is the **PA** variant, so the
+firmware now **defaults to `-D T3S3_SX1280_PA`** (in `platformio.ini`
+`[common] build_flags`): the antenna-switch enables (RX=21/TX=10) are
+driven via RadioLib `setRfSwitchPins()` — the exact call from LilyGo's own
+SX1280PA example. For a non-PA board, remove that define and rebuild; the
+boot banner and the `boot` JSON event state which variant the binary
+contains, so a wrong guess is visible on serial + OLED instead of a
+silently deaf front end. Note the chip has **4 MB embedded flash** —
+`board_build.flash_size = 4MB` / `default.csv` are set in the env, and
+`flash.sh` flashes with `--flash-size 4MB` (see flash.md).
 
 If the OLED shows column junk instead of text, the panel is an SH1106:
 swap the constructor in `src/ui.cpp` (`U8G2_SSD1306_...` →

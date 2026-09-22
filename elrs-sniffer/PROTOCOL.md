@@ -1,10 +1,10 @@
 # PROTOCOL.md — ELRS sniffer serial JSON contract
 
-Version: `0.2.x` (banner reports `ELRS_SNIFFER_VERSION`). One JSON object
+Version: `0.2.2` (banner reports `ELRS_SNIFFER_VERSION`). One JSON object
 per line, LF-terminated, on the native USB serial port at **460800 8N1**.
 All fields are additive-only within the 0.2 series — dashboard code must
 ignore unknown keys and must skip any line that does not begin with `{`
-(two human-readable banner lines are printed at boot).
+(human-readable banner lines are printed at boot and on faults).
 
 Device time base: `ms` is device `millis()` (uint32, wraps ~49.7 days) —
 use host reception time for graphs, `ms` only for intra-device ordering.
@@ -13,10 +13,10 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 
 | line | when |
 |---|---|
-| `stats` | exactly once per second |
+| `stats` | exactly once per second — **always**, even with no radio (`radio:0`); a missing `stats` line for >2 s means the device is dead |
 | `dwell` | on every sweep-step change while unlocked (≈ every 0.7–4 s) |
 | `sync`, `lock`, `unlock`, `linkstats`, `gps`, `batt`, `atti`, `fm`, `tlm` | as decoded, asynchronous |
-| `ready`, `error` | boot / fatal |
+| `boot`, `ready`, `error`, `radio_up` | boot / fault lifecycle |
 
 ## `stats` — 1 Hz summary (the primary dashboard feed)
 
@@ -35,6 +35,7 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 | `lock` | 0/1 | — | a CRC-validated ELRS sync has been captured and not timed out |
 | `ch` | [4] uint | µs | sticks `[roll, pitch, throttle, yaw]`, 988–2012; `0` = not yet decoded |
 | `arm` | 0/1 | — | AUX1 high (arm channel) |
+| `radio` | 0/1 | — | 0 = radio faulted (no SX1280); device alive but deaf. `rssi` is then the last/initial -128 sentinel |
 | `uid` | string, optional | — | `UID[3..5]` as lowercase hex — **link fingerprint, not identity**; absent until a sync is captured |
 
 ## Events
@@ -76,9 +77,21 @@ Telemetry frames (reassembled CRSF):
 
 Boot/lifecycle:
 ```json
-{"t":"ready","steps":20,"sync_freq":2441}
-{"t":"error","what":"sx1280_init"}
+{"t":"boot","v":"0.2.2","board":"LilyGo T3-S3 SX1280-PA","flash_mb":4,"variant":"sx1280pa"}
+{"t":"ready","steps":20,"sync_freq":2441,"radio":1,"oled":1}
+{"t":"radio_up"}
+{"t":"error","what":"radio_init","detail":"timeout 15s (no SX1280 ACK)","pins":"NSS=7 SCK=5 MISO=3 MOSI=6 RST=8 DIO1=9 BUSY=36"}
+{"t":"error","what":"oled_init","detail":"no ACK at 0x3c SDA=18 SCL=17"}
 ```
+
+- `boot` fires before any init, always — its absence means the board never
+  ran (bad flash/hardware), not an app problem.
+- `ready` reports init outcomes: `radio`/`oled` 0 = that subsystem faulted;
+  stats still flow.
+- `error.what` values: `radio_init`, `oled_init`, `sx1280_init` (legacy
+  string may still appear on very old builds).
+- `radio_up` fires when a previously faulted radio recovers (retried every
+  ~15 s); there is no `radio_down` — use `stats.radio:0` as the fault flag.
 
 ## Notes for the dashboard integration
 

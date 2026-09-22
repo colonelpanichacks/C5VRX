@@ -20,15 +20,38 @@ static U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
 static uint8_t tlm_rot;
 
-void ui_init()
+// Bounded OLED presence check: set up I2C with a transaction timeout, then
+// look for an ACK at the SSD1306 address. Wire transactions are the only
+// part that can block; u8g2's init itself is write-only.
+bool ui_probe()
 {
     Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
+    Wire.setTimeOut(100); // bound any single transaction to 100 ms
+    Wire.beginTransmission(OLED_I2C_ADDR);
+    return Wire.endTransmission() == 0;
+}
+
+void ui_start()
+{
     oled.begin();
     oled.setFont(u8g2_font_5x7_tr);
     oled.clearBuffer();
     oled.drawStr(6, 20, "ELRS SNIFFER");
     oled.drawStr(6, 32, "passive 2.4GHz");
     oled.drawStr(6, 44, "sweeping ...");
+    oled.sendBuffer();
+}
+
+void ui_show_fault(const char *what, const char *detail)
+{
+    oled.clearBuffer();
+    oled.setDrawColor(2); // inverted
+    oled.drawBox(0, 0, 128, 11);
+    oled.setDrawColor(1);
+    oled.drawStr(4, 9, what);
+    oled.drawStr(0, 22, detail != NULL ? detail : "");
+    oled.drawStr(0, 40, "serial JSON active");
+    oled.drawStr(0, 50, "stats continue 1/s");
     oled.sendBuffer();
 }
 
@@ -85,15 +108,24 @@ void ui_render(const ui_state_t *st)
         oled.drawBox(x + 1, y + h - 1 - fill, wdt - 2, fill);
     }
 
-    // rotating telemetry line
-    if (st->tlm[tlm_rot][0] == 0) tlm_rot = 0;
-    oled.drawStr(0, 62, st->tlm[tlm_rot]);
-    tlm_rot = (tlm_rot + 1) % UI_TLM_LINES;
+    // rotating telemetry line (fault banner wins when set)
+    if (st->fault[0]) {
+        oled.setDrawColor(2);
+        oled.drawBox(0, 54, 128, 10);
+        oled.setDrawColor(1);
+        oled.drawStr(2, 62, st->fault);
+    } else {
+        if (st->tlm[tlm_rot][0] == 0) tlm_rot = 0;
+        oled.drawStr(0, 62, st->tlm[tlm_rot]);
+        tlm_rot = (tlm_rot + 1) % UI_TLM_LINES;
+    }
 
     oled.sendBuffer();
 }
 #else // SNIFFER_HAS_OLED
-void ui_init() {}
+bool ui_probe() { return false; }
+void ui_start() {}
+void ui_show_fault(const char *, const char *) {}
 void ui_render(const ui_state_t *) {}
 #endif
 #endif // ARDUINO

@@ -2,9 +2,11 @@
 // main.cpp — ELRS sniffer: sweep SX1280 rates on the ELRS sync channel,
 // classify packets, decode sticks + telemetry, drive display + USB JSON.
 //
-// JSON over USB serial (460800 baud) — one "stats" line per second plus
-// per-event lines ("dwell","sync","tlm","lock","unlock"), designed to be
-// fusable into the OUI-SPY Flask dashboard later.
+// Boot-observability contract (v0.2.2): the very first thing setup() does is
+// bring up USB CDC and print a banner — before radio, before display. Every
+// init after that is bounded; any failure becomes a JSON error event + a
+// fault screen, and the main loop (1 Hz stats JSON) keeps running no matter
+// what, so "alive, no packets" and "dead" are always distinguishable.
 // =============================================================================
 #include <Arduino.h>
 #include "board_pins.h"
@@ -13,10 +15,14 @@
 #include "sniffer_radio.h"
 #include "ui.h"
 
+#define RADIO_INIT_TIMEOUT_MS 15000u
+#define RADIO_RETRY_MS 15000u
+
 static elrs_decode_ctx_t dctx;
 static sniffer_sweep_t sweep;
 static uint8_t step_idx;
 static bool radio_ok;
+static bool oled_ok;
 static bool locked;
 
 static uint32_t step_entered_ms;
@@ -160,18 +166,26 @@ static void stats_tick()
     uist.rssi_dbm = last_rssi;
     uist.snr_db = last_snr;
     uist.locked = locked;
+    uist.radio_ok = radio_ok;
+    if (!radio_ok) {
+        snprintf(uist.fault, sizeof(uist.fault), "RADIO FAULT");
+    } else if (!oled_ok) {
+        uist.fault[0] = 0; // radio fine, no display: nothing to draw on anyway
+    } else {
+        uist.fault[0] = 0;
+    }
     last_rssi = -128.0f; // reset peak-hold for the next window
 #if defined(PIN_BOARD_LED)
     digitalWrite(PIN_BOARD_LED, locked ? HIGH : LOW);
 #endif
 
     Serial.printf("{\"t\":\"stats\",\"ms\":%lu,\"rate\":\"%s\",\"iq\":\"%c\",\"rssi\":%d,"
-                  "\"snr10\":%d,\"pps\":%lu,\"lq_permille\":%lu,\"lock\":%u,"
+                  "\"snr10\":%d,\"pps\":%lu,\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
                   "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u",
                   (unsigned long)now, uist.rate, uist.iq_inverted ? 'i' : 'n',
                   (int)last_rssi, (int)(last_snr * 10), (unsigned long)uist.pps,
                   (unsigned long)uist.lq_permille,
-                  locked ? 1 : 0,
+                  locked ? 1 : 0, radio_ok ? 1 : 0,
                   (unsigned long)uist.ch_us[0], (unsigned long)uist.ch_us[1],
                   (unsigned long)uist.ch_us[2], (unsigned long)uist.ch_us[3],
                   uist.armed ? 1 : 0);
@@ -180,25 +194,85 @@ static void stats_tick()
     }
     Serial.println("}");
 
-    ui_render(&uist);
+    if (oled_ok) ui_render(&uist);
+}
+
+// ---- bounded radio init --------------------------------------------------
+// RadioLib 6.6 already bounds each SPI transaction (1 s timeout), but run the
+// whole init pinned to core 0 behind a wall-clock bound anyway: if anything
+// pathological stalls, the main loop on core 1 keeps emitting stats. A
+// stalled task may remain on core 0 — harmless (nothing else lives there).
+static volatile bool g_radio_task_done;
+static volatile int g_radio_task_result;
+
+static void radio_init_task(void *)
+{
+    g_radio_task_result = g_radio.begin();
+    g_radio_task_done = true;
+    vTaskDelete(NULL);
+}
+
+static bool radio_init_bounded(char *err, size_t errlen)
+{
+    g_radio_task_done = false;
+    if (xTaskCreatePinnedToCore(radio_init_task, "radio_init", 4096, NULL, 1,
+                                NULL, 0) != pdPASS) {
+        g_radio_task_result = g_radio.begin(); // fallback: RadioLib's own bounds
+        g_radio_task_done = true;
+    }
+    uint32_t t0 = millis();
+    while (!g_radio_task_done && millis() - t0 < RADIO_INIT_TIMEOUT_MS) delay(10);
+    if (!g_radio_task_done) {
+        snprintf(err, errlen, "timeout %us (no SX1280 ACK)", RADIO_INIT_TIMEOUT_MS / 1000);
+        return false; // init task still spinning on core 0; left to die there
+    }
+    if (g_radio_task_result != 0) {
+        snprintf(err, errlen, "RadioLib begin err %d", (int)g_radio_task_result);
+        return false;
+    }
+    return true;
+}
+
+// ---- boot observability: first serial output, before ANY init ------------
+static void early_banner()
+{
+    Serial.begin(460800);
+    uint32_t t0 = millis();
+    while (!Serial && millis() - t0 < 1500) delay(10); // brief wait, never block
+    Serial.println();
+    Serial.printf("elrs-sniffer %s boot | %s\n", ELRS_SNIFFER_VERSION, SNIFFER_BOARD_NAME);
+#if PIN_LORA_RXEN != -1
+    Serial.println("variant: SX1280-PA (RF switch driven: RXEN=21 TXEN=10)");
+#else
+    Serial.println("variant: SX1280 non-PA (no RF switch)");
+#endif
+    Serial.printf("radio pins: NSS=%d SCK=%d MISO=%d MOSI=%d RST=%d DIO1=%d BUSY=%d\n",
+                  PIN_LORA_NSS, PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI,
+                  PIN_LORA_RST, PIN_LORA_DIO1, PIN_LORA_BUSY);
+    Serial.printf("chip: flash %u MB @ %u MHz\n",
+                  (unsigned)(ESP.getFlashChipSize() >> 20),
+                  (unsigned)(ESP.getFlashChipSpeed() / 1000000));
+    Serial.println("passive Rx only - link uid = fingerprint, not identity");
+    Serial.printf("{\"t\":\"boot\",\"v\":\"%s\",\"board\":\"%s\",\"flash_mb\":%u,"
+                  "\"variant\":\"%s\"}\n", ELRS_SNIFFER_VERSION, SNIFFER_BOARD_NAME,
+                  (unsigned)(ESP.getFlashChipSize() >> 20),
+#if PIN_LORA_RXEN != -1
+                  "sx1280pa");
+#else
+                  "sx1280");
+#endif
+    Serial.flush();
 }
 
 void setup()
 {
-    Serial.begin(460800);
-    unsigned long t0 = millis();
-    while (!Serial && millis() - t0 < 2000) delay(10);
-
-    Serial.println();
-    Serial.printf("ELRS-SNIFFER %s on %s\n", ELRS_SNIFFER_VERSION, SNIFFER_BOARD_NAME);
-    Serial.println("passive Rx only — no transmission. link uid = fingerprint, not identity");
+    early_banner(); // MUST NOT be preceded by anything that can stall
 
     memset(&uist, 0, sizeof(uist));
     uist.ident[0] = 0;
     snprintf(uist.rate, sizeof(uist.rate), "boot");
     for (int i = 0; i < UI_TLM_LINES; i++) uist.tlm[i][0] = 0;
 
-    ui_init();
 #if defined(PIN_BOARD_LED)
     pinMode(PIN_BOARD_LED, OUTPUT);
     digitalWrite(PIN_BOARD_LED, LOW); // LED_ON = HIGH: lit only when locked
@@ -206,51 +280,79 @@ void setup()
     elrs_decode_init(&dctx);
     sniffer_sweep_build(&sweep);
 
-    radio_ok = g_radio.begin();
-    if (!radio_ok) {
-        Serial.println("{\"t\":\"error\",\"what\":\"sx1280_init\"}");
-        snprintf(uist.ident, sizeof(uist.ident), "NO SX1280 - check pins");
-        return;
+    // OLED: bounded probe, splash only on success
+    oled_ok = ui_probe();
+    if (oled_ok) {
+        ui_start();
+    } else {
+        Serial.printf("{\"t\":\"error\",\"what\":\"oled_init\",\"detail\":\"no ACK at 0x%02x SDA=%d SCL=%d\"}\n",
+                      OLED_I2C_ADDR, PIN_OLED_SDA, PIN_OLED_SCL);
     }
-    Serial.printf("{\"t\":\"ready\",\"steps\":%u,\"sync_freq\":%lu}\n",
-                  sweep.count, (unsigned long)(ELRS_2G4_SYNC_FREQ_HZ / 1000000));
-    apply_step(0);
+
+    // Radio: bounded init, fault is recoverable and reported both ways
+    static char radio_err[72];
+    radio_ok = radio_init_bounded(radio_err, sizeof(radio_err));
+    if (!radio_ok) {
+        Serial.printf("{\"t\":\"error\",\"what\":\"radio_init\",\"detail\":\"%s\",\"pins\":\"NSS=%d SCK=%d MISO=%d MOSI=%d RST=%d DIO1=%d BUSY=%d\"}\n",
+                      radio_err, PIN_LORA_NSS, PIN_LORA_SCK, PIN_LORA_MISO,
+                      PIN_LORA_MOSI, PIN_LORA_RST, PIN_LORA_DIO1, PIN_LORA_BUSY);
+        if (oled_ok) ui_show_fault("RADIO FAULT", radio_err);
+        snprintf(uist.rate, sizeof(uist.rate), "rf fault");
+    }
+
+    Serial.printf("{\"t\":\"ready\",\"steps\":%u,\"sync_freq\":%lu,\"radio\":%u,\"oled\":%u}\n",
+                  sweep.count, (unsigned long)(ELRS_2G4_SYNC_FREQ_HZ / 1000000),
+                  radio_ok ? 1 : 0, oled_ok ? 1 : 0);
+    if (radio_ok) apply_step(0);
     last_stats_ms = millis();
 }
 
 void loop()
 {
-    if (!radio_ok) { delay(500); return; }
+    // retry a faulted radio — the fault may be transient
+    static uint32_t last_radio_retry = 0;
+    if (!radio_ok && millis() - last_radio_retry > RADIO_RETRY_MS) {
+        last_radio_retry = millis();
+        static char err[72];
+        if (radio_init_bounded(err, sizeof(err))) {
+            radio_ok = true;
+            Serial.println("{\"t\":\"radio_up\"}");
+            apply_step(0);
+        } // stay quiet otherwise: the 1 Hz stats line already says radio:0
+    }
 
-    uint8_t buf[ELRS_OTA8_LEN];
-    float rssi, snr;
-    size_t want = sweep.steps[step_idx].rate->payload;
+    if (radio_ok) {
+        uint8_t buf[ELRS_OTA8_LEN];
+        float rssi, snr;
+        size_t want = sweep.steps[step_idx].rate->payload;
 
-    if (g_radio.read_packet(buf, want, rssi, snr)) {
-        elrs_packet_t pkt;
-        bool ok = elrs_decode_packet(&dctx, buf, want, &pkt);
-        if (rssi > last_rssi) last_rssi = rssi; // peak-hold for the stats window
-        last_snr = snr;
-        if (!ok) return; // demod junk (no air CRC on ELRS LoRa)
-        last_pkt_ms = millis(); // classified packets only: junk must not
-        window_pkts++;          // extend dwells or keep a lock alive
-        if (locked) lock_total_pkts++;
-        switch (pkt.type) {
-        case ELRS_PKT_SYNC: on_sync(pkt); break;
-        case ELRS_PKT_TLM:  on_tlm(pkt); break;
-        case ELRS_PKT_RCDATA: on_rc(pkt); break;
-        default: break; // MSP: counted in pps only
+        if (g_radio.read_packet(buf, want, rssi, snr)) {
+            elrs_packet_t pkt;
+            bool ok = elrs_decode_packet(&dctx, buf, want, &pkt);
+            if (rssi > last_rssi) last_rssi = rssi; // peak-hold for the stats window
+            last_snr = snr;
+            if (ok) { // classified only: junk must not extend dwells/locks
+                last_pkt_ms = millis();
+                window_pkts++;
+                if (locked) lock_total_pkts++;
+                switch (pkt.type) {
+                case ELRS_PKT_SYNC: on_sync(pkt); break;
+                case ELRS_PKT_TLM:  on_tlm(pkt); break;
+                case ELRS_PKT_RCDATA: on_rc(pkt); break;
+                default: break; // MSP: counted in pps only
+                }
+            }
+        }
+
+        if (!locked && millis() - step_entered_ms > current_dwell_ms()) {
+            apply_step(step_idx + 1);
+        }
+        if (locked && millis() - last_pkt_ms > 5000) {
+            locked = false;
+            Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
+            apply_step(step_idx + 1);
         }
     }
 
-    if (!locked && millis() - step_entered_ms > current_dwell_ms()) {
-        apply_step(step_idx + 1);
-    }
-    if (locked && millis() - last_pkt_ms > 5000) {
-        locked = false;
-        Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
-        apply_step(step_idx + 1);
-    }
-
-    stats_tick();
+    stats_tick(); // always runs — alive-with-no-radio still emits 1 Hz JSON
 }
