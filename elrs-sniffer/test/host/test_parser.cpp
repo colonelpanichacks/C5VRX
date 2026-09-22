@@ -8,6 +8,7 @@
 #include "elrs_defs.h"
 #include "elrs_crc.h"
 #include "elrs_parse.h"
+#include "elrs_fhss.h"
 
 // ---- independent CRC formulation: verbatim port of the ELRS 3.6.4 table
 // implementation (src/lib/CRC/crc.cpp Crc2Byte), kept structurally different
@@ -379,6 +380,42 @@ int main()
         assert(sw[0] == 0x2f && sw[1] == 0xb1 && sw[2] == 0xd3 && sw[3] == 0x3a);
     }
     printf("ok: FLRC setup bytes vs ELRS register writes\n");
+
+    // 13) FHSS sequence vs golden vector (python-ported ELRS algorithm,
+    //     seed 0x01020304 — the same seed the ELRS test_fhss uses) plus the
+    //     ELRS unit-test invariants: per-80-block uniqueness, sync channel
+    //     (41) at every block start, determinism.
+    {
+        static const uint8_t golden[40] = {
+            0x29, 0x07, 0x06, 0x41, 0x11, 0x02, 0x13, 0x3b, 0x49, 0x2b,
+            0x0c, 0x1f, 0x18, 0x17, 0x12, 0x19, 0x1c, 0x4e, 0x0f, 0x14,
+            0x3e, 0x00, 0x48, 0x30, 0x09, 0x08, 0x01, 0x20, 0x33, 0x2f,
+            0x04, 0x2c, 0x4a, 0x37, 0x03, 0x26, 0x38, 0x1a, 0x2e, 0x3c };
+        uint8_t seq[FHSS_SEQ_COUNT], seq2[FHSS_SEQ_COUNT];
+        elrs_fhss_build(0x01020304, seq);
+        for (int i = 0; i < 40; i++) assert(seq[i] == golden[i]);
+        assert(seq[80] == 0x29 && seq[81] == 0x0f && seq[82] == 0x23 && seq[83] == 0x33);
+        for (uint8_t b = 0; b < FHSS_SEQ_COUNT / FHSS_FREQ_COUNT; b++) {
+            assert(seq[b * FHSS_FREQ_COUNT] == FHSS_SYNC_INDEX); // sync at block start
+            bool seen[FHSS_FREQ_COUNT] = { false };
+            for (uint8_t k = 0; k < FHSS_FREQ_COUNT; k++) {
+                uint8_t v = seq[b * FHSS_FREQ_COUNT + k];
+                assert(v < FHSS_FREQ_COUNT && !seen[v]);
+                seen[v] = true;
+            }
+        }
+        elrs_fhss_build(0x01020304, seq2); // determinism (test_fhss_same)
+        assert(memcmp(seq, seq2, FHSS_SEQ_COUNT) == 0);
+        // hop cadence helper: idx advances once per hopInterval packets
+        assert(elrs_fhss_advance(10, 0, 4) == 10);
+        assert(elrs_fhss_advance(10, 4, 4) == 11);
+        assert(elrs_fhss_advance(10, 3, 4) == 10);
+        assert(elrs_fhss_advance(159, 4, 4) == 0);
+        // channels: 2400.4 MHz + ch * 1 MHz
+        assert(elrs_fhss_channel_hz(0) == 2400400000u);
+        assert(elrs_fhss_channel_hz(41) == 2441400000u);
+    }
+    printf("ok: FHSS golden vector + ELRS unit-test invariants\n");
 
     printf("ALL HOST TESTS PASSED\n");
     return 0;

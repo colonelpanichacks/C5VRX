@@ -59,6 +59,8 @@ public:
     // path underneath is bounded by RadioLib's busy-pin timeout — this is
     // the dwell watchdog's recovery hammer; it cannot hang the caller.
     bool recover(const sniffer_step_t &step, uint32_t freq_hz);
+    // Retune only (FHSS hop-following). Bounded by RadioLib internals.
+    bool tune(uint32_t freq_hz);
     // FLRC identity: 32-bit sync word = uidMacSeedGet(UID), radio CRC seed =
     // OtaCrcInitializer — both derived from the bind-phrase UID (elrs_defs.h
     // citations). Without the right phrase, FLRC demods all fail the radio

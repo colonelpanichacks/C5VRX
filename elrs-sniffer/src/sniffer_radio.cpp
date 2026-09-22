@@ -183,6 +183,12 @@ bool SnifferRadio::recover(const sniffer_step_t &step, uint32_t freq_hz)
     return ok;
 }
 
+bool SnifferRadio::tune(uint32_t freq_hz)
+{
+    if (radio == NULL) return false;
+    return radio->setFrequency(freq_hz / 1000000.0) == RADIOLIB_ERR_NONE;
+}
+
 bool SnifferRadio::read_packet(uint8_t *buf, size_t len, float &rssi, float &snr)
 {
     if (!dio1_fired) return false;

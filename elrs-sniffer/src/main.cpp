@@ -14,6 +14,7 @@
 #include "board_pins.h"
 #include "elrs_defs.h"
 #include "elrs_parse.h"
+#include "elrs_fhss.h"
 #include "sniffer_radio.h"
 #include "ui.h"
 
@@ -30,6 +31,7 @@
 #define RSSI_SAMPLE_MS 200u        // <=5 Hz live energy sampling
 #define RSSI_MAX_FAILS 3           // consecutive SPI errors -> stop for this dwell
 #define PKT_DEBUG_MIN_MS 500u      // sync-first debug line rate limit (2/s)
+#define LOCK_DROP_MS 6000u         // unlock after this long with zero validated packets
 #define PREF_NAMESPACE "elrs-sniffer"
 
 static elrs_decode_ctx_t dctx;
@@ -41,6 +43,7 @@ static bool locked;
 
 static uint32_t step_entered_ms;
 static uint32_t last_pkt_ms;
+static uint32_t last_valid_ms;    // last CRC-validated (or FLRC radio-valid) packet
 static uint32_t last_stats_ms;
 static uint32_t window_pkts;      // CRC-OK packets this second (stats.pps)
 static uint32_t window_rx;        // raw RxDone this second (stats.rx_per_s)
@@ -72,6 +75,154 @@ static uint8_t sample_fails;
 static bool g_rx_busy;          // read_packet SPI in progress — don't sample
 
 static ui_state_t uist;
+
+// FHSS/crack helpers (defined below; used by on_sync)
+static void emit_fingerprint(const char *band);
+static void fhss_anchor(const elrs_packet_t &pkt);
+static void start_crack(bool flrc);
+
+// ---- FHSS hop-following + UID[2] brute-force (full passive capture) --------
+// The hop sequence is seeded by uidMacSeedGet() which needs UID[2] — the one
+// byte ELRS never broadcasts. Both LoRa and FLRC locks therefore run a UID2
+// crack: per candidate 0..255, seed the sequence, tune to the predicted
+// channel (LoRa; scored by CRC-valid packets) or the sync channel (FLRC;
+// scored by radio-CRC-valid packets, ~300 ms/candidate). A hit rebuilds the
+// sequence and the sniffer follows EVERY hop: full rc/tlm/linkstats capture.
+static bool g_uid2_known = false;
+static uint8_t g_uid2 = 0;
+static uint8_t g_seq[FHSS_SEQ_COUNT];
+static uint16_t g_fhss_idx = 0;          // predicted TX sequence position
+static uint8_t g_pkts_since_hop = 0;
+static bool g_following = false;
+static uint32_t g_follow_freq = ELRS_2G4_SYNC_FREQ_HZ;
+static bool g_fp_emitted = false;        // one OSINT fingerprint per link
+static uint8_t g_uid[6] = { 0x43, 0x7f, 0x2f, 0xb1, 0xd3, 0x39 };
+// crack state
+static bool g_crack = false;
+static bool g_crack_flrc = false;
+static uint8_t g_crack_cand = 0;
+static uint32_t g_crack_t0 = 0;
+static uint32_t g_crack_score = 0;
+// sync anchor for position prediction
+static uint8_t g_anchor_idx = 0;
+static uint8_t g_anchor_nonce = 0;
+static uint32_t g_anchor_ms = 0;
+
+static uint32_t mac_seed_with_uid2(uint8_t uid2)
+{
+    return ((uint32_t)uid2 << 24) | ((uint32_t)g_uid[3] << 16) |
+           ((uint32_t)g_uid[4] << 8) | ((uint32_t)g_uid[5] ^ ELRS_OTA_VERSION_ID_3X);
+}
+
+static void start_crack(bool flrc)
+{
+    g_crack = true;
+    g_crack_flrc = flrc;
+    g_crack_cand = 0;
+    g_crack_score = 0;
+    g_crack_t0 = millis();
+    if (flrc) {
+        uint8_t uid[6] = { g_uid[0], g_uid[1], 0, g_uid[3], g_uid[4], g_uid[5] };
+        g_radio.setFlrcIdentity(uid);
+        g_radio.tune(ELRS_2G4_SYNC_FREQ_HZ);
+    }
+}
+
+static void crack_advance_candidate()
+{
+    if (g_crack_flrc) {
+        uint8_t uid[6] = { g_uid[0], g_uid[1], g_crack_cand, g_uid[3], g_uid[4], g_uid[5] };
+        g_radio.setFlrcIdentity(uid);
+        g_radio.tune(ELRS_2G4_SYNC_FREQ_HZ);
+    } else {
+        // LoRa: tune to the channel this candidate predicts for the anchor
+        uint8_t seq[FHSS_SEQ_COUNT];
+        elrs_fhss_build(mac_seed_with_uid2(g_crack_cand), seq);
+        uint32_t elapsed = (millis() - g_anchor_ms) / 4; // ~packets @250Hz class
+        uint16_t idx = elrs_fhss_advance(g_anchor_idx, elapsed, 4);
+        g_radio.tune(elrs_fhss_channel_hz(seq[idx]));
+    }
+}
+
+static void crack_tick()
+{
+    if (!g_crack) return;
+    const elrs_rate_t *r = sweep.steps[step_idx].rate;
+    uint32_t win_ms = g_crack_flrc ? 300 : ((6u * r->hop_interval * r->interval_us) / 1000 + 20);
+    if (millis() - g_crack_t0 < win_ms) return;
+
+    uint8_t threshold = g_crack_flrc ? 3 : 2;
+    if (g_crack_score >= threshold) {
+        g_uid2 = g_crack_cand;
+        g_uid2_known = true;
+        g_crack = false;
+        elrs_fhss_build(mac_seed_with_uid2(g_uid2), g_seq);
+        g_following = true;
+        g_fhss_idx = g_anchor_idx;
+        g_follow_freq = elrs_fhss_channel_hz(g_seq[g_fhss_idx]);
+        g_radio.tune(g_follow_freq);
+        uist.freq_hz = g_follow_freq;
+        Serial.printf("{\"t\":\"event\",\"what\":\"uid2_crack\",\"uid2\":%u,\"valids\":%lu}\n",
+                      g_uid2, (unsigned long)g_crack_score);
+        Serial.printf("{\"t\":\"event\",\"what\":\"uid_cracked\",\"uid\":\"%02x %02x %02x %02x %02x %02x\"}\n",
+                      g_uid[0], g_uid[1], g_uid2, g_uid[3], g_uid[4], g_uid[5]);
+        return;
+    }
+    if (g_crack_score > 0) {
+        Serial.printf("{\"t\":\"event\",\"what\":\"uid2_crack\",\"uid2\":%u,\"valids\":%lu}\n",
+                      g_crack_cand, (unsigned long)g_crack_score);
+    }
+    g_crack_cand++;
+    if (g_crack_cand == 0) { // exhausted 0..255
+        g_crack = false;
+        Serial.println("{\"t\":\"event\",\"what\":\"uid2_crack_failed\"}");
+        g_radio.tune(ELRS_2G4_SYNC_FREQ_HZ);
+        return;
+    }
+    g_crack_score = 0;
+    g_crack_t0 = millis();
+    crack_advance_candidate();
+}
+
+static void follow_on_valid_packet()
+{
+    if (!g_following || g_crack) return;
+    const elrs_rate_t *r = sweep.steps[step_idx].rate;
+    if (++g_pkts_since_hop < r->hop_interval) return;
+    g_pkts_since_hop = 0;
+    g_fhss_idx = (uint16_t)((g_fhss_idx + 1) % FHSS_SEQ_COUNT);
+    uint32_t f = elrs_fhss_channel_hz(g_seq[g_fhss_idx]);
+    if (f != g_follow_freq) {
+        g_follow_freq = f;
+        g_radio.tune(f);
+    }
+    uist.freq_hz = f;
+}
+
+static void fhss_anchor(const elrs_packet_t &pkt)
+{
+    g_anchor_idx = pkt.sync.fhss_index;
+    g_anchor_nonce = pkt.sync.nonce;
+    g_anchor_ms = millis();
+    g_fhss_idx = g_anchor_idx;
+    if (g_uid2_known) {
+        uint32_t f = elrs_fhss_channel_hz(g_seq[g_fhss_idx]);
+        if (g_following && f != g_follow_freq) {
+            g_follow_freq = f;
+            g_radio.tune(f);
+        }
+        uist.freq_hz = f;
+    }
+}
+
+static void emit_fingerprint(const char *band)
+{
+    if (g_fp_emitted) return;
+    g_fp_emitted = true;
+    Serial.printf("{\"t\":\"event\",\"what\":\"fp\",\"band\":\"%s\",\"uid_tail\":\"%02x%02x%02x\"}\n",
+                  band, dctx.uid3, dctx.uid4, dctx.uid5);
+}
+
 
 // Configure the radio for a sweep step. The "dwell" event is emitted when a
 // dwell ENDS (dwell_advance), carrying that dwell's rssi_max — so the serial
@@ -156,6 +307,14 @@ static void on_sync(const elrs_packet_t &pkt)
                   pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5);
     if (!good) return;
     last_good_step = step_idx; // sweep re-enters here first after a drop
+    emit_fingerprint("lora");
+    fhss_anchor(pkt);
+    if (g_crack && g_crack_flrc) { // strong LoRa lock beats an FLRC crack
+        g_crack = false;
+        g_radio.tune(ELRS_2G4_SYNC_FREQ_HZ);
+    } else if (!g_uid2_known && !g_crack) {
+        start_crack(false); // find UID[2], then hop-follow this link
+    }
     if (!locked) {
         locked = true;
         lock_total_pkts = 0;
@@ -257,6 +416,7 @@ static void stats_tick()
     Serial.printf("{\"t\":\"stats\",\"ms\":%lu,\"rate\":\"%s\",\"iq\":\"%c\",\"rssi\":%d,"
                   "\"rssi_now\":%d,\"snr10\":%d,\"pps\":%lu,\"rx_per_s\":%lu,"
                   "\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
+                  "\"freq\":%lu,\"fhss\":%u,"
                   "\"rx\":%lu,\"crc_ok\":%lu,"
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},"
                   "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u",
@@ -265,6 +425,8 @@ static void stats_tick()
                   (unsigned long)uist.pps, (unsigned long)rx_per_s,
                   (unsigned long)uist.lq_permille,
                   locked ? 1 : 0, radio_ok ? 1 : 0,
+                  (unsigned long)uist.freq_hz,
+                  g_following ? (unsigned)g_fhss_idx : 255,
                   (unsigned long)n_rx, (unsigned long)n_crc_ok,
                   (unsigned long)n_rc, (unsigned long)n_msp,
                   (unsigned long)n_sync, (unsigned long)n_tlm, (unsigned long)n_unk,
@@ -377,7 +539,6 @@ static bool radio_init_bounded(const radio_pin_set_t *ps, uint32_t timeout_ms,
 //   community converters (e.g. busheezy/elrs-binding-phrase-to-bytes) hash
 //   the SAME wrapped string. NOT md5(phrase) plain.
 // Default phrase "ExpressLRS" -> UID 43 7f 2f b1 d3 39 (verified by python).
-static uint8_t g_uid[6] = { 0x43, 0x7f, 0x2f, 0xb1, 0xd3, 0x39 };
 
 static void derive_uid_from_phrase(const char *phrase, uint8_t uid[6])
 {
@@ -773,6 +934,22 @@ void loop()
                     Serial.printf("{\"t\":\"rawpkt\",\"cls\":%u,\"hex\":\"%s\"}\n",
                                   (unsigned)pkt.cls, hex);
                 }
+                if (pkt.cls == ELRS_PKT_CLASS_CRC_OK) {
+                    n_crc_ok++; dwell_crc_ok++; window_pkts++;
+                    if (locked) lock_total_pkts++;
+                    last_valid_ms = millis();
+                    if (g_crack) g_crack_score++;
+                    follow_on_valid_packet();
+                    // sync-first debug: SHOW validated packets (2/s cap)
+                    if (millis() - last_pkt_debug_ms >= PKT_DEBUG_MIN_MS) {
+                        last_pkt_debug_ms = millis();
+                        char hex[2 * 16 + 1];
+                        size_t hn = want < 16 ? want : 16;
+                        to_hex(buf, hn, hex);
+                        Serial.printf("{\"t\":\"pkt\",\"type\":\"%s\",\"len\":%u,\"hex\":\"%s\"}\n",
+                                      pkt_type_name(pkt.type), (unsigned)want, hex);
+                    }
+                }
                 switch (pkt.type) {
                 case ELRS_PKT_SYNC:
                     n_sync++; dwell_sync++;
@@ -792,6 +969,12 @@ void loop()
                         dctx.uid_known = true;
                         dctx.crc_init = elrs_crc_init_from_uid(g_uid[4], g_uid[5]);
                         dctx.crc_init_known = true;
+                        emit_fingerprint("flrc");
+                        fhss_anchor(pkt);
+                        if (!g_uid2_known && !g_crack) start_crack(true);
+                        if (!locked) Serial.println("{\"t\":\"lock\"}");
+                        locked = true;
+                        last_good_step = step_idx;
                     }
                     // raw ground-truth: FULL hex of every sync-classified
                     // packet (validated or not), <=2/s — for CRC forensics.
@@ -810,19 +993,6 @@ void loop()
                     n_rc++; dwell_rc++; on_rc(pkt); break;
                 default:
                     n_msp++; dwell_msp++; break;
-                }
-                if (pkt.cls == ELRS_PKT_CLASS_CRC_OK) {
-                    n_crc_ok++; dwell_crc_ok++; window_pkts++;
-                    if (locked) lock_total_pkts++;
-                    // sync-first debug: SHOW validated packets (2/s cap)
-                    if (millis() - last_pkt_debug_ms >= PKT_DEBUG_MIN_MS) {
-                        last_pkt_debug_ms = millis();
-                        char hex[2 * 16 + 1];
-                        size_t hn = want < 16 ? want : 16;
-                        to_hex(buf, hn, hex);
-                        Serial.printf("{\"t\":\"pkt\",\"type\":\"%s\",\"len\":%u,\"hex\":\"%s\"}\n",
-                                      pkt_type_name(pkt.type), (unsigned)want, hex);
-                    }
                 }
             }
         }
@@ -860,13 +1030,19 @@ void loop()
             g_radio.recover(cur, ELRS_2G4_SYNC_FREQ_HZ);
             dwell_advance();
         }
-        if (locked && millis() - last_pkt_ms > 5000) {
+        if (locked && millis() - last_valid_ms > LOCK_DROP_MS) {
             locked = false;
+            g_following = false;
+            g_crack = false;
+            g_uid2_known = false;
+            g_fp_emitted = false; // next link gets its own fingerprint
             Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
             // re-enter sweep: parked step if set, else last good rate+IQ
             dwell_begin(g_park_step >= 0 ? (uint8_t)g_park_step : last_good_step);
         }
     }
+
+    crack_tick();
 
     led_update(locked, uist.pps);
     stats_tick(); // always runs — alive-with-no-radio still emits 1 Hz JSON

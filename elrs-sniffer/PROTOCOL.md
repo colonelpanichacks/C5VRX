@@ -146,18 +146,40 @@ Boot/lifecycle:
   ```json
   {"t":"event","what":"oled_driver","drv":"sh1106"}
   ```
-  emitted when the OLED driver is toggled (`what:"oled_driver"`,
-  `drv:"sh1106"|"ssd1306"`); `verbose_on`/`verbose_off` for the V command;
-  `parked`/`sweep_resume` for the R command.
+  - `oled_driver` (`drv:"sh1106"|"ssd1306"`) — OLED driver toggle.
+  - `verbose_on`/`verbose_off` (V command); `parked{step,rate}` /
+    `sweep_resume` (R command).
+  - `uid` — bind phrase applied: `{"t":"event","what":"uid","uid":"43 7f ..."}`.
+  - `fp` — OSINT fingerprint, first sync of a link:
+    `{"t":"event","what":"fp","band":"lora|flrc","uid_tail":"a1b2c3"}`.
+  - `flrc_sync` — FLRC sync parsed (see FLRC section).
+  - `uid2_crack` — per UID[2] candidate with any score:
+    `{"t":"event","what":"uid2_crack","uid2":47,"valids":5}`.
+  - `uid_cracked` — full UID recovered, hop-following starts:
+    `{"t":"event","what":"uid_cracked","uid":".. .. .. .. .. .."}`.
+  - `uid2_crack_failed` — all 256 candidates exhausted.
   Console commands: `P` = radio pin re-probe, `D` = toggle OLED driver,
   `V` = print every demodded packet as `rawpkt` (10/s), `R [step]` = park
   the sweep on a step (`R` alone resumes; steps are numbered 0..N-1 as
   listed in the `dwell` lines), `U <phrase>` = set the ELRS bind phrase
-  (rest of the line, spaces allowed; persisted; the derived UID is printed
-  as `{"t":"event","what":"uid","uid":"xx xx ..."}`). The T3-S3 BOOT button
+  (rest of the line, spaces allowed; persisted). The T3-S3 BOOT button
   (GPIO0) held ≥1.5 s also toggles the OLED driver. Manual toggles pause
   `stats` for ~1.5 s (splash); while parked, dwell extensions still apply
   and the unlock path re-enters at the parked step.
+
+## FHSS hop-following
+
+After a validated sync the sniffer brute-forces UID[2] (the byte ELRS
+never broadcasts; needed to seed the hop sequence) and then follows the
+ELRS 2.4G FHSS sequence (`elrs_fhss.h`, ported from 3.6.4 FHSS.cpp +
+random.cpp): 80 × 1 MHz channels 2400.4–2479.4, sync channel 2441.4,
+sequence length 160, TX position advancing once per `hopInterval` packets
+(tx_main.cpp: `(OtaNonce+1) % hopInterval == 0`). While following, `stats`
+gains `freq` (current tuned Hz) and `fhss` (sequence index, 255 = not
+following); every received packet is captured — rc sticks, telemetry
+frames, linkstats — not just sync-channel traffic. Sync packets re-anchor
+the sequence position. Lock drops only after 6 s with zero validated
+packets (deep fade), then the sweep resumes; a new link emits a new `fp`.
 
 ## FLRC rates
 
