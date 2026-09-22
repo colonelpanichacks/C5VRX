@@ -19,16 +19,22 @@ flashes leave stale Arduino/PHY state that looks like firmware bugs.
 | `boot_app0.bin`  | **0xe000** | Arduino OTA-rollback marker; part of the canonical merged image (platform `esp32_create_combined_bin` layout) |
 | `firmware.bin`   | **0x10000** | app offset from parsing the partition table (`ESP32_APP_OFFSET`; also the platform's merged-image layout) |
 
-Flash params: `--flash-mode qio --flash-freq 80m --flash-size 4MB` — the
-confirmed board has **4 MB embedded flash (XMC)** (esptool: "Embedded Flash
-4MB"); mode/freq come from the `esp32-s3-devkitc-1` manifest. The PlatformIO
-env pins this too: `board_build.flash_size = 4MB` and
-`board_build.partitions = default.csv` (the 4 MB table; consumed by the
-framework's `tools/platformio-build.py`, app0 @ 0x10000 size 0x140000).
-**Do not** flash an 8 MB table/binary config onto this chip: the earlier
-8 MB build wrote a partition table describing space that doesn't exist and
-an image header claiming 8 MB — a plausible contributor to the silent-boot
-failure this script's full erase now clears.
+Flash params: `--flash-mode dio --flash-freq 80m --flash-size 4MB`.
+- Size: the confirmed board is an **ESP32-S3R2** — 4 MB embedded XMC
+  flash, 2 MB embedded QSPI PSRAM (esptool: "Embedded Flash 4MB (XMC),
+  Embedded PSRAM 2MB (AP_3v3)").
+- Mode **dio, not qio**: the XMC embedded flash has known QIO-mode quirks
+  on ESP32-S3 (boot-stage flash access faults after the bootloader switches
+  read mode). dio costs nothing at 80 MHz for this firmware. QIO can be
+  re-tried later once the board is healthy. The PlatformIO env pins the
+  same choice (`board_build.flash_mode = dio`) so the SDK libraries, image
+  headers, and flash.sh all agree.
+- PSRAM: `board_build.arduino.memory_type = dio_qspi` (S3R2 embedded PSRAM
+  is **QSPI**; the framework derives `<flash_mode>_qspi` by default, so dio
+  flash keeps the qspi PSRAM half — verified in
+  `tools/platformio-build-esp32s3.py`). Do **not** use an `*_opi` variant:
+  octal-PSRAM libs on a QSPI-only chip panic early in boot exactly like the
+  observed reset loop.
 
 > Why not `pio run -t upload`: PlatformIO's Arduino-framework upload writes
 > **only** `firmware.bin @ 0x10000` (`UPLOADCMD='$UPLOADER $UPLOADERFLAGS
@@ -63,6 +69,24 @@ RX=21/TX=10). For a non-PA board, remove that define from
 `[common] build_flags` in `platformio.ini` and rebuild — the banner and the
 `boot` JSON event state which variant the firmware was *built* for, so a
 wrong guess is visible on both serial and OLED instead of silently deaf.
+
+## Onboard LED (GPIO37) — boot & fault patterns, no serial needed
+
+| phase | LED pattern | meaning |
+|---|---|---|
+| reset → ~1 s | **solid ON** | app started (2nd-stage bootloader handed off to our image) |
+| ~1 s → radio init done | OFF, **200 ms blink** while waiting | radio init in progress |
+| steady state, healthy, unlocked | **1 Hz heartbeat** (50 ms ON each second) | sweeping, no link |
+| steady state, healthy, locked | **solid ON** | ELRS link locked |
+| steady state, radio fault | **fast blink (~5 Hz)** forever | no SX1280 — see `radio:0` stats |
+
+Boot-stage triage without any terminal:
+- **Never lights**: wrong/reset-looping image at bootloader level, hardware
+  power, or LED pin mismatch — re-check `verify_flash`, try download mode
+  (BOOT+RST).
+- **Lights 1 s then fast-blink**: app runs; SX1280 not answering → wrong
+  pins or dead radio module.
+- **Lights 1 s then heartbeat**: fully healthy; it is sweeping for ELRS.
 
 ## Boot observability (v0.2.2+): what you should see, where
 

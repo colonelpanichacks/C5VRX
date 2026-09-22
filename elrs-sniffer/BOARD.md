@@ -1,8 +1,12 @@
-# BOARD.md — hardware pinning: DONE (LilyGo T3-S3 SX1280)
+# BOARD.md — hardware pinning: DONE (LilyGo T3-S3 V1.2 SX1280)
 
-**Status: pinned.** The unit is a **LilyGo T3-S3, ESP32-S3, SX1280 2.4 GHz
-variant** with the 0.96" SSD1306 OLED. All pins below are **[VERIFIED]**
-against the manufacturer's own source:
+**Status: pinned.** The unit is a **LilyGo T3-S3 V1.2, ESP32-S3R2**
+(QFN56 rev v0.2: 4 MB embedded XMC flash + 2 MB embedded QSPI PSRAM,
+esptool-identified), **SX1280 2.4 GHz "ranging" listing = PA variant**,
+with the 0.96" SSD1306 OLED. Chip implications: QSPI-PSRAM-only (never an
+`*_opi` SDK memory variant) and XMC flash → **dio** flash mode (known S3
+QIO quirks) — both encoded in `platformio.ini`. All pins below are
+**[VERIFIED]** against the manufacturer's own source:
 `Xinyuan-LilyGO/LilyGo-LoRa-Series` → `examples/T3S3Factory/utilities.h`
 (T3_S3_V1_2_SX1280 / T3_S3_V1_2_SX1280_PA blocks) and
 `examples/LoRa/T3S3/SX1280PA_PingPong/SX1280PA_PingPong.ino` (RF-switch

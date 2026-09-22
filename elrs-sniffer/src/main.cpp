@@ -175,9 +175,6 @@ static void stats_tick()
         uist.fault[0] = 0;
     }
     last_rssi = -128.0f; // reset peak-hold for the next window
-#if defined(PIN_BOARD_LED)
-    digitalWrite(PIN_BOARD_LED, locked ? HIGH : LOW);
-#endif
 
     Serial.printf("{\"t\":\"stats\",\"ms\":%lu,\"rate\":\"%s\",\"iq\":\"%c\",\"rssi\":%d,"
                   "\"snr10\":%d,\"pps\":%lu,\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
@@ -196,6 +193,42 @@ static void stats_tick()
 
     if (oled_ok) ui_render(&uist);
 }
+
+// ---- LED boot/fault marker (GPIO37 onboard LED, active HIGH) -------------
+// Visible without serial. Pattern (also documented in flash.md):
+//   setup entry: ON solid 1 s ("app started") -> OFF
+//   radio init:  200 ms blink while waiting
+//   loop:        radio fault = 50 ms fast blink forever;
+//                locked = solid ON; unlocked = 1 Hz heartbeat (50 ms ON/s)
+#if defined(PIN_BOARD_LED)
+static void led_boot_marker_start()
+{
+    pinMode(PIN_BOARD_LED, OUTPUT);
+    digitalWrite(PIN_BOARD_LED, HIGH);
+}
+
+static void led_boot_marker_done(uint32_t started_ms)
+{
+    uint32_t elapsed = millis() - started_ms;
+    if (elapsed < 1000) delay(1000 - elapsed);
+    digitalWrite(PIN_BOARD_LED, LOW);
+}
+
+static void led_update(bool radio_ok, bool locked)
+{
+    if (!radio_ok) {
+        digitalWrite(PIN_BOARD_LED, (millis() % 100) < 50 ? HIGH : LOW);
+    } else if (locked) {
+        digitalWrite(PIN_BOARD_LED, HIGH);
+    } else {
+        digitalWrite(PIN_BOARD_LED, (millis() % 1000) < 50 ? HIGH : LOW);
+    }
+}
+#else
+static void led_boot_marker_start() {}
+static void led_boot_marker_done(uint32_t) {}
+static void led_update(bool, bool) {}
+#endif
 
 // ---- bounded radio init --------------------------------------------------
 // RadioLib 6.6 already bounds each SPI transaction (1 s timeout), but run the
@@ -221,7 +254,18 @@ static bool radio_init_bounded(char *err, size_t errlen)
         g_radio_task_done = true;
     }
     uint32_t t0 = millis();
-    while (!g_radio_task_done && millis() - t0 < RADIO_INIT_TIMEOUT_MS) delay(10);
+    uint32_t last_blink = 0;
+    bool led_state = false;
+    while (!g_radio_task_done && millis() - t0 < RADIO_INIT_TIMEOUT_MS) {
+        delay(10);
+#if defined(PIN_BOARD_LED)
+        if (millis() - last_blink >= 200) { // init-in-progress blink
+            last_blink = millis();
+            led_state = !led_state;
+            digitalWrite(PIN_BOARD_LED, led_state ? HIGH : LOW);
+        }
+#endif
+    }
     if (!g_radio_task_done) {
         snprintf(err, errlen, "timeout %us (no SX1280 ACK)", RADIO_INIT_TIMEOUT_MS / 1000);
         return false; // init task still spinning on core 0; left to die there
@@ -266,17 +310,16 @@ static void early_banner()
 
 void setup()
 {
+    led_boot_marker_start();
+    uint32_t boot_mark_t0 = millis();
     early_banner(); // MUST NOT be preceded by anything that can stall
+    led_boot_marker_done(boot_mark_t0); // 1 s ON = "app started"
 
     memset(&uist, 0, sizeof(uist));
     uist.ident[0] = 0;
     snprintf(uist.rate, sizeof(uist.rate), "boot");
     for (int i = 0; i < UI_TLM_LINES; i++) uist.tlm[i][0] = 0;
 
-#if defined(PIN_BOARD_LED)
-    pinMode(PIN_BOARD_LED, OUTPUT);
-    digitalWrite(PIN_BOARD_LED, LOW); // LED_ON = HIGH: lit only when locked
-#endif
     elrs_decode_init(&dctx);
     sniffer_sweep_build(&sweep);
 
@@ -354,5 +397,6 @@ void loop()
         }
     }
 
+    led_update(radio_ok, locked);
     stats_tick(); // always runs — alive-with-no-radio still emits 1 Hz JSON
 }

@@ -99,7 +99,7 @@ echo "==> [4/5] Writing images"
 $ESPTOOL --chip esp32s3 -p "$PORT" -b 460800 \
     --before default-reset --after hard-reset \
     write-flash -z \
-    --flash-mode qio --flash-freq 80m --flash-size 4MB \
+    --flash-mode dio --flash-freq 80m --flash-size 4MB \
     0x0     "$BOOTLOADER" \
     0x8000  "$PARTITIONS" \
     0xe000  "$BOOTAPP0" \
