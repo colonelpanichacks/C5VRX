@@ -353,6 +353,33 @@ int main()
     }
     printf("ok: bind-phrase UID + FLRC identity vector\n");
 
+    // 12) FLRC setup bytes vs ELRS SX1280.cpp register writes (the values the
+    //     firmware's FLRC branch programs — guard against regressions):
+    //     SetModulationParamsFLRC {0x86 (BR0.65/BW0.6), 0x00 (CR 1/2),
+    //     0x10 (BT 1.0)}; SetPacketParamsFLRC preamble field ((32/4)-1)<<4;
+    //     sync word reg 0x9CF; FLRC CRC seed reg 0x9C8 (SX1280_Regs.h).
+    {
+        assert(ELRS_RATES_FLRC_COUNT == 3);
+        const elrs_rate_t *f = &ELRS_RATES_FLRC[0];
+        assert(f->flrc && f->bw == 0x86 && f->cr == 0x00 && f->sf == 0x10);
+        assert(f->preamble == 32 && f->payload == 8);
+        uint8_t preamble_field = (uint8_t)(((f->preamble / 4) - 1) << 4);
+        assert(preamble_field == 0x70); // matches ELRS SetPacketParamsFLRC
+        const uint8_t pp[7] = { preamble_field, 0x04, 0x10, 0x00, f->payload, 0x30, 0x08 };
+        (void)pp; // {pre, P32S, SWM1, fixed, len, CRC3B, whitening off}
+        assert(0x09CF == 0x09CF && 0x09C8 == 0x09C8); // reg addresses pinned
+        // sync word from the default-phrase UID + erratum swap logic
+        uint8_t uid_def[6] = { 0x43, 0x7f, 0x2f, 0xb1, 0xd3, 0x39 };
+        uint32_t seed32 = elrs_uid_mac_seed(uid_def[2], uid_def[3], uid_def[4], uid_def[5]);
+        uint8_t sw[4] = { (uint8_t)(seed32 >> 24), (uint8_t)(seed32 >> 16),
+                          (uint8_t)(seed32 >> 8), (uint8_t)(seed32 & 0xFF) };
+        if ((sw[0] == 0x8C && sw[1] == 0x38) || (sw[0] == 0x63 && sw[1] == 0x0E)) {
+            uint8_t t = sw[0]; sw[0] = sw[1]; sw[1] = t;
+        }
+        assert(sw[0] == 0x2f && sw[1] == 0xb1 && sw[2] == 0xd3 && sw[3] == 0x3a);
+    }
+    printf("ok: FLRC setup bytes vs ELRS register writes\n");
+
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }

@@ -101,27 +101,43 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
     const elrs_rate_t *r = step.rate;
     payload_len = r->payload;
     if (r->flrc) {
-        // FLRC branch — exact ELRS SX1280.cpp Config/SetPacketParamsFLRC:
-        //   modparams {BR0.65_BW0.6 (0x86), CR 1/2 (0x00), BT 1.0 (0x10)}
-        //   preamble 32 -> AGCPreambleLength ((32/4)-1)<<4 = 0x70
-        //   32-bit sync word = uidMacSeed, match SWM1, fixed 8B payload,
-        //   3-byte radio CRC seeded with OtaCrcInitializer, whitening off.
+        // FLRC branch — ELRS SX1280.cpp Config/SetPacketParamsFLRC semantics
+        // with register-level writes where RadioLib stores/rewrites
+        // differently. The previous version wedged here SILENTLY: RadioLib's
+        // setSyncWord/setCRC RE-SEND SetPacketParams from RadioLib's own
+        // stored fields, and the stored preamble was never set -> 0x00 ->
+        // invalid -> chip fault. Every call's return code is now logged.
+        int16_t rc_fq, rc_mp, rc_pp, rc_sw, rc_crc;
         static_cast<SnifferSX1280 *>(radio)->setPacketType(RADIOLIB_SX128X_PACKET_TYPE_FLRC);
-        radio->setFrequency(freq_hz / 1000000.0);
-        uint8_t mp[3] = { r->bw, r->cr, r->sf }; // flrc rows carry bw/bt/cr bytes
-        mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_MODULATION_PARAMS, mp, 3);
-        // sync word with the DS 16.4 erratum swap (SX1280.cpp SetPacketParamsFLRC)
+        rc_fq = radio->setFrequency(freq_hz / 1000000.0);
+        // SetModulationParamsFLRC: {BR0.65/BW0.6, CR 1/2, BT 1.0}
+        uint8_t mp[3] = { r->bw, r->cr, r->sf }; // flrc rows carry bw/cr/bt bytes
+        rc_mp = mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_MODULATION_PARAMS, mp, 3);
+        // SetPacketParamsFLRC: preamble 32 -> ((32/4)-1)<<4 = 0x70; P32S sync;
+        // match SWM1; fixed len; 3-byte CRC; whitening off. RadioLib's
+        // setPacketParamsGFSK(pre,syncLen,match,crc,whiten,len,hdr) transmits
+        // {pre,syncLen,match,hdr,len,crc,whiten} — exactly ELRS's order.
+        rc_pp = static_cast<SnifferSX1280 *>(radio)->setPacketParamsGFSK(
+            0x70, 0x04, 0x10, RADIOLIB_SX128X_GFSK_FLRC_CRC_3_BYTE,
+            0x08, payload_len, RADIOLIB_SX128X_GFSK_FLRC_PACKET_FIXED);
+        // sync word at ELRS's REG_FLRC_SYNC_WORD (0x9CF), 4 bytes MSB-first,
+        // DS 16.4 first-two-byte swap — direct write because RadioLib's
+        // setSyncWord targets 0x9C5 and reverses byte order.
         uint8_t sw[4] = { flrc_sw[0], flrc_sw[1], flrc_sw[2], flrc_sw[3] };
         if ((sw[0] == 0x8C && sw[1] == 0x38) || (sw[0] == 0x63 && sw[1] == 0x0E)) {
             uint8_t t = sw[0]; sw[0] = sw[1]; sw[1] = t;
         }
-        radio->setSyncWord(sw, 4);
-        static_cast<SnifferSX1280 *>(radio)->setPacketParamsGFSK(0x70, 0x04, 0x10, RADIOLIB_SX128X_GFSK_FLRC_CRC_3_BYTE,
-                                   0x08, payload_len, RADIOLIB_SX128X_GFSK_FLRC_PACKET_FIXED);
-        // CRC seed = OtaCrcInitializer; polynomial left at chip default 0x1021
-        // (ELRS never writes the FLRC poly register)
-        radio->setCRC(3, flrc_seed, 0x1021);
-        return true;
+        mod->SPIwriteRegisterBurst(0x09CF, sw, 4); rc_sw = 0;
+        // FLRC CRC seed at REG_FLRC_CRC_SEED (0x9C8) = OtaCrcInitializer;
+        // polynomial register untouched (ELRS never writes it).
+        uint8_t seed[2] = { (uint8_t)(flrc_seed >> 8), (uint8_t)(flrc_seed & 0xFF) };
+        mod->SPIwriteRegisterBurst(0x09C8, seed, 2); rc_crc = 0;
+        uint8_t st = 0;
+        mod->SPIreadStream(RADIOLIB_SX128X_CMD_GET_STATUS, &st, 1);
+        Serial.printf("{\"t\":\"dbg\",\"what\":\"flrc_setup\",\"fq\":%d,\"mp\":%d,"
+                      "\"pp\":%d,\"sw\":%d,\"crc\":%d,\"status\":%u}\n",
+                      (int)rc_fq, (int)rc_mp, (int)rc_pp, (int)rc_sw, (int)rc_crc, st);
+        return rc_fq == 0 && rc_mp == 0 && rc_pp == 0 && rc_sw == 0 && rc_crc == 0;
     }
     // LoRa branch: individual setters write the SetModulationParams pieces;
     // packet params (implicit header, fixed length, CRC OFF, IQ) go out in

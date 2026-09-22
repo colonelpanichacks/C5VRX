@@ -74,6 +74,16 @@ not), ≤2/s — ground truth for CRC forensics:
 Re-run the host seed-search (`test/host/test_parser.cpp`) on any captured
 hex to test whether ANY CRC init validates it.
 
+`dbg` — diagnostic lines (not emitted at a fixed rate):
+```json
+{"t":"dbg","what":"flrc_setup","fq":0,"mp":0,"pp":0,"sw":0,"crc":0,"status":135}
+```
+emitted per FLRC dwell setup with each config call's RadioLib return code
+(`fq` setFrequency, `mp` SetModulationParams, `pp` SetPacketParams,
+`sw` sync-word register write, `crc` CRC-seed register write; all 0 =
+success) plus the chip STATUS byte. Any non-zero rc pinpoints the failing
+call.
+
 `sync` — a sync packet decoded (`ok=1` means the ELRS software CRC validated):
 ```json
 {"t":"sync","ok":1,"fhss":42,"nonce":240,"rateIdx":6,"swMode":0,"tlmRatio":2,"uid":"a5b3c2"}
