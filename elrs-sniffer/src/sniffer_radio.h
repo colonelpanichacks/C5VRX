@@ -55,6 +55,10 @@ public:
     int16_t begin(); // default: RADIO_PIN_SETS[RADIO_PIN_SET_DEFAULT]
     // Apply a dwell step: modulation, fixed length, CRC off, IQ, frequency.
     bool apply(const sniffer_step_t &step, uint32_t freq_hz);
+    // Force-restart the radio on a step (re-apply + start_rx). Every command
+    // path underneath is bounded by RadioLib's busy-pin timeout — this is
+    // the dwell watchdog's recovery hammer; it cannot hang the caller.
+    bool recover(const sniffer_step_t &step, uint32_t freq_hz);
     // (Re)start continuous RX with DIO1 -> RX_DONE only.
     void start_rx();
     // Called from loop; when a packet demodded, fills buf/len/rssi/snr.

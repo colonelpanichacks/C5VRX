@@ -75,18 +75,17 @@ wrong guess is visible on both serial and OLED instead of silently deaf.
 | phase | LED pattern | meaning |
 |---|---|---|
 | reset → ~1 s | **solid ON** | app started (2nd-stage bootloader handed off to our image) |
-| ~1 s → radio init done | OFF, **200 ms blink** while waiting | radio init in progress |
-| steady state, healthy, unlocked | **1 Hz heartbeat** (50 ms ON each second) | sweeping, no link |
-| steady state, healthy, locked | **solid ON** | ELRS link locked |
-| steady state, radio fault | **fast blink (~5 Hz)** forever | no SX1280 — see `radio:0` stats |
+| steady state, pps == 0 | **OFF** | no ELRS packets demodulating (sweeping silently) |
+| steady state, packets flowing | **blink at ~min(pps, 5) Hz** | receive activity proportional to packet rate |
+| steady state, locked | **solid ON** | ELRS link locked |
 
 Boot-stage triage without any terminal:
 - **Never lights**: wrong/reset-looping image at bootloader level, hardware
   power, or LED pin mismatch — re-check `verify_flash`, try download mode
   (BOOT+RST).
-- **Lights 1 s then fast-blink**: app runs; SX1280 not answering → wrong
-  pins or dead radio module.
-- **Lights 1 s then heartbeat**: fully healthy; it is sweeping for ELRS.
+- **Lights 1 s then stays OFF**: app runs; sweep is hearing nothing (check
+  `rssi_max` in the dwell lines for the RF-path discriminator).
+- **Lights 1 s then blinks/solid**: packets are flowing / link locked.
 
 ## Boot observability (v0.2.2+): what you should see, where
 

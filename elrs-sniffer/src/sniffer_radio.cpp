@@ -109,6 +109,16 @@ void SnifferRadio::start_rx()
                         RADIOLIB_SX128X_IRQ_RX_DONE, RADIOLIB_SX128X_IRQ_RX_DONE);
 }
 
+bool SnifferRadio::recover(const sniffer_step_t &step, uint32_t freq_hz)
+{
+    if (radio == NULL) return false;
+    // re-apply + restart RX; every RadioLib call here has an internal
+    // BUSY-pin timeout and returns an error rather than waiting forever
+    bool ok = apply(step, freq_hz);
+    start_rx();
+    return ok;
+}
+
 bool SnifferRadio::read_packet(uint8_t *buf, size_t len, float &rssi, float &snr)
 {
     if (!dio1_fired) return false;

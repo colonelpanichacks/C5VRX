@@ -20,8 +20,10 @@
 #define RADIO_PROBE_TIMEOUT_MS 5000u
 #define RADIO_RETRY_MS 15000u
 #define DWELL_MS 1500u             // fixed dwell per rate (sync can be seconds apart)
+#define DWELL_WATCHDOG_MS 4000u    // wedged dwell -> radio restart + advance
 #define REDWELL_RSSI_DB -80        // dwells hotter than this get one repeat
-#define RSSI_SAMPLE_MS 100u        // ~10 Hz live energy sampling
+#define RSSI_SAMPLE_MS 200u        // <=5 Hz live energy sampling
+#define RSSI_MAX_FAILS 3           // consecutive SPI errors -> stop for this dwell
 #define PREF_NAMESPACE "elrs-sniffer"
 
 static elrs_decode_ctx_t dctx;
@@ -47,6 +49,9 @@ static float window_rssi_max = -128.0f;
 static float rssi_now = -128.0f;
 static uint32_t last_sample_ms;
 static bool redwell_scheduled;
+static bool sampling_enabled;   // per-dwell; cleared after RSSI_MAX_FAILS errors
+static uint8_t sample_fails;
+static bool g_rx_busy;          // read_packet SPI in progress — don't sample
 
 static ui_state_t uist;
 
@@ -61,6 +66,8 @@ static void dwell_begin(uint8_t i)
     g_radio.start_rx();
     step_entered_ms = millis();
     dwell_rssi_max = -128.0f;
+    sampling_enabled = true;
+    sample_fails = 0;
     snprintf(uist.rate, sizeof(uist.rate), "%s", s.rate->name);
     uist.iq_inverted = s.iq_inverted;
     uist.freq_hz = ELRS_2G4_SYNC_FREQ_HZ;
@@ -223,12 +230,12 @@ static void stats_tick()
     if (oled_ok) ui_render(&uist);
 }
 
-// ---- LED boot/fault marker (GPIO37 onboard LED, active HIGH) -------------
-// Visible without serial. Pattern (also documented in flash.md):
-//   setup entry: ON solid 1 s ("app started") -> OFF
-//   radio init:  200 ms blink while waiting
-//   loop:        radio fault = 50 ms fast blink forever;
-//                locked = solid ON; unlocked = 1 Hz heartbeat (50 ms ON/s)
+// ---- LED marker (GPIO37 onboard LED, active HIGH) --------------------------
+// STRICTLY receive-activity (user requirement, flash.md table):
+//   boot:      ON solid 1 s = "app started" (one-time, pre-loop marker)
+//   sweep:     OFF while pps == 0 (no heartbeat)
+//   packets:   blink at ~min(pps,5) Hz
+//   locked:    solid ON
 #if defined(PIN_BOARD_LED)
 static void led_boot_marker_start()
 {
@@ -243,20 +250,22 @@ static void led_boot_marker_done(uint32_t started_ms)
     digitalWrite(PIN_BOARD_LED, LOW);
 }
 
-static void led_update(bool radio_ok, bool locked)
+static void led_update(bool locked, uint32_t pps)
 {
-    if (!radio_ok) {
-        digitalWrite(PIN_BOARD_LED, (millis() % 100) < 50 ? HIGH : LOW);
-    } else if (locked) {
+    if (locked) {
         digitalWrite(PIN_BOARD_LED, HIGH);
+    } else if (pps == 0) {
+        digitalWrite(PIN_BOARD_LED, LOW);
     } else {
-        digitalWrite(PIN_BOARD_LED, (millis() % 1000) < 50 ? HIGH : LOW);
+        uint32_t hz = pps > 5 ? 5 : pps;
+        uint32_t period = 1000 / hz;
+        digitalWrite(PIN_BOARD_LED, (millis() % period) < (period / 2) ? HIGH : LOW);
     }
 }
 #else
 static void led_boot_marker_start() {}
 static void led_boot_marker_done(uint32_t) {}
-static void led_update(bool, bool) {}
+static void led_update(bool, uint32_t) {}
 #endif
 
 // ---- bounded radio init + pin auto-probe -----------------------------------
@@ -563,14 +572,21 @@ void loop()
     }
 
     if (radio_ok) {
-        // live energy sampling (~10 Hz) — the RF-path discriminator
-        if (millis() - last_sample_ms >= RSSI_SAMPLE_MS) {
+        // live energy sampling (<=5 Hz) — the RF-path discriminator.
+        // Guarded: only when RX is running and no packet SPI is in flight;
+        // three consecutive SPI errors stop sampling for THIS dwell (the
+        // rssi values stay stale) instead of hammering a wedged radio.
+        if (sampling_enabled && !g_rx_busy && !locked &&
+            millis() - last_sample_ms >= RSSI_SAMPLE_MS) {
             last_sample_ms = millis();
             float db;
             if (g_radio.rssiInst(db) == RADIOLIB_ERR_NONE) {
+                sample_fails = 0;
                 rssi_now = db;
                 if (db > window_rssi_max) window_rssi_max = db;
                 if (db > dwell_rssi_max) dwell_rssi_max = db;
+            } else if (++sample_fails >= RSSI_MAX_FAILS) {
+                sampling_enabled = false;
             }
         }
 
@@ -578,7 +594,10 @@ void loop()
         float rssi, snr;
         size_t want = sweep.steps[step_idx].rate->payload;
 
-        if (g_radio.read_packet(buf, want, rssi, snr)) {
+        g_rx_busy = true;
+        bool got = g_radio.read_packet(buf, want, rssi, snr);
+        g_rx_busy = false;
+        if (got) {
             elrs_packet_t pkt;
             bool ok = elrs_decode_packet(&dctx, buf, want, &pkt);
             if (rssi > last_rssi) last_rssi = rssi; // peak-hold for the stats window
@@ -599,6 +618,16 @@ void loop()
         if (!locked && millis() - step_entered_ms > DWELL_MS) {
             dwell_advance();
         }
+        // dwell watchdog: a dwell that never completes wedges the sweep —
+        // force a radio restart on this step and move on, visibly.
+        if (!locked && radio_ok && millis() - step_entered_ms > DWELL_WATCHDOG_MS) {
+            const sniffer_step_t &s = sweep.steps[step_idx];
+            Serial.printf("{\"t\":\"error\",\"what\":\"dwell_timeout\",\"rate\":\"%s\",\"iq\":\"%c\",\"ms\":%lu}\n",
+                          s.rate->name, s.iq_inverted ? 'i' : 'n',
+                          (unsigned long)(millis() - step_entered_ms));
+            g_radio.recover(s, ELRS_2G4_SYNC_FREQ_HZ);
+            dwell_advance();
+        }
         if (locked && millis() - last_pkt_ms > 5000) {
             locked = false;
             Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
@@ -606,6 +635,6 @@ void loop()
         }
     }
 
-    led_update(radio_ok, locked);
+    led_update(locked, uist.pps);
     stats_tick(); // always runs — alive-with-no-radio still emits 1 Hz JSON
 }
