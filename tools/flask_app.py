@@ -1310,12 +1310,16 @@ class ElrsState:
         self.rate = "-"
         self.iq = "-"
         self.rssi = None
+        self.rssi_now = None
         self.snr10 = None
         self.pps = 0
+        self.rx_per_s = None
         self.lq_permille = 0
         self.uid = None
         self.arm = 0
         self.ch = [0, 0, 0, 0]
+        self.freq = None        # hop-follow tuned Hz (optional, fhss mode)
+        self.fhss = None        # hop sequence index; 255 = not following
         self.stats_time = None  # monotonic of the last stats line
         self.tlm = {}           # type -> (payload dict, monotonic)
         self.events = []        # newest-last [(monotonic, seq, payload)]
@@ -1331,9 +1335,15 @@ class ElrsState:
                 self.rate = obj.get("rate", "-")
                 self.iq = obj.get("iq", "-")
                 self.rssi = obj.get("rssi")
+                self.rssi_now = obj.get("rssi_now", self.rssi_now)
                 self.snr10 = obj.get("snr10")
                 self.pps = obj.get("pps", 0)
+                self.rx_per_s = obj.get("rx_per_s", self.rx_per_s)
                 self.lq_permille = obj.get("lq_permille", 0)
+                # Hop-follow fields are emitted only while following; keep
+                # the last seen values otherwise (fhss 255 = not following).
+                self.freq = obj.get("freq", self.freq)
+                self.fhss = obj.get("fhss", self.fhss)
                 if obj.get("uid"):
                     self.uid = obj["uid"]
                 self.arm = obj.get("arm", 0)
@@ -1362,12 +1372,16 @@ class ElrsState:
                 "rate": self.rate,
                 "iq": self.iq,
                 "rssi": self.rssi,
+                "rssi_now": self.rssi_now,
                 "snr": None if self.snr10 is None else round(self.snr10 / 10.0, 1),
                 "pps": self.pps,
+                "rx_per_s": self.rx_per_s,
                 "lq": round(self.lq_permille / 10.0, 1),
                 "uid": self.uid,
                 "arm": self.arm,
                 "ch": list(self.ch),
+                "freq": self.freq,
+                "fhss": self.fhss,
                 "stats_age_s": (None if self.stats_time is None
                                 else round(now - self.stats_time, 1)),
                 "tlm": {k: {"age_s": round(now - ts, 1),
@@ -1613,7 +1627,8 @@ PAGE = """<!DOCTYPE html>
                 text-shadow:0 0 6px rgba(57,255,106,.6); }
   .vmode.static { color:var(--amb); border-color:var(--amb); animation:pulse 1.2s infinite; }
   .vmode.nosignal { color:var(--dim); border-color:var(--dim); }
-  .hopchip { padding:0 5px; border-radius:3px; border:1px solid var(--dim);
+  .hopchip { display:inline-block; min-width:46px; text-align:center;
+             padding:0 5px; border-radius:3px; border:1px solid var(--dim);
              color:var(--dim); letter-spacing:.08em; }
   .hopchip.lock { color:var(--grn); border-color:var(--grn);
                   text-shadow:0 0 6px rgba(57,255,106,.6); }
@@ -1728,21 +1743,26 @@ PAGE = """<!DOCTYPE html>
                             repeating-linear-gradient(0deg,rgba(57,255,106,.04) 0 1px,transparent 1px 24px); }
   #etitle { position:absolute; top:7px; left:14px; font-size:.62rem;
             letter-spacing:.18em; color:var(--dim); pointer-events:none; }
-  #edot { display:inline-block; width:8px; height:8px; border-radius:50%;
+  #edot, #xedot { display:inline-block; width:8px; height:8px; border-radius:50%;
           background:#4a5a4a; vertical-align:1px; }
-  #edot.lock { background:var(--grn); box-shadow:0 0 8px rgba(57,255,106,.8); }
-  #edot.sweep { background:var(--amb); box-shadow:0 0 8px rgba(255,176,0,.7);
+  #edot.lock, #xedot.lock { background:var(--grn); box-shadow:0 0 8px rgba(57,255,106,.8); }
+  #edot.sweep, #xedot.sweep { background:var(--amb); box-shadow:0 0 8px rgba(255,176,0,.7);
                 animation:pulse 1s infinite; }
   #ebig { display:flex; gap:14px; align-items:baseline; }
   .eb .ek, .egauge .ek { color:var(--dim); font-size:.56rem; letter-spacing:.1em; }
-  .eb b { font-size:1.3rem; color:var(--txt); margin:0 3px; }
+  .eb b { font-size:1.3rem; color:var(--txt); margin:0 3px; font-variant-numeric:tabular-nums; }
   .eb .eu, .egauge .eu { color:var(--dim); font-size:.54rem; }
-  #erate { font-size:.6rem; color:var(--txt); letter-spacing:.06em; }
+  #erate { font-size:.6rem; color:var(--txt); letter-spacing:.06em; flex:0 0 14px; height:14px; white-space:nowrap;
+         overflow:hidden; text-overflow:ellipsis;
+         font-variant-numeric:tabular-nums; }
   #eintel { font-size:.6rem; color:var(--amb); letter-spacing:.04em;
-            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #euid { font-size:.56rem; color:#31c8ff; border:1px solid #31c8ff;
-          border-radius:3px; padding:0 5px; align-self:flex-start;
-          letter-spacing:.08em; }
+            white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+            flex:0 0 14px; height:14px; font-variant-numeric:tabular-nums; }
+  #euid { display:flex; gap:6px; align-items:center; align-self:flex-start;
+          flex:0 0 18px; height:18px; overflow:hidden; }
+  .armb { color:#fff; background:var(--red); border-radius:3px; padding:0 6px;
+          font-size:.56rem; letter-spacing:.1em; animation:pulse 1s infinite; }
+  .armb.sm { font-size:.5rem; padding:0 4px; }
   #etick { flex:1 1 0; min-height:0; overflow:hidden; font-size:.54rem;
            line-height:1.5; color:var(--dim); }
   #etick .evl { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -1758,12 +1778,19 @@ PAGE = """<!DOCTYPE html>
              border-radius:1px; }
   .stk.dim .stkfill { background:#4a5a4a; }
   .stk.dim i, .stk.dim b { opacity:.5; }
-  .stk b { font-size:.5rem; color:var(--txt); font-weight:normal; }
+  .stk b { font-size:.5rem; color:var(--txt); font-weight:normal;
+           font-variant-numeric:tabular-nums; }
   .evl .etag { display:inline-block; min-width:34px; margin-right:5px; }
-  .evl.k-sync .etag { color:#31c8ff; }
+  /* Event color code: sync/flrc_sync cyan, lock green, unlock/linkstats
+     amber, aircraft telemetry white, OSINT events magenta, errors red. */
+  .evl.k-sync .etag, .evl.k-flrc_sync .etag { color:#31c8ff; }
   .evl.k-lock .etag { color:var(--grn); }
-  .evl.k-unlock .etag, .evl.k-error .etag { color:var(--red); }
-  .evl.k-gps .etag, .evl.k-batt .etag { color:var(--amb); }
+  .evl.k-unlock .etag, .evl.k-linkstats .etag { color:var(--amb); }
+  .evl.k-gps .etag, .evl.k-batt .etag, .evl.k-atti .etag,
+  .evl.k-fm .etag { color:var(--txt); }
+  .evl.k-fp .etag, .evl.k-uid_cracked .etag, .evl.k-uid2_crack .etag,
+  .evl.k-uid2_crack_failed .etag { color:#ff3ac8; }
+  .evl.k-error .etag { color:var(--red); }
   .evl .eage { color:var(--dim); margin-left:5px; }
   /* ELRS tab: gauges on top, sparkline middle, intel + log bottom. */
   #view-elrs { flex:1 1 0; min-height:0; display:none; flex-direction:column;
@@ -1771,14 +1798,43 @@ PAGE = """<!DOCTYPE html>
                border-radius:6px; overflow:hidden;
                background-image:repeating-linear-gradient(90deg,rgba(57,255,106,.03) 0 1px,transparent 1px 24px),
                                 repeating-linear-gradient(0deg,rgba(57,255,106,.03) 0 1px,transparent 1px 24px); }
-  .etop { flex:0 0 auto; display:flex; align-items:center; gap:22px;
-          flex-wrap:wrap; padding:14px 18px; border-bottom:1px solid var(--dim); }
-  .egauge { text-align:center; }
-  .egauge b { display:block; font-size:1.9rem; color:var(--txt); }
-  #xemeta { font-size:.62rem; color:var(--txt); letter-spacing:.06em;
-            line-height:1.7; }
-  #xemeta .k { color:var(--dim); }
-  .sticks.big { flex:1 1 220px; max-width:420px; }
+  .etop { flex:0 0 96px; height:96px; display:flex; align-items:center; gap:22px;
+          flex-wrap:nowrap; overflow:hidden; padding:0 18px;
+          border-bottom:1px solid var(--dim); }
+  .egauge { flex:0 0 84px; text-align:center; overflow:hidden; }
+  .egauge b { display:block; font-size:1.9rem; color:var(--txt);
+              font-variant-numeric:tabular-nums; }
+  .gsub { display:block; font-style:normal; font-size:.54rem; color:var(--dim);
+          letter-spacing:.06em; min-height:.7rem; white-space:nowrap;
+          overflow:hidden; font-variant-numeric:tabular-nums; }
+  /* ELRS tab link header: state dot, rate/iq, lock badge, ARMED tag, UID
+     alias chip, hop-follow indicator. FIXED height; conditional items keep
+     their slots via visibility + reserved widths (never display:none), so
+     badges appearing never push neighbors. */
+  #elinkhdr { flex:0 0 34px; height:34px; display:flex; align-items:center;
+              gap:12px; flex-wrap:nowrap; overflow:hidden; padding:0 18px;
+              font-size:.66rem; letter-spacing:.08em;
+              border-bottom:1px solid var(--dim);
+              font-variant-numeric:tabular-nums; }
+  #elinkhdr .esp { flex:1 1 auto; }
+  #xehinfo { color:var(--txt); white-space:nowrap; }
+  #xeuidwrap { flex:0 0 auto; min-width:110px; min-height:18px;
+               text-align:right; }
+  #xearm { flex:0 0 54px; box-sizing:border-box; text-align:center; }
+  .ebadge { padding:0 8px; border-radius:3px; border:1px solid var(--dim);
+            color:var(--dim); font-size:.58rem; letter-spacing:.12em; }
+  .ebadge.lock { color:var(--grn); border-color:var(--grn);
+                 text-shadow:0 0 6px rgba(57,255,106,.6); }
+  .ebadge.sweep { color:var(--amb); border-color:var(--amb); }
+  .followb { flex:0 0 auto; min-width:196px; box-sizing:border-box;
+             display:inline-block; text-align:center;
+             padding:0 8px; border-radius:3px; border:1px solid #31c8ff;
+             color:#31c8ff; font-size:.58rem; letter-spacing:.1em; }
+  #xestickwrap { flex:1 1 220px; max-width:420px; position:relative; }
+  .staletag { position:absolute; top:-7px; right:0; font-size:.5rem;
+              letter-spacing:.14em; color:var(--amb); border:1px solid var(--amb);
+              border-radius:3px; padding:0 4px; background:var(--panel); }
+  .sticks.big { width:100%; }
   .sticks.big .stk .stkbar { height:14px; }
   .sticks.big .stk i, .sticks.big .stk b { font-size:.56rem; }
   .emid { flex:1 1 0; min-height:80px; position:relative;
@@ -1786,14 +1842,44 @@ PAGE = """<!DOCTYPE html>
   #espark { position:absolute; inset:0; width:100%; height:100%; }
   .esptitle { position:absolute; top:6px; left:14px; font-size:.58rem;
               letter-spacing:.16em; color:var(--dim); pointer-events:none; }
-  .ebot { flex:0 0 auto; display:flex; max-height:38%;
+  /* Telemetry grid: label:value cards (GPS/batt/atti/fm + linkstats), each
+     with its value age. ALL cards always render (dim — placeholder when
+     empty) at a FIXED height; the note slot is always reserved
+     (visibility-toggled), so arrivals never reflow the grid. Stacks 2-col
+     on mobile (media query below). */
+  .etlm { flex:0 0 auto; display:grid; grid-template-columns:repeat(3,1fr);
+          gap:8px; padding:8px 14px; border-bottom:1px solid var(--dim); }
+  .etcard { min-width:0; height:56px; overflow:hidden;
+            border:1px solid rgba(51,80,47,.5); border-radius:5px; padding:5px 10px;
+            box-sizing:border-box;
+            background:rgba(57,255,106,.03); font-size:.6rem; line-height:1.5; }
+  .etcard .etk { color:var(--dim); font-size:.56rem; letter-spacing:.12em; }
+  .etcard .etv { color:var(--txt); font-size:.66rem; letter-spacing:.04em; margin-top:1px;
+               white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+               font-variant-numeric:tabular-nums; }
+  .etcard .etv b { color:var(--grn); }
+  .etcard .etna { color:var(--dim); }
+  .etcard .etage { color:var(--dim); margin-left:6px; letter-spacing:.04em;
+                   font-size:.52rem; }
+  .etcard .etsub { color:var(--dim); font-size:.52rem; letter-spacing:.04em;
+                   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ecopy { font:inherit; font-size:.56rem; padding:0 4px; margin-left:4px;
+           background:var(--panel); color:var(--dim);
+           border:1px solid var(--dim); border-radius:3px; cursor:pointer;
+           vertical-align:1px; }
+  .ecopy:active { color:var(--grn); border-color:var(--grn); }
+  #etnote { grid-column:1 / -1; height:26px; box-sizing:border-box; overflow:hidden;
+          visibility:hidden; white-space:nowrap; text-overflow:ellipsis;
+          border:1px solid var(--amb); border-radius:5px;
+          padding:4px 10px; color:var(--amb); font-size:.62rem;
+          letter-spacing:.06em; }
+  #etnote.sweep { border-color:var(--dim); color:var(--dim); }
+  /* Event log + encounters: FIXED-height row, each pane scrolls internally;
+     entry count never changes the container. */
+  .ebot { flex:0 0 30%; min-height:110px; display:flex;
           border-top:none; }
-  #eintelpanel { flex:1 1 0; min-width:0; padding:8px 14px; font-size:.64rem;
-                 line-height:1.7; border-right:1px solid var(--dim);
-                 overflow:auto; }
-  #eintelpanel .k { color:var(--dim); display:inline-block; min-width:64px; }
   #elog { flex:1 1 0; min-width:0; padding:8px 14px; font-size:.58rem;
-          line-height:1.6; overflow:auto; }
+          line-height:1.6; overflow-y:auto; }
   #elog .evl { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #elog .ets { color:var(--dim); margin-right:6px; }
   .tabs { flex:0 0 auto; display:flex; gap:6px; align-items:flex-end;
@@ -1808,7 +1894,8 @@ PAGE = """<!DOCTYPE html>
   #detchip { font-size:.52rem; letter-spacing:.08em; color:var(--amb);
              border:1px solid var(--dim); border-radius:3px; padding:0 5px; }
   #elrschip { font-size:.52rem; letter-spacing:.08em; color:var(--dim);
-              border:1px solid var(--dim); border-radius:3px; padding:0 5px; }
+              border:1px solid var(--dim); border-radius:3px; padding:0 5px;
+              display:inline-block; min-width:44px; text-align:center; }
   #elrschip.sweep { color:var(--amb); border-color:var(--amb); }
   #elrschip.lock { color:var(--grn); border-color:var(--grn); }
   #view-dets { flex:1 1 0; min-height:0; display:none; flex-direction:column;
@@ -1956,10 +2043,13 @@ PAGE = """<!DOCTYPE html>
     #gwrap, #swrap, #ewrap { flex:0 0 86%; min-height:0;
                              scroll-snap-align:center; }
     #swrap { border-left:none; }
-    .etop { gap:12px; padding:10px 12px; }
+    .etop { gap:12px; padding:0 12px; }
+    .egauge { flex:0 0 62px; }
     .egauge b { font-size:1.3rem; }
-    .ebot { flex-direction:column; max-height:none; overflow:auto; }
-    #eintelpanel { border-right:none; border-bottom:1px solid var(--dim); }
+    .etlm { grid-template-columns:repeat(2,1fr); gap:6px; padding:6px 10px; }
+    #elinkhdr { gap:8px; padding:0 12px; font-size:.6rem; }
+    .followb { min-width:160px; }
+    .ebot { flex:0 0 220px; flex-direction:column; overflow:auto; }
     #gtitle, #fstitle { font-size:.58rem; }
     #gcur b { font-size:1.1rem; }
     .detbar { gap:8px; padding:6px 8px; }
@@ -2067,23 +2157,41 @@ PAGE = """<!DOCTYPE html>
   <div id="erate">--</div>
   <div id="esticks" class="sticks"></div>
   <div id="eintel">--</div>
-  <div id="euid" style="display:none"></div>
+  <div id="euid" style="visibility:hidden"></div>
   <div id="etick"></div>
 </div>
 </div>
 </div>
 <div id="view-elrs">
+  <div id="elinkhdr">
+    <span id="xedot"></span>
+    <span id="xehinfo">--</span>
+    <span id="xelockb" class="ebadge">--</span>
+    <span class="esp"></span>
+    <span id="xeuidwrap"></span>
+    <span id="xearm" class="armb" style="visibility:hidden">ARMED</span>
+    <span id="xefollow" class="followb" style="visibility:hidden"></span>
+  </div>
   <div class="etop">
-    <div class="egauge"><span class="ek">RSSI</span><b id="xerssi">--</b><span class="eu">dBm</span></div>
+    <div class="egauge"><span class="ek">RSSI</span><b id="xerssi">--</b><span class="eu">dBm</span><i class="gsub" id="xerssinow"></i></div>
     <div class="egauge"><span class="ek">LQ</span><b id="xelq">--</b><span class="eu">%</span></div>
     <div class="egauge"><span class="ek">SNR</span><b id="xesnr">--</b><span class="eu">dB</span></div>
-    <div class="egauge"><span class="ek">PPS</span><b id="xepps">--</b><span class="eu">pkt/s</span></div>
-    <div id="xemeta"></div>
-    <div id="xesticks" class="sticks big"></div>
+    <div class="egauge"><span class="ek">PPS</span><b id="xepps">--</b><span class="eu">pkt/s</span><i class="gsub" id="xerx"></i></div>
+    <div id="xestickwrap">
+      <div id="xesticks" class="sticks big"></div>
+      <div id="xestale" class="staletag" style="visibility:hidden">STALE</div>
+    </div>
   </div>
   <div class="emid"><canvas id="espark"></canvas><div class="esptitle">RSSI / LQ // 60S</div></div>
+  <div class="etlm">
+    <div class="etcard" id="etgps"></div>
+    <div class="etcard" id="etbatt"></div>
+    <div class="etcard" id="etatti"></div>
+    <div class="etcard" id="etfm"></div>
+    <div class="etcard" id="etls"></div>
+    <div id="etnote"></div>
+  </div>
   <div class="ebot">
-    <div id="eintelpanel"></div>
     <div id="eenc"></div>
     <div id="elog"></div>
   </div>
@@ -2695,17 +2803,34 @@ function fmtEv(ev) {
     case 'radio_up': return 'recovered';
     case 'error': return (ev.what || '?') + ' ' + (ev.detail || '');
     case 'probe': return (ev.set || ev.info || '') + (ev.ok ? ' ok' : '');
+    case 'event':
+      switch (ev.what) {
+        case 'fp': return 'band=' + (ev.band || '?') + ' tail=' +
+                          (ev.uid_tail || '?');
+        case 'flrc_sync': return 'uid_pkt=' + (ev.uid_pkt || '?') +
+                          ' phrase=' + (ev.uid_phrase || '?') +
+                          (ev.match ? ' MATCH' : ' no-match');
+        case 'uid2_crack': return 'uid2=' + ev.uid2 + ' valids=' + ev.valids;
+        case 'uid_cracked': return 'UID=' + (ev.uid || '?');
+        case 'uid2_crack_failed': return 'UID[2] candidates exhausted';
+        case 'uid': return 'bind phrase applied';
+        default: return ev.what || '';
+      }
     default: return '';
   }
 }
+/* Class key for color-coding: t="event" lines classify by their `what`
+   (fp/uid_cracked/uid2_crack/flrc_sync are the OSINT events -> magenta). */
+const evKey = ev => ev.t === 'event' ? (ev.what || 'event') : (ev.t || '?');
 const evLine = (ev, stamp) =>
-  '<div class="evl k-' + esc(ev.t || '?') + '">' +
+  '<div class="evl k-' + esc(evKey(ev)) + '">' +
   (stamp ? '<span class="ets">' + esc(stamp) + '</span>' : '') +
-  '<span class="etag">' + esc((ev.t || '?').toUpperCase()) + '</span>' +
+  '<span class="etag">' + esc(evKey(ev).toUpperCase()) + '</span>' +
   esc(fmtEv(ev)) +
   (ev.age_s !== undefined ? '<span class="eage">' + ev.age_s.toFixed(0) + 's</span>' : '') +
   '</div>';
-/* Latest intel items (GPS/batt/atti/mode/uplink) as one-line strings. */
+/* Latest intel items for the LIVE-tab card, preference-ordered:
+   GPS -> batt -> fm -> atti -> linkstats (model-reported uplink). */
 function intelItems(e) {
   const t = (e && e.tlm) || {}, out = [];
   if (t.gps) out.push('GPS ' + (t.gps.lat_e7 / 1e7).toFixed(5) + ',' +
@@ -2713,12 +2838,12 @@ function intelItems(e) {
     (t.gps.spd_kmh10 / 10).toFixed(0) + 'km/h');
   if (t.batt) out.push('BATT ' + (t.batt.v10 / 10).toFixed(1) + 'V · ' +
     (t.batt.a10 / 10).toFixed(1) + 'A · ' + t.batt.mah + 'mAh');
+  if (t.fm) out.push('MODE ' + t.fm.m);
   if (t.atti) out.push('ATTI p' + (t.atti.p / 10000 * 57.3).toFixed(0) +
     ' r' + (t.atti.r / 10000 * 57.3).toFixed(0) +
     ' y' + (t.atti.y / 10000 * 57.3).toFixed(0));
-  if (t.fm) out.push('MODE ' + t.fm.m);
-  if (t.linkstats) out.push('UPLINK lq=' + t.linkstats.lq + ' rssi=' +
-    t.linkstats.rssi1 + '/' + t.linkstats.rssi2 + ' snr=' + t.linkstats.snr);
+  if (t.linkstats) out.push('UPLINK lq=' + t.linkstats.lq + ' rssi2=' +
+    t.linkstats.rssi2 + ' snr=' + t.linkstats.snr);
   return out;
 }
 let elrsHist = [];                     // {t, rssi, lq} per poll, 60 s window
@@ -2757,6 +2882,61 @@ function updElrsEnc(on, lock, rssi, lq, uid) {
     (elrsEncOpen ? encLine(elrsEncOpen) : '') +
     elrsEnc.slice().reverse().map(encLine).join('');
 }
+/* Telemetry cards: each label:value card carries its value age (dim "Ns ago" beyond 5 s)
+   and degrades to a dim placeholder; values are latest-of-type from the backend
+   (tlm dict never expires, so presence == arrived at least once since connect). */
+const etAge = a => (typeof a === 'number' && a > 5)
+  ? '<span class="etage">' + Math.round(a) + 's ago</span>' : '';
+function etCard(id, label, valHtml, sub, age) {
+  document.getElementById(id).innerHTML =
+    '<div class="etk">' + esc(label) + etAge(age) + '</div>' +
+    '<div class="etv">' + valHtml + '</div>' +
+    (sub ? '<div class="etsub">' + esc(sub) + '</div>' : '');
+}
+function updElrsTlm(e, on) {
+  const t = (e && e.tlm) || {}, na = '<span class="etna">—</span>';
+  let gpsHtml, gpsAge = t.gps && t.gps.age_s;
+  if (!t.gps) gpsHtml = '<span class="etna">—</span>';
+  else if (!t.gps.lat_e7 && !t.gps.lon_e7)
+    gpsHtml = '<span class="etna">no GPS lock</span>';
+  else {
+    const la = (t.gps.lat_e7 / 1e7).toFixed(5),
+          lo = (t.gps.lon_e7 / 1e7).toFixed(5);
+    gpsHtml = esc(la + ',' + lo) + ' · ' + esc(t.gps.sats) + 'sat · ' +
+      (t.gps.spd_kmh10 / 10).toFixed(0) + 'km/h' +
+      ' <button class="ecopy" data-coords="' + la + ',' + lo +
+      '" title="copy coordinates">&#128203;</button>';
+  }
+  etCard('etgps', 'GPS', gpsHtml, '', gpsAge);
+  etCard('etbatt', 'BATTERY', t.batt ?
+    '<b>' + (t.batt.v10 / 10).toFixed(1) + 'V</b> · ' +
+    (t.batt.a10 / 10).toFixed(1) + 'A · ' + esc(t.batt.mah) + 'mAh' : na,
+    '', t.batt && t.batt.age_s);
+  etCard('etatti', 'ATTITUDE', t.atti ?
+    'p<b>' + (t.atti.p / 10000 * 57.3).toFixed(0) + '°</b> r<b>' +
+    (t.atti.r / 10000 * 57.3).toFixed(0) + '°</b> y<b>' +
+    (t.atti.y / 10000 * 57.3).toFixed(0) + '°</b>' : na,
+    '', t.atti && t.atti.age_s);
+  etCard('etfm', 'FLIGHT MODE', t.fm ? '<b>' + esc(t.fm.m) + '</b>' : na,
+    '', t.fm && t.fm.age_s);
+  etCard('etls', 'LINKSTATS // MODEL', t.linkstats ?
+    'lq <b>' + esc(t.linkstats.lq) + '</b> · rssi <b>' +
+    esc(t.linkstats.rssi1) + '/' + esc(t.linkstats.rssi2) + '</b> · snr <b>' +
+    esc(t.linkstats.snr) + '</b>' : na,
+    "reported by the model's receiver (uplink at the aircraft, not the sniffer)",
+    t.linkstats && t.linkstats.age_s);
+  // Empty-state honesty: locked with zero aircraft telemetry ever, or
+  // sweeping. The note slot is always reserved (visibility, fixed height).
+  const note = document.getElementById('etnote');
+  if (on && !e.lock) {
+    note.style.visibility = 'visible'; note.className = 'sweep';
+    note.textContent = 'sweeping — waiting for link';
+  } else if (on && !(t.gps || t.batt || t.atti || t.fm)) {
+    note.style.visibility = 'visible'; note.className = 'warn';
+    note.textContent = "pilot's telemetry is OFF — control link data only " +
+                       '(sticks + linkstats)';
+  } else note.style.visibility = 'hidden';
+}
 function updElrs(e, set) {
   const dot = document.getElementById('edot');
   const chip = document.getElementById('elrschip');
@@ -2776,29 +2956,44 @@ function updElrs(e, set) {
   set('eintel', on ? (items.length ?
         items[Math.floor(Date.now() / 2000) % items.length] : 'listening...')
                    : '--');
-  const uidEl = document.getElementById('euid');
-  uidEl.style.display = on && e.uid ? '' : 'none';
-  uidEl.textContent = 'UID ' + (e.uid || '');
+  // Card: UID alias chip + ARMED marker (slot is fixed-height and kept via
+  // visibility, so the card layout never shifts when they appear).
+  const euid = document.getElementById('euid');
+  euid.style.visibility = on && (e.uid || e.arm) ? 'visible' : 'hidden';
+  euid.innerHTML = on ?
+    (e.uid ? droneChip('elrs:' + String(e.uid).toLowerCase(), e.uid) : '') +
+    (e.arm ? '<span class="armb sm">ARMED</span>' : '') : '';
   document.getElementById('etick').innerHTML =
     on ? (e.last_events || []).slice(-3).reverse().map(ev => evLine(ev)).join('') : '';
-  // ELRS tab gauges + meta
+  // ELRS tab link header: dot, rate/iq, lock badge, ARMED tag, UID alias chip, FOLLOWING chip.
+  document.getElementById('xedot').className = on ? (e.lock ? 'lock' : 'sweep') : '';
+  set('xehinfo', on ? (e.rate || '--') + ' · iq ' + (e.iq || '-') : 'no dongle');
+  const lb = document.getElementById('xelockb');
+  lb.textContent = on ? (e.lock ? 'LOCK' : 'SWEEP') : 'OFFLINE';
+  lb.className = 'ebadge ' + (on ? (e.lock ? 'lock' : 'sweep') : 'off');
+  document.getElementById('xearm').style.visibility =
+    on && e.arm ? 'visible' : 'hidden';
+  const fp = e.uid ? 'elrs:' + String(e.uid).toLowerCase() : null;
+  document.getElementById('xeuidwrap').innerHTML = on && fp ?
+    droneChip(fp, 'elrs:' + e.uid) : '';
+  const follow = !!(on && e.lock && typeof e.freq === 'number' && e.freq > 0 &&
+                    e.fhss !== null && e.fhss !== undefined && e.fhss !== 255);
+  const fol = document.getElementById('xefollow');
+  fol.style.visibility = follow ? 'visible' : 'hidden';
+  if (follow)
+    fol.textContent = 'FOLLOWING ' + (e.freq / 1e6).toFixed(1) + ' MHz · fhss ' + e.fhss;
+  // Tab gauges (+ secondary lines: rssi_now, raw rx/s) + sticks.
   set('xerssi', on ? (rssi === null ? '--' : rssi) : '--');
+  set('xerssinow', on ? 'now ' + (numv(e.rssi_now) === null ? '--' : e.rssi_now) : '');
   set('xelq', on ? numv(e.lq) ?? '--' : '--');
   set('xesnr', on ? (numv(e.snr) === null ? '--' : e.snr) : '--');
   set('xepps', on ? (e.pps || 0) : '--');
-  document.getElementById('xemeta').innerHTML = on ?
-    '<span class="k">RATE </span>' + esc(e.rate || '-') + '<br>' +
-    '<span class="k">IQ </span>' + esc(e.iq || '-') + '<br>' +
-    '<span class="k">LOCK </span>' + (e.lock ? 'YES' : 'no') + '<br>' +
-    '<span class="k">ARM </span>' + (e.arm ? 'ARMED' : 'disarmed') + '<br>' +
-    '<span class="k">UID </span>' + esc(e.uid || '-') + '<br>' +
-    '<span class="k">PORT </span>' + esc(e.port || '-') : 'dongle offline';
+  set('xerx', on && numv(e.rx_per_s) !== null ? e.rx_per_s + ' rx/s raw' : '');
   document.getElementById('xesticks').innerHTML = stickHtml(on ? e.ch : null, on && e.lock);
-  document.getElementById('eintelpanel').innerHTML = intelItems(e).map(s => {
-    const sp = s.indexOf(' ');
-    return '<div><span class="k">' + esc(s.slice(0, sp)) + '</span> ' +
-           esc(s.slice(sp + 1)) + '</div>';
-  }).join('') || '<div><span class="k">—</span> no telemetry decoded yet</div>';
+  const allZero = !(e && e.ch || []).some(v => v > 0);
+  document.getElementById('xestale').style.visibility =
+    on && (!e.lock || allZero) ? 'visible' : 'hidden';
+  updElrsTlm(e, on);
   // Scrolling event log: append only events newer than the last seen seq.
   (on ? e.last_events || [] : []).forEach(ev => {
     if (ev.seq > elogSeen) {
@@ -2862,6 +3057,26 @@ function drawElrsSpark() {
   x.stroke();
 }
 
+/* GPS card: 📋 copies "lat,lon" to the clipboard. */
+document.getElementById('etgps').addEventListener('click', e => {
+  const b = e.target.closest && e.target.closest('.ecopy');
+  if (!b) return;
+  const txt = b.getAttribute('data-coords') || '';
+  if (navigator.clipboard && navigator.clipboard.writeText)
+    navigator.clipboard.writeText(txt).then(() => toast('GPS copied: ' + txt),
+                                           () => toast('copy failed'));
+  else toast('clipboard unavailable');
+});
+/* UID chips (ELRS tab header + LIVE card) rename through the same alias
+   system as the DETECTIONS table (fingerprint elrs:<uid>). */
+['elinkhdr', 'euid'].forEach(id =>
+  document.getElementById(id).addEventListener('click', e => {
+    if (e.target.closest && !e.target.closest('.dedit')) {
+      const chip = e.target.closest('.dchip');
+      if (chip) droneRename(chip);
+    }
+  }));
+
 async function poll() {
   let s;
   const hdrs = geoFix ? { 'X-Geo': geoFix.lat + ',' + geoFix.lon + ',' +
@@ -2904,7 +3119,7 @@ async function poll() {
   // the lock state is obvious from the picture itself.
   vm.textContent = s.video_mode === 'sync' ? 'SYNC' : '';
   vm.className = 'vmode ' + (s.video_mode === 'sync' ? 'sync' : 'nosignal');
-  vm.style.display = s.video_mode === 'sync' ? '' : 'none';
+  vm.style.visibility = s.video_mode === 'sync' ? 'visible' : 'hidden';
   // Freshest sweep entry (min age_s): the scanner's current dwell channel
   // -- same source the spectrum/waterfall dwell markers use.
   let fresh = null;
