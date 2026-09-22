@@ -79,6 +79,11 @@ FRAME_HEARTBEAT_S = 30.0    # idle wake-up only; no frame is pushed unless
                             # frame_seq or the connection state changed
 MJPEG_KEEPALIVE_S = 1.0     # re-push the last REAL frame at ~1 Hz when the
                             # firmware frame flow stalls (never placeholder)
+ROW_SNAPSHOT_AFTER_S = 0.4  # partial frames: if rows keep arriving but no
+                            # bit0 completes a frame, snapshot the canvas
+                            # after this long so new video always surfaces
+ROWS_STALE_S = 3.0          # rows older than this mark the canvas stale
+                            # (amber border) instead of showing bright pixels
 ALLOWED_KEYS = set("gcCubamsd+-0fjkoOvx")
 KEY_MIN_INTERVAL_S = 0.1    # ~10/s max serial-writing rate across all endpoints
 DESIRED_TIMEOUT_S = 6.0     # give up on a toggle the firmware never confirms
@@ -162,6 +167,8 @@ class State:
         # content -- the same "display keeps old row" contract as the old
         # whole-frame format.
         self.row_buf = bytearray(WIDTH * HEIGHT)
+        self.row_time = 0.0          # monotonic time of the last row bytes
+        self.snap_seq = 0            # decreasing synthetic seq for snapshots
         self.frame_seq = -1
         self.frame_time = 0.0
         self.frame_times = []        # timestamps for FPS estimation
@@ -207,16 +214,28 @@ class State:
             "level_db": 0.0, "band": "-",
         }
 
-    def put_frame(self, payload: bytes, seq: int) -> None:
+    def put_frame(self, payload: bytes, seq: int, count_fps: bool = True) -> None:
         now = time.monotonic()
         with self.frame_cond:
             self.frame = payload
             self.frame_seq = seq
             self.frame_time = now
             self.preview_on = True   # flowing frames prove the stream is on
-            self.frame_times = [t for t in self.frame_times if now - t < 5.0]
-            self.frame_times.append(now)
+            if count_fps:
+                self.frame_times = [t for t in self.frame_times if now - t < 5.0]
+                self.frame_times.append(now)
             self.frame_cond.notify_all()
+
+    def publish_snapshot(self) -> None:
+        """Publish the current row canvas as a partial-frame snapshot.
+
+        Used by the MJPEG loop when rows keep arriving but no bit0 row
+        completes a frame (reconnecting/marginal video): the display must
+        track the newest received rows instead of freezing on the last
+        complete frame. Not counted in FPS -- only bit0 completions are.
+        """
+        self.snap_seq -= 1   # negative seqs can never collide with packet seqs
+        self.put_frame(bytes(self.row_buf), self.snap_seq, count_fps=False)
 
     def fps(self) -> float:
         with self.lock:
@@ -834,6 +853,7 @@ class SerialManager(threading.Thread):
                         continue
                     start = r.row_index * STATE.frame_w
                     STATE.row_buf[start:start + STATE.frame_w] = r.pixels
+                    STATE.row_time = time.monotonic()
                     if r.flags & 1:
                         frame = bytes(STATE.row_buf)
                         locked = bool(r.flags & 2)
@@ -911,12 +931,26 @@ def current_jpeg() -> bytes:
         dims = (STATE.frame_w, STATE.frame_h)
         connected = STATE.connected
         age = time.monotonic() - STATE.frame_time if frame else None
+        # Canvas freshness is measured from the ROW bytes, not the snapshot
+        # publishes: a partial stream snapshots every >=400 ms, which would
+        # keep `age` forever young while the picture itself is frozen.
+        rows_stale = bool(frame) and             (time.monotonic() - STATE.row_time) > ROWS_STALE_S
     # Placeholder only when genuinely disconnected or frameless for a long
     # stretch; as long as any frames flow (snow included), show the canvas.
     if frame is None or not connected or age > PLACEHOLDER_AFTER_S:
         return placeholder_jpeg()
     img = Image.frombytes("L", dims, frame)
+    if rows_stale:
+        # Old channel / gone drone: dim the picture and frame it amber so
+        # "this is stale" is obvious at a glance (no flicker during normal
+        # flow -- the marking appears once at the ROWS_STALE_S boundary).
+        img = img.point(lambda p: (p * 3) // 4)
     img = img.resize((dims[0] * SCALE, dims[1] * SCALE), Image.NEAREST)
+    if rows_stale:
+        img = img.convert("RGB")
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([0, 0, img.width - 1, img.height - 1],
+                       outline=(255, 176, 0), width=SCALE)
     return make_jpeg(img)
 
 
@@ -928,16 +962,25 @@ def mjpeg_stream():
     # frame is the current image (received and not yet stale), a stalled
     # frame flow re-pushes that frame at ~1 Hz so the browser feed never
     # looks dead; the placeholder path stays push-once.
+    #
+    # Partial frames: reconnecting video whose frames never complete (no
+    # bit0 row) must still surface -- if rows have arrived since the last
+    # publish and ROW_SNAPSHOT_AFTER_S has passed, snapshot the canvas now.
+    # The wait is short enough (250 ms) that the gate fires within one tick
+    # of its deadline even when no further packets arrive.
     last_seq = -1
     last_conn = None
     last_push = 0.0
     while True:
         with STATE.frame_cond:
             if STATE.frame_seq == last_seq and STATE.connected == last_conn:
-                STATE.frame_cond.wait(timeout=MJPEG_KEEPALIVE_S)
+                STATE.frame_cond.wait(timeout=0.25)
             changed = (STATE.frame_seq != last_seq or
                        STATE.connected != last_conn)
             now = time.monotonic()
+            if not changed and STATE.connected and                     STATE.row_time > STATE.frame_time and                     now - STATE.frame_time >= ROW_SNAPSHOT_AFTER_S:
+                STATE.publish_snapshot()
+                changed = True
             has_real = (STATE.frame is not None and STATE.connected and
                         now - STATE.frame_time <= PLACEHOLDER_AFTER_S)
             keepalive = (not changed and has_real and
