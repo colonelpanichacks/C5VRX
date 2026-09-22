@@ -69,6 +69,11 @@ static const char *TAG = "c5vrx3_preview";
 
 #define SYNC_FEED_STALE_US  1500000   /* no sync frame complete for 1.5 s -> snow */
 #define USB_WRITE_BUDGET_US   60000   /* drop/skip instead of stalling longer */
+#define DRAIN_ABANDON_US     500000   /* wall-time bound on a stuck frame-final
+                                         * retry: then the frame is abandoned
+                                         * (counted once in drop=) and row flow
+                                         * resumes, so a wedged final packet can
+                                         * never silence the pane for good */
 #define FRAME_MIN_INTERVAL_US 66000   /* 15 fps frame-level cap: full-rate row
                                          * bursts (~1.1 MB/s at 30-50 fields/s)
                                          * correlate with USB-Serial/JTAG
@@ -124,6 +129,7 @@ static unsigned s_nrows;        /* staged row records (<= ROW_BATCH) */
 static bool s_draining;         /* previous frame's final packet not yet sent:
                                    rows of the current frame are dropped and
                                    the buffered final packet is retried first */
+static int64_t  s_draining_since_us;    /* when s_draining armed (DRAIN_ABANDON_US bound) */
 static uint32_t s_rows_sent;
 static uint32_t s_rows_dropped;
 static int64_t  s_last_frame_done_us;   /* final row of the last published frame out */
@@ -282,7 +288,10 @@ static void row_stage(uint8_t row_index, const uint8_t *row, bool last, bool loc
     memcpy(rec + 2u, row, GRAB_W);
     ++s_nrows;
     if (s_nrows >= ROW_BATCH || last) {
-        if (!rows_send_staged(last) && last) s_draining = true;
+        if (!rows_send_staged(last) && last) {
+            s_draining = true;
+            s_draining_since_us = esp_timer_get_time();
+        }
         if (last && !s_draining) {
             s_last_sync_publish_us = esp_timer_get_time();
             s_last_frame_done_us = s_last_sync_publish_us;
@@ -377,6 +386,7 @@ static void preview_reset_counters(void)
     s_grab_max_us = 0;
     s_last_frame_done_us = 0;
     s_pace_drop = false;
+    s_draining_since_us = 0;
 }
 
 /* One task pass: retry a stuck final packet, then a bounded grab attempt,
@@ -403,10 +413,19 @@ static void preview_tick(void)
 
     /* The previous frame never finished on the wire: retry its final packet
      * first; rows of this frame are dropped until it gets out. */
-    if (s_draining && rows_send_staged(true)) {
-        s_draining = false;
-        s_last_sync_publish_us = esp_timer_get_time();
-        s_last_frame_done_us = s_last_sync_publish_us;
+    if (s_draining) {
+        if (esp_timer_get_time() - s_draining_since_us > (int64_t)DRAIN_ABANDON_US) {
+            /* Hard bound: the stuck frame's final packet never got out.
+             * Abandon it -- count the buffered rows once -- and resume row
+             * flow immediately so video can never stay wedged off the wire. */
+            s_rows_dropped += s_nrows;
+            s_nrows = 0u;
+            s_draining = false;
+        } else if (rows_send_staged(true)) {
+            s_draining = false;
+            s_last_sync_publish_us = esp_timer_get_time();
+            s_last_frame_done_us = s_last_sync_publish_us;
+        }
     }
 
     /* 15 fps frame-level cap: drop this frame's rows if the previous
@@ -437,7 +456,15 @@ static void preview_tick(void)
     s_last.pal = info.pal;
     if (info.fields > 0) s_field_count += (uint32_t)info.fields;
     if (info.error) ++s_errs;
-    s_h_locked = (rows == GRAB_H && info.error == NULL);
+    const bool now_locked = (rows == GRAB_H && info.error == NULL);
+    if (now_locked && !s_h_locked) {
+        /* Unlock->lock transition: reset the pacing stamp so the first
+         * frame of a new session publishes immediately. (A stale stamp
+         * cannot actually suppress -- the gate only drops frames when
+         * < 66 ms elapsed -- but the reset removes the up-to-66 ms wait.) */
+        s_last_frame_done_us = 0;
+    }
+    s_h_locked = now_locked;
     if (s_h_locked) ++s_frames_completed;
 
     /* Incomplete grab (a row was given up or the timeout hit): the rows
@@ -447,8 +474,10 @@ static void preview_tick(void)
         /* Incomplete grab: the staged tail ends the frame here. Its lock
          * badge reflects the last grab state (transitions may lag a frame). */
         s_rows[s_nrows - 1u][1] |= (uint8_t)(1u | (s_h_locked ? 2u : 0u));
-        if (!rows_send_staged(true)) s_draining = true;
-        else {
+        if (!rows_send_staged(true)) {
+            s_draining = true;
+            s_draining_since_us = esp_timer_get_time();
+        } else {
             s_last_sync_publish_us = esp_timer_get_time();
             s_last_frame_done_us = s_last_sync_publish_us;
         }
