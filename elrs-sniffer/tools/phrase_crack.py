@@ -93,6 +93,70 @@ jill joan joanna joel jonah jordan jorge josephine joy judith julia julian
 
 BUILTIN_WORDS = DEFAULT_PHRASES + FPV_WORDS + FIRST_NAMES
 
+# ---------------------------------------------------------------------------
+# Factory-fixed UID intelligence (checked BEFORE any hashing — instant).
+# Stock firmware with NO binding phrase uses a MAC-derived UID, not a phrase —
+# these are not crackable, they are *recognized*. Add new factory dumps to
+# tools/factory_uids.json (same format: {"hexuid": "label"}); it is loaded
+# and merged over this built-in table when present.
+FACTORY_UIDS = {
+    "0000609e0b58": "HappyModel stock batch (Mobula6/Crux3/Mobula7 ELRS, factory default)",
+    "000096af1f7c": "HappyModel stock batch 2 (Mobula6 ELRS)",
+}
+
+# Brand-default binding phrases (official per-brand defaults; the classic
+# "never changed it" cases). Tagged for labeled match output. Verified:
+# iloveiflight -> UID 12ce9b6e75c4 (md5 self-check path).
+BRAND_DEFAULTS = [
+    ("iloveiflight", "iFlight official default (Commando8 + iFlight BNF line)"),
+    ("happymodel", "HappyModel"), ("betafpv", "BetaFPV"), ("radiomaster", "RadioMaster"),
+    ("jumper", "Jumper"), ("geprc", "GEPRC"), ("iflight", "iFlight"), ("emax", "EMAX"),
+    ("flywoo", "Flywoo"), ("darwinfpv", "DarwinFPV"), ("eachine", "Eachine"),
+    ("hqprop", "HQProp"), ("tbs", "Team BlackSheep"), ("teamblacksheep", "Team BlackSheep"),
+    ("mobula6", "HappyModel Mobula6"), ("mobula7", "HappyModel Mobula7"),
+    ("mobula8", "HappyModel Mobula8"), ("crux3", "HappyModel Crux3"),
+    ("tinyhawk", "EMAX Tinyhawk"), ("tinyhawk2", "EMAX Tinyhawk II"),
+    ("tinyhawk3", "EMAX Tinyhawk III"), ("cetus", "BETAFPV Cetus"),
+    ("cetusx", "BETAFPV Cetus X"), ("cetuspro", "BETAFPV Cetus Pro"),
+    ("meteor65", "BETAFPV Meteor65"), ("meteor75", "BETAFPV Meteor75"),
+    ("meteor85", "BETAFPV Meteor85"), ("commando8", "iFlight Commando8"),
+    ("zorro", "RadioMaster Zorro"), ("boxer", "RadioMaster Boxer"),
+    ("tpro", "RadioMaster T-Pro"), ("t20", "RadioMaster T20"), ("pocket", "RadioMaster Pocket"),
+    ("literradio", "RadioMaster LiteRadio"), ("avatar", "Walksnail Avatar"),
+    ("o4", "DJI O4"), ("spektrum", "Spektrum"), ("futaba", "Futaba"), ("frsky", "FrSky"),
+    ("fatshark", "FatShark"), ("walksnail", "Walksnail"), ("hdzero", "HDZero"),
+    ("orqa", "Orqa"), ("dji", "DJI"), ("fpv", "FPV"), ("freestyle", "freestyle"),
+    ("cinewhoop", "cinewhoop"), ("longrange", "longrange"), ("tinywhoop", "Tiny Whoop"),
+    ("drone", "drone"), ("racing", "racing"), ("acro", "acro"),
+]
+
+
+def load_factory_uids():
+    import json
+    import os
+    table = dict(FACTORY_UIDS)
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "factory_uids.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                table.update({k.lower(): v for k, v in json.load(f).items()})
+        except Exception as e:
+            print("warning: factory_uids.json unreadable (%s); using built-in table" % e)
+    return table
+
+
+def brand_label(phrase):
+    """Map a matched phrase back to a BRAND_DEFAULTS label (base word + suffix)."""
+    p = phrase.lower()
+    for w, label in sorted(BRAND_DEFAULTS, key=lambda x: -len(x[0])):
+        if not p.startswith(w):
+            continue
+        rest = p[len(w):]
+        if rest == "" or rest in SUFFIXES or rest.isdigit() or \
+                (rest.startswith("_") and rest[1:].isdigit()):
+            return "BRAND DEFAULT (%s): %s" % (label.split(" ")[0], phrase)
+    return None
+
 
 # ---------------------------------------------------------------------------
 def leet_variants(word):
@@ -240,6 +304,9 @@ def main():
     ap.add_argument("uids", nargs="*", help="UID hex strings (full 6-byte or tail)")
     ap.add_argument("--uids", dest="uidfile", help="file with one UID per line")
     ap.add_argument("--wordlist", dest="wordlist", help="custom wordlist file")
+    ap.add_argument("--rockyou", dest="rockyou",
+                    help="path to a local rockyou-format wordlist (never bundled; "
+                         "e.g. Kali /usr/share/wordlists/rockyou.txt or SecLists)")
     ap.add_argument("--leet", action="store_true", help="l33tspeak variants")
     ap.add_argument("--case", action="store_true", help="Capitalized + UPPER variants")
     ap.add_argument("--wordnums", action="store_true",
@@ -249,10 +316,12 @@ def main():
     args = ap.parse_args()
 
     assert uid_for_phrase("ExpressLRS") == bytes.fromhex("437f2fb1d339"), "self-check failed"
+    assert uid_for_phrase("iloveiflight") == bytes.fromhex("12ce9b6e75c4"), "brand vector failed"
 
     targets = []
     for u in args.uids:
-        targets.append((parse_uid(u), len(parse_uid(u)) == 6))
+        t = parse_uid(u)
+        targets.append((t, len(t) == 6))
     if args.uidfile:
         for line in open(args.uidfile):
             line = line.strip()
@@ -261,39 +330,69 @@ def main():
                 targets.append((t, len(t) == 6))
     if not targets:
         ap.error("no UIDs given (argv or --uids file)")
+
+    # 0) factory-fixed UID table — instant, before any hashing
+    factory = load_factory_uids()
+    factory_hits = []
+    remaining = []
     for t, full in targets:
+        hit = None
+        if full and t.hex() in factory:
+            hit = t.hex()
+        elif not full:
+            for fu in factory:  # tail against known factory UIDs
+                if bytes.fromhex(fu).endswith(t):
+                    hit = fu
+                    break
+        if hit:
+            factory_hits.append((hit, factory[hit]))
+        else:
+            remaining.append((t, full))
+    if factory_hits:
+        print("factory-fixed UID matches (FACTORY-UID, no cracking needed):")
+        for uid, label in factory_hits:
+            print("  %s  ->  %s   (FACTORY-UID)" % (uid, label))
+    for t, full in remaining:
         print("target: %s (%s)" % (t.hex(), "full UID" if full else "tail %d bytes" % len(t)))
 
-    words = list(BUILTIN_WORDS)
+    words = [w for w, _ in BRAND_DEFAULTS] + list(BUILTIN_WORDS)
     if args.wordlist:
         words += open(args.wordlist, encoding="utf-8", errors="replace").read().splitlines()
-    print("dictionary: %d words" % len(words))
+    if args.rockyou:
+        # rockyou is never bundled (license/size); commonly from Kali
+        # /usr/share/wordlists/rockyou.txt or the SecLists project.
+        words += open(args.rockyou, encoding="utf-8", errors="replace").read().splitlines()
+        print("rockyou loaded: %d words total" % len(words))
+    print("dictionary: %d words (brand defaults first)" % len(words))
 
     matches = []
     total = 0
     t_start = time.time()
-    # ordering: dictionary -> leet -> case -> wordnums -> alnum
-    total += run_stage("dict", dict_candidates(words, False, False), targets, matches)[0]
+    # ordering: dict -> leet -> case -> wordnums -> alnum
+    total += run_stage("dict", dict_candidates(words, False, False), remaining, matches)[0]
     if args.leet:
-        total += run_stage("leet", dict_candidates(words, True, False), targets, matches)[0]
+        total += run_stage("leet", dict_candidates(words, True, False), remaining, matches)[0]
     if args.case:
         total += run_stage("case",
                            (p for p in dict_candidates(words, False, True)
-                            if p != p.lower()), targets, matches)[0]
+                            if p != p.lower()), remaining, matches)[0]
     if args.wordnums:
         total += run_stage("wordnums", wordnums_candidates(words, args.case),
-                           targets, matches)[0]
+                           remaining, matches)[0]
     if args.alnum:
         if not 1 <= args.alnum <= 6:
             ap.error("--alnum length must be 1..6")
-        run_alnum(args.alnum, targets, matches)
+        run_alnum(args.alnum, remaining, matches)
         total += len(ALNUM) ** args.alnum
 
     print("\n%d hashes total in %.1fs" % (total, time.time() - t_start))
-    if matches:
-        print("\nMATCHES:")
-        for uid, phrase, kind in matches:
-            print("  %s  <-  %r   (%s)" % (uid, phrase, kind))
+    if matches or factory_hits:
+        if matches:
+            print("\nMATCHES:")
+            for uid, phrase, kind in matches:
+                ann = brand_label(phrase)
+                tag = "%s, %s" % (ann, kind) if ann else kind
+                print("  %s  <-  %r   (%s)" % (uid, phrase, tag))
         return 0
     print("\nno match (dictionary + enabled modes exhausted; beyond this, "
           "targeted wordlists / GPU md5 are the next step)")

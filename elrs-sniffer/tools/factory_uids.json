@@ -1,0 +1,4 @@
+{
+  "_note": "Factory-fixed UID table for phrase_crack.py. Keys are lowercase hex UIDs (12 chars), values are human labels. Entries here are MERGED OVER the built-in table (FACTORY_UIDS in phrase_crack.py) and checked INSTANTLY, before any hashing. Use this for new factory dumps: stock firmware with no binding phrase uses a MAC-derived UID, not a phrase - it cannot be cracked, only recognized. Sources: your own passive captures, manufacturer firmware dumps, community OUI/UID lists.",
+  "example000000001": "Example entry - replace with real factory UID + label"
+}

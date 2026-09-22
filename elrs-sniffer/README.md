@@ -137,12 +137,31 @@ N=6 is 36⁶ ≈ 2.2e9 ≈ a few minutes; an ETA prints before it starts).
 Tail-only hits are reported "PROBABLE, verify with more captures".
 ~1.3M hashes/s per core single-threaded (~15M/s on a 10-core box).
 
-Realistic coverage: dictionary + wordnums + leet + case handles what
-humans actually type; `--alnum 6` sweeps every short lowercase-alphanumeric
-phrase. Beyond that (7+, mixed case, symbols) the math explodes — use
-targeted wordlists from your own intel (`--wordlist`), not more compute.
-A GPU attack on MD5 is trivially possible; this tool stays stdlib-only
-because the dictionary covers the realistic OSINT cases.
+What the tiers cover, in OSINT terms:
+
+* **iFlight ecosystem, line-wide**: the official default phrase
+  `iloveiflight` (UID `12ce9b6e75c4`, self-check verified) is the
+  Commando8/radio default and ships on the iFlight BNF line — one dictionary
+  hit labels the whole fleet.
+* **HappyModel stock batches**: factory firmware with no binding phrase uses
+  a MAC-derived UID, not a phrase — uncrackable, so it is *recognized*
+  instead via the fixed-UID table (checked instantly, before any hashing):
+  `0000609e0b58` (Mobula6/Crux3/Mobula7 batch), `000096af1f7c` (Mobula6
+  batch 2). Add new dumps to `tools/factory_uids.json`.
+* **Brand/model defaults**: per-brand official phrases and model/radio names
+  (BetaFPV, RadioMaster Zorro/Boxer/Pocket, EMAX Tinyhawk, DJI, Walksnail,
+  FrSky, …) sit at the top of the dictionary with labeled matches
+  ("BRAND DEFAULT (RadioMaster): zorro2024").
+* **Human patterns**: `--wordnums` (freestyle23, sarah2023), `--leet`,
+  `--case`, and `--alnum 6` sweeps every short lowercase-alphanumeric
+  phrase. `--rockyou PATH` adds a local rockyou-format list (never bundled;
+  Kali `/usr/share/wordlists/rockyou.txt` or SecLists).
+
+What is NOT covered: phrase-less stock firmware is MAC-derived (see fixed
+UID table / OUI fingerprinting); 7+ char or mixed-case-symbol phrases blow
+past brute force — use targeted wordlists from your own intel. A GPU MD5
+attack is trivially possible; this tool stays stdlib-only because the tiers
+above cover the realistic field cases.
 
 **Legal posture:** the cracker is an *offline* attack on *your own passive
 captures*. It exists to suggest a human-readable label for a link the
