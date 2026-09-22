@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
+        "arc_phy.c"
         "rf.c"
         "video.c"
         "menu_raster.c"

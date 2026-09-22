@@ -52,6 +52,7 @@ static bool s_analog_bw40 = true;
 #define RX_FILTER_MASK      (0xFu << RX_FILTER_SHIFT)
 #define ADC_RATE_REG        0x600A0448u
 #define RX_GAIN_STATUS_REG  0x600A702Cu
+#define RX_IQ_CORR_REG      0x600A0438u
 #define ADC_RATE_SEL_MASK   0x3u
 
 /* Continuous modem front-end un-gating registers.
@@ -93,6 +94,16 @@ static const uint8_t s_iq_diag[8] = {
 extern int lmac_stop_hw_txq(void);
 
 static const char *TAG = "c5vrx3_rf";
+
+/* ARC (vendor-aware receive chain) state: the gain-table description and
+ * receive tuple captured read-only from the pinned vendor PHY after init
+ * and every successful retune, published as one generation counter. */
+static arc_gain_table_t s_arc_gain_table;
+static rf_phy_snapshot_t s_arc_receive_tuple;
+static uint32_t s_arc_generation;
+static uint8_t s_current_gain_val = 52u;
+
+static void arc_capture_vendor_state(void);
 
 /**
  * Disable all 5 LMAC MAC TX hardware queues.
@@ -408,6 +419,11 @@ esp_err_t rf_start(void)
     extern void phy_force_rx_gain(bool enable, uint8_t gain_idx);
     phy_force_rx_gain(true, 52);
 
+    /* Vendor PHY initialization has now generated both valid RX gain tables
+     * and completed its own calibration. Capture that state read-only before
+     * C5VRX freezes receiver ownership. */
+    arc_capture_vendor_state();
+
     /* Disable PHY PLL / RXCAL tracking timer if compiled in, so it never
      * recalibrates RF / RX hardware during continuous analog video reception.
      * With CONFIG_ESP_PHY_DISABLE_PLL_TRACK=y, the tracking timer is omitted entirely. */
@@ -429,21 +445,15 @@ extern void phy_set_freq(uint16_t freq_mhz, int offset);
 extern void phy_chip_set_chan_offset(int offset_khz);
 extern void phy_fft_scale_force(bool force_en, int8_t force_value);
 
-/* C5-only/PHY experimental surface. Signatures below are independently used
- * by C5-targeted PHY tooling, but remain undocumented by Espressif. Keep every
- * call behind explicit EXPERIMENTAL menu modes and weak-link capability checks. */
-extern void phy_enable_agc(void) __attribute__((weak));
-extern void phy_agc_max_gain_set(int gain) __attribute__((weak));
+/* Read-only C5 PHY observations. Estimator/calibration routines are not called
+ * while live because they reconfigure clocks and receive state. */
 extern int phy_get_noise_floor(void) __attribute__((weak));
 extern int phy_get_rssi(void) __attribute__((weak));
 
-static uint8_t s_current_gain_val = 52u;
 /* Last gain value actually forced into the PHY; -1 = never forced. Lets the
  * CFO/offset path skip redundant phy_force_rx_gain() calls, which each cause
  * a visible Q/dc dip in the demodulated baseband. (OUI-SPY mod) */
 static int s_last_forced_gain = -1;
-static bool s_experimental_hw_agc;
-static uint8_t s_experimental_agc_max_gain = 62u;
 
 /* Standard FPV Channel Table: 6 Bands x 8 Channels = 48 Channels
  * RaceBand (R), Boscam A (A), Boscam B (B), Boscam E (E), FatShark (F), LowBand (L) */
@@ -568,10 +578,32 @@ void rf_get_phy_snapshot(rf_phy_snapshot_t *snapshot)
     snapshot->rx_filter_reg = REG32(RX_FILTER_REG);
     snapshot->adc_rate_reg = REG32(ADC_RATE_REG);
     snapshot->source_mux_reg = REG32(SOURCE_MUX);
+    snapshot->iq_correction_reg = REG32(RX_IQ_CORR_REG);
     snapshot->rx_filter_mode =
         (uint8_t)((snapshot->rx_filter_reg & RX_FILTER_MASK) >> RX_FILTER_SHIFT);
     snapshot->adc_rate_sel =
         (uint8_t)(snapshot->adc_rate_reg & ADC_RATE_SEL_MASK);
+    snapshot->iq_correction =
+        arc_iq_correction_decode(snapshot->iq_correction_reg);
+    if (!arc_gain_tuple_decode(&s_arc_gain_table, s_current_gain_val,
+                               &snapshot->gain_tuple)) {
+        snapshot->gain_tuple = (arc_gain_tuple_t){0};
+        snapshot->gain_tuple.gain_index = s_current_gain_val;
+    }
+}
+
+static void arc_capture_vendor_state(void)
+{
+    arc_phy_capture_gain_table(&s_arc_gain_table);
+    rf_get_phy_snapshot(&s_arc_receive_tuple);
+    /* Publish last so readers never associate a new generation with a tuple
+     * that is still being filled. The controller is the sole retune owner. */
+    ++s_arc_generation;
+}
+
+const rf_phy_snapshot_t *rf_get_arc_receive_tuple(void)
+{
+    return &s_arc_receive_tuple;
 }
 
 void rf_set_fft_scale_force(bool force, int8_t value)
@@ -602,42 +634,19 @@ bool rf_try_get_wideband_rssi_dbm(int *dbm)
     return true;
 }
 
-bool rf_set_experimental_hw_agc(bool enable, uint8_t max_gain)
+const arc_gain_table_t *rf_get_arc_gain_table(void)
 {
-    if (enable) {
-        if (!phy_enable_agc || !phy_agc_max_gain_set) return false;
-        if (max_gain > 62u) max_gain = 62u;
-        if (max_gain < 2u) max_gain = 2u;
-
-        /* Release the same forced-gain primitive used by production, then let
-         * the vendor AGC operate under a bounded ceiling. This is deliberately
-         * experimental: boot disabled rfagc separately and the exact split
-         * between RF/BB AGC remains part of issue #27 characterization. */
-        s_experimental_agc_max_gain = max_gain;
-        phy_agc_max_gain_set((int)max_gain);
-        phy_force_rx_gain(false, s_current_gain_val);
-        phy_enable_agc();
-        s_experimental_hw_agc = true;
-        return true;
-    }
-
-    /* Deterministic return to the known C5VRX receive state. */
-    phy_disable_agc();
-    phy_rfagc_disable();
-    phy_force_rx_gain(true, s_current_gain_val);
-    s_last_forced_gain = s_current_gain_val;
-    s_experimental_hw_agc = false;
-    return true;
+    return &s_arc_gain_table;
 }
 
-bool rf_get_experimental_hw_agc(void)
+uint8_t rf_get_arc_survival_gain(void)
 {
-    return s_experimental_hw_agc;
+    return arc_gain_highest_rf_stage_start(&s_arc_gain_table);
 }
 
-uint8_t rf_get_experimental_agc_max_gain(void)
+uint32_t rf_get_arc_generation(void)
 {
-    return s_experimental_agc_max_gain;
+    return s_arc_generation;
 }
 
 const fpv_channel_t *rf_get_current_channel(void)
@@ -753,6 +762,12 @@ esp_err_t rf_set_channel(size_t index)
     phy_wifi_fbw_sel(s_analog_bw40 ? 1u : 0u);
     phy_force_rx_gain(true, s_current_gain_val);
     s_last_forced_gain = s_current_gain_val;
+
+    /* A channel change may make the vendor PHY regenerate its active RX gain
+     * table and calibrated receive state. Recapture only after the retune and
+     * all receive-state reassertions succeeded, then publish one generation
+     * change so ARC cannot keep stale spans/maxima or controller state. */
+    arc_capture_vendor_state();
 
     /* Commit logical state only after the supported bootstrap succeeded. */
     s_current_band = new_band;

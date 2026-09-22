@@ -50,7 +50,7 @@ c_files = list(MAIN.glob("*.c"))
 all_c = "\n".join(read(f) for f in c_files)
 c_names = [f.name for f in c_files]
 
-check("production receiver and dedicated menu raster modules", set(c_names) == {"main.c", "rf.c", "video.c", "menu_raster.c", "buzzer.c", "status_led.c", "preview.c", "grab.c"},
+check("production receiver and dedicated menu raster modules", set(c_names) == {"main.c", "arc_phy.c", "rf.c", "video.c", "menu_raster.c", "buzzer.c", "status_led.c", "preview.c", "grab.c"},
       f"found: {c_names}")
 check("main.c present", "main.c" in c_names)
 check("rf.c present", "rf.c" in c_names)

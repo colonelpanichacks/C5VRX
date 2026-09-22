@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "arc_phy.h"
 
 /**
  * rf_start() - Initialize the ESP32-C5 Wi-Fi/PHY receive-only frontend.
@@ -47,11 +48,18 @@ typedef struct {
     uint32_t rx_filter_reg;
     uint32_t adc_rate_reg;
     uint32_t source_mux_reg;
+    uint32_t iq_correction_reg;
     uint8_t rx_filter_mode;
     uint8_t adc_rate_sel;
+    arc_iq_correction_t iq_correction;
+    arc_gain_tuple_t gain_tuple;
 } rf_phy_snapshot_t;
 
 void rf_get_phy_snapshot(rf_phy_snapshot_t *snapshot);
+/* Vendor-calibrated, read-only receive tuple captured atomically with the ARC
+ * gain table after PHY init or a successful channel retune. It is diagnostic
+ * state only; undocumented fields are never swept or reapplied in LOCK. */
+const rf_phy_snapshot_t *rf_get_arc_receive_tuple(void);
 
 /**
  * Force/release the PHY FFT scaling stage. This is exposed only so the lab can
@@ -70,9 +78,11 @@ void rf_set_fft_scale_force(bool force, int8_t value);
  */
 bool rf_try_get_noise_floor_dbm(int *dbm);
 bool rf_try_get_wideband_rssi_dbm(int *dbm);
-bool rf_set_experimental_hw_agc(bool enable, uint8_t max_gain);
-bool rf_get_experimental_hw_agc(void);
-uint8_t rf_get_experimental_agc_max_gain(void);
+const arc_gain_table_t *rf_get_arc_gain_table(void);
+uint8_t rf_get_arc_survival_gain(void);
+/* Changes after every successful PHY init/channel retune and lets the ARC
+ * supervisor discard controller state derived from an older vendor table. */
+uint32_t rf_get_arc_generation(void);
 
 /**
  * FPV Channel and Carrier Frequency Fine-Tuning:
