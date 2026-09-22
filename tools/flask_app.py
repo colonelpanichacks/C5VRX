@@ -323,14 +323,14 @@ def _det_read_rows(limit: int = 500):
 # ----- Drone aliases (tools/drone_aliases.json) -----
 #
 # User-named display aliases for fingerprinted drones, keyed by the same
-# fingerprint the DETECTIONS tab clusters on (cfo_ppm rounded to the
-# nearest 0.5 ppm + "|" + video_std, e.g. "12.0|PAL"). Display-only: the
+# fingerprint the DETECTIONS tab clusters on (line_us rounded to the
+# nearest 0.02 us + "|" + video_std, e.g. "63.98|PAL"). Display-only: the
 # fingerprint stays the identity; detections.csv is never rewritten.
 # Same pattern as _dets_lock: state mutated and file written under one
 # lock; missing/corrupt file reads as {}.
 
 DRONE_ALIASES_JSON = Path(__file__).resolve().parent / "drone_aliases.json"
-ALIAS_FP_RE = re.compile(r"^-?\d+\.[05]\|\w{0,8}$")
+ALIAS_FP_RE = re.compile(r"^\d+\.\d{2}\|\w{0,8}$")
 ALIAS_MAX = 40
 
 _aliases_lock = threading.Lock()
@@ -1223,6 +1223,8 @@ PAGE = """<!DOCTYPE html>
   #dettable tr.vs td:first-child { border-left:2px solid var(--grn); }
   #dettable tr.ev { background:rgba(255,176,0,.04); }
   #dettable tr.ev td:first-child { border-left:2px solid var(--amb); }
+  #dettable tr.nz { opacity:.45; }
+  .detcard.nz { opacity:.55; }
   #dettable td.num { text-align:right; font-variant-numeric:tabular-nums; }
   #dettable th.sps { min-width:64px; }
   .dt-d { color:var(--dim); }
@@ -1408,6 +1410,8 @@ PAGE = """<!DOCTYPE html>
     <span class="lbl">DETECTION LOG // tools/detections.csv</span>
     <span id="dettotal">0 ROWS</span>
     <span id="detsum"></span>
+    <button id="detnoise" class="tg" style="display:none"
+            title="blip locks (under 2s, no video sync, under 15 dB) are hidden; the raw CSV keeps everything">SHOW NOISE</button>
     <a id="export" class="tg" href="/api/detections/export" download="detections.csv">EXPORT CSV</a>
     <button id="detclear" class="tg" title="truncate tools/detections.csv to header-only">CLEAR</button>
   </div>
@@ -1571,6 +1575,20 @@ const fmtISO = v => (typeof v === 'string' && v.length >= 19 && v.charAt(10) ===
     esc(v.slice(11, 19)) + '</span>' : esc(v);
 const bchip = (band, name) =>
   '<span class="bchip b' + esc(band || '?') + '">' + esc(name) + '</span>';
+/* Canonical display name for carriers the grid knows under two channels
+   (A1 5865 vs B8 5866 are 1 MHz apart): within 2 MHz of another Boscam
+   grid channel, the alphabetically-first name wins, so the same carrier
+   reads consistently. Display-only — the logged channel is untouched;
+   names outside the grid pass through. */
+const CANON = {};
+CH.forEach(row => row.forEach(c => {
+  let best = c.n;
+  CH.forEach(r2 => r2.forEach(d => {
+    if (Math.abs(d.f - c.f) <= 2 && d.n < best) best = d.n;
+  }));
+  CANON[c.n] = best;
+}));
+const canonCh = name => CANON[name] || name;
 /* Mini level strip: min..peak range bar with a mean tick, on the graph's
    fixed 0..45 dB scale. '' when the episode has no level samples. */
 const sparkSpan = r => {
@@ -1588,15 +1606,19 @@ const sparkSpan = r => {
 /* Row accent class: video-synced episodes green, standalone events amber. */
 const detRowCls = r => r.video_sync === 1 ? 'vs'
                      : r.lock_type === 'event' ? 'ev' : '';
-/* DRONE-ID clustering: fingerprint = cfo_ppm rounded to the nearest
-   0.5 ppm + video_std ('' when the firmware left it blank). Rows with a
-   blank/non-numeric cfo_ppm carry no fingerprint and get no ID. */
+/* DRONE-ID clustering: fingerprint = line_us rounded to the nearest
+   0.02 us + "|" + video_std ('' when the firmware left it blank). The
+   line period comes from the camera crystal and is stable per device —
+   unlike cfo_ppm, which bounces with video content and stays display-only.
+   Rounds via integer cents (x100, snap to even) to dodge binary-float
+   ties. Rows with a blank/non-numeric line_us get no fingerprint, no ID. */
 const droneFp = r => {
-  if (r.cfo_ppm === '' || r.cfo_ppm === undefined || r.cfo_ppm === null)
+  if (r.line_us === '' || r.line_us === undefined || r.line_us === null)
     return null;
-  const p = Number(r.cfo_ppm);
-  if (!isFinite(p)) return null;
-  return (Math.round(p * 2) / 2).toFixed(1) + '|' + (r.video_std || '');
+  const us = Number(r.line_us);
+  if (!isFinite(us) || us <= 0) return null;
+  const cents = Math.round(Math.round(us * 100) / 2) * 2;
+  return (cents / 100).toFixed(2) + '|' + (r.video_std || '');
 };
 /* Deterministic fp -> DRONE-XXX map: clusters are numbered by first-seen
    (earliest start_iso), so the same row set always yields the same IDs. */
@@ -1623,6 +1645,12 @@ const droneHue = fp => {
 };
 let detAliases = {};                   // fingerprint -> user alias (sidecar)
 let detLast = null;                    // last /api/detections payload
+let showNoise = false;                 // noise rows hidden by default
+/* A row is NOISE when it looks like a blip lock: under 2 s, no video
+   sync, peak under 15 dB. Hidden rows don't count in the counter or the
+   summary; the CSV/export keep everything (raw data). */
+const isNoise = r => Number(r.duration_s || 0) < 2 && !r.video_sync &&
+                     Number(r.level_peak_db || 0) < 15;
 const droneChip = (fp, id) => {
   const h = droneHue(fp), al = detAliases[fp];
   return '<span class="dchip' + (al ? ' aliased' : '') + '" data-fp="' + esc(fp) + '"' +
@@ -1634,9 +1662,12 @@ const fmtCfo = v => (v > 0 ? '+' : '') + Number(v).toFixed(1);
 const fmtLine = v => (typeof v === 'number' ? v.toFixed(2) : esc(v)) + 'us';
 /* Header summary strip: "N drones fingerprinted · M encounters ·
    strongest: DRONE-X (peak dB)" — aliased drones show the alias with the
-   fingerprint's ppm instead ("strongest: MY RIG (+12.0 ppm)"). */
-function renderDetSum(rows, dm) {
-  const ids = Object.keys(dm).length;
+   fingerprint's line period instead ("strongest: MY RIG (63.98us)").
+   Counts only the rows passed in (noise-filtered view). */
+function renderDetSum(rows) {
+  const seen = {};
+  rows.forEach(r => { if (r.drone) seen[r.drone] = 1; });
+  const ids = Object.keys(seen).length;
   const enc = rows.reduce((n, r) => n + (r.drone ? 1 : 0), 0);
   let best = null;
   rows.forEach(r => {
@@ -1647,7 +1678,7 @@ function renderDetSum(rows, dm) {
   let strong = '';
   if (best) {
     const al = detAliases[best.fp];
-    strong = al ? ' · strongest: ' + al + ' (' + fmtCfo(parseFloat(best.fp)) + ' ppm)'
+    strong = al ? ' · strongest: ' + al + ' (' + best.fp.split('|')[0] + 'us)'
                 : ' · strongest: ' + best.id + ' (' + best.peak + 'dB)';
   }
   document.getElementById('detsum').textContent =
@@ -1709,31 +1740,43 @@ function renderDets(d) {
   const shots = d.shots || [];
   detLast = d;
   detAliases = d.aliases || {};
-  document.getElementById('dettotal').textContent = (d.total || 0) + ' ROWS';
-  // Cluster fingerprinted rows and inject the display ID, then summarize.
+  // Noise filter: blip locks hidden by default; the header chip reveals
+  // them (dimmed). Hidden rows count neither in the counter nor the
+  // summary. The CSV/export always keep everything.
+  const noiseN = rows.reduce((n, r) => n + (isNoise(r) ? 1 : 0), 0);
+  const view = showNoise ? rows : rows.filter(r => !isNoise(r));
+  const nzBtn = document.getElementById('detnoise');
+  nzBtn.style.display = noiseN ? '' : 'none';
+  nzBtn.textContent = (showNoise ? 'HIDE NOISE (' : 'SHOW NOISE (') + noiseN + ')';
+  document.getElementById('dettotal').textContent = view.length + ' ROWS';
+  // Cluster ALL rows (noise included) so drone IDs stay stable when the
+  // noise toggle flips, then summarize the visible view only.
   const dm = droneMap(rows);
   rows.forEach(r => {
     const fp = droneFp(r);
     if (fp) { r.drone = dm[fp]; r.dronefp = fp; }
   });
-  renderDetSum(rows, dm);
+  renderDetSum(view);
   // Skip columns the CSV lacks entirely (or that are blank on every row).
-  const cols = DETCOLS.filter(c => rows.some(r => r[c[0]] !== undefined && r[c[0]] !== ''));
-  if (rows.some(r => typeof r.level_peak_db === 'number')) {
+  const cols = DETCOLS.filter(c => view.some(r => r[c[0]] !== undefined && r[c[0]] !== ''));
+  if (view.some(r => typeof r.level_peak_db === 'number')) {
     const li = cols.findIndex(c => c[0] === 'level_min_db');
     cols.splice(li >= 0 ? li + 1 : cols.length, 0, ['spark', 'LEVEL']);
   }
-  if (rows.some(r => shotFor(r, shots))) cols.push(['shot', 'SHOT']);
-  if (window.innerWidth <= 899) { renderDetCards(rows, cols, shots); return; }
+  if (view.some(r => shotFor(r, shots))) cols.push(['shot', 'SHOT']);
+  if (window.innerWidth <= 899) { renderDetCards(view, cols, shots); return; }
   const sig = cols.map(c => c[0]).join(',');
   if (sig !== detSig) {
     detSig = sig;
     document.getElementById('dethead').innerHTML =
-      '<tr>' + cols.map(c => '<th' + (c[0] === 'spark' ? ' class="sps"' : '') + '>' +
+      '<tr>' + cols.map(c => '<th' + (c[0] === 'spark' ? ' class="sps"' : '') +
+        (c[0] === 'cfo_ppm' ? ' title="per-measurement carrier offset — drifts ' +
+                             'with video content; NOT a fingerprint"' : '') + '>' +
                              c[1] + '</th>').join('') + '</tr>';
   }
-  document.getElementById('detbody').innerHTML = rows.map(r => {
-    const rcls = detRowCls(r);
+  document.getElementById('detbody').innerHTML = view.map(r => {
+    let rcls = detRowCls(r);
+    if (showNoise && isNoise(r)) rcls += (rcls ? ' ' : '') + 'nz';
     return '<tr' + (rcls ? ' class="' + rcls + '"' : '') + '>' + cols.map(c => {
       const k = c[0], v = r[k];
       if (k === 'shot') {
@@ -1747,9 +1790,11 @@ function renderDets(d) {
         return v === 1 ? '<td><span class="vsb y">YES</span></td>'
                        : '<td class="na">--</td>';
       if (v === undefined || v === '') return '<td class="na">--</td>';
-      if (k === 'channel') return '<td>' + bchip(r.band, v) + '</td>';
+      if (k === 'channel') return '<td>' + bchip(r.band, canonCh(v)) + '</td>';
       if (k === 'drone') return '<td>' + droneChip(r.dronefp, v) + '</td>';
-      if (k === 'cfo_ppm') return '<td class="num">' + esc(fmtCfo(v)) + '</td>';
+      if (k === 'cfo_ppm')
+        return '<td class="num" title="per-measurement carrier offset — drifts ' +
+               'with video content; NOT a fingerprint">' + esc(fmtCfo(v)) + '</td>';
       if (k === 'video_std') return '<td><span class="stdb">' + esc(v) + '</span></td>';
       if (k === 'line_us') return '<td class="num">' + fmtLine(v) + '</td>';
       if (k === 'start_iso' || k === 'end_iso')
@@ -1773,7 +1818,7 @@ function renderDetCards(rows, cols, shots) {
   const TITLE = ['channel', 'drone', 'start_iso', 'duration_s', 'video_sync', 'shot'];
   document.getElementById('detcards').innerHTML = rows.map(r => {
     let h = '<div class="dcline">';
-    if (r.channel !== undefined && r.channel !== '') h += bchip(r.band, r.channel);
+    if (r.channel !== undefined && r.channel !== '') h += bchip(r.band, canonCh(r.channel));
     if (r.drone) h += droneChip(r.dronefp, r.drone);
     if (r.start_iso) h += '<span class="dcts">' + fmtISO(r.start_iso) + '</span>';
     if (r.duration_s !== undefined && r.duration_s !== '')
@@ -1799,7 +1844,9 @@ function renderDetCards(rows, cols, shots) {
       else val = esc(v);
       h += '<span><i>' + c[1] + '</i>' + val + '</span>';
     });
-    return '<div class="detcard ' + detRowCls(r) + '">' + h + '</div></div>';
+    let rcls = detRowCls(r);
+    if (showNoise && isNoise(r)) rcls += (rcls ? ' ' : '') + 'nz';
+    return '<div class="detcard ' + rcls + '">' + h + '</div></div>';
   }).join('');
 }
 document.querySelector('.detwrap').addEventListener('click', e => {
@@ -1814,6 +1861,10 @@ document.querySelector('.detwrap').addEventListener('click', e => {
 });
 document.getElementById('lightbox').addEventListener('click', () => {
   document.getElementById('lightbox').style.display = 'none';
+});
+document.getElementById('detnoise').addEventListener('click', () => {
+  showNoise = !showNoise;
+  if (detLast) renderDets(detLast);
 });
 document.getElementById('detclear').addEventListener('click', async () => {
   if (!confirm('Delete ALL logged detections (tools/detections.csv)?')) return;
