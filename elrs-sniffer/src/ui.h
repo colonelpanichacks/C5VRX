@@ -14,6 +14,13 @@
 
 #define UI_TLM_LINES 3
 
+// Panel driver: LilyGo ships these 0.96" panels interchangeably, labelled
+// SSD1306, and some are actually SH1106 (classic gotcha — SH1106 on the
+// SSD1306 init sequence = dark screen while the I2C ACK probe still passes).
+// Both U8G2 drivers are compiled in; the active one is chosen at runtime and
+// persisted (default SH1106).
+typedef enum { OLED_DRV_SSD1306 = 0, OLED_DRV_SH1106 = 1 } oled_driver_t;
+
 typedef struct {
     bool     has_rc;
     bool     radio_ok;          // false -> fault banner, stats carry "radio":0
@@ -34,16 +41,24 @@ typedef struct {
 
 #ifdef ARDUINO
 // Boot-time sequencing (all bounded — see main.cpp):
-//   ui_probe()  -> Wire setup + bounded ACK check for the SSD1306
-//   ui_start()  -> u8g2 init + splash (only after probe succeeds)
+//   ui_probe()  -> Wire setup + bounded ACK check (driver-agnostic)
+//   ui_start(drv)-> init the chosen driver + 1.5 s splash naming the driver
 //   ui_show_fault() -> static fault screen when radio init failed
+// Runtime driver switch (both toggle paths call ui_toggle_driver):
+//   re-inits with the other driver, redraws the splash, blocks 1.5 s.
 bool ui_probe();
-void ui_start();
+void ui_start(oled_driver_t drv);
 void ui_show_fault(const char *what, const char *detail);
 void ui_render(const ui_state_t *st);
+oled_driver_t ui_toggle_driver();
+oled_driver_t ui_get_driver();
+const char *ui_driver_name(oled_driver_t drv);
 #else
 static inline bool ui_probe() { return false; }
-static inline void ui_start() {}
+static inline void ui_start(oled_driver_t) {}
 static inline void ui_show_fault(const char *, const char *) {}
 static inline void ui_render(const ui_state_t *) {}
+static inline oled_driver_t ui_toggle_driver() { return OLED_DRV_SH1106; }
+static inline oled_driver_t ui_get_driver() { return OLED_DRV_SH1106; }
+static inline const char *ui_driver_name(oled_driver_t) { return "none"; }
 #endif

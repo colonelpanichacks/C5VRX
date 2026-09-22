@@ -286,6 +286,35 @@ static bool radio_init_bounded(const radio_pin_set_t *ps, uint32_t timeout_ms,
     return true;
 }
 
+// ---- OLED driver preference ------------------------------------------------
+static int oled_pref_read()
+{
+    Preferences pr;
+    if (!pr.begin(PREF_NAMESPACE, true)) return OLED_DRV_SH1106; // default
+    int v = pr.getUChar("oled_drv", OLED_DRV_SH1106);
+    pr.end();
+    return (v == OLED_DRV_SSD1306 || v == OLED_DRV_SH1106) ? v : OLED_DRV_SH1106;
+}
+
+static void oled_pref_write(int drv)
+{
+    Preferences pr;
+    if (pr.begin(PREF_NAMESPACE, false)) {
+        pr.putUChar("oled_drv", (uint8_t)drv);
+        pr.end();
+    }
+}
+
+// Toggle the panel driver (serial 'D' / long-press BOOT), persist, report.
+static void toggle_oled_driver()
+{
+    if (!oled_ok) return;
+    oled_driver_t d = ui_toggle_driver(); // re-init + 1.5 s splash
+    oled_pref_write(d);
+    Serial.printf("{\"t\":\"event\",\"what\":\"oled_driver\",\"drv\":\"%s\"}\n",
+                  ui_driver_name(d));
+}
+
 // ---- pin-set cache (Preferences/NVS) --------------------------------------
 static int pin_cache_read()
 {
@@ -397,14 +426,19 @@ void setup()
     elrs_decode_init(&dctx);
     sniffer_sweep_build(&sweep);
 
-    // OLED: bounded probe, splash only on success
+    // OLED: bounded probe, splash only on success; driver from prefs
+    // (default SH1106 — these panels ship interchangeably and mislabelled)
+    int oled_drv = oled_pref_read();
     oled_ok = ui_probe();
     if (oled_ok) {
-        ui_start();
+        ui_start((oled_driver_t)oled_drv);
     } else {
         Serial.printf("{\"t\":\"error\",\"what\":\"oled_init\",\"detail\":\"no ACK at 0x%02x SDA=%d SCL=%d\"}\n",
                       OLED_I2C_ADDR, PIN_OLED_SDA, PIN_OLED_SCL);
     }
+#if defined(PIN_BUTTON)
+    pinMode(PIN_BUTTON, INPUT_PULLUP); // active low; long-press toggles driver
+#endif
 
     // Radio: pin auto-probe (cached set first), bounded per candidate.
     int cached_idx = pin_cache_read();
@@ -423,9 +457,18 @@ void setup()
         report_radio_fault(detail);
     }
 
-    char ready_extra[40] = { 0 };
-    if (g_working_pins) snprintf(ready_extra, sizeof(ready_extra), ",\"pins\":\"%s\"",
-                                 g_working_pins->name);
+    char ready_extra[64] = { 0 };
+    if (g_working_pins) {
+        int off = snprintf(ready_extra, sizeof(ready_extra), ",\"pins\":\"%s\"",
+                           g_working_pins->name);
+        if (off > 0 && oled_ok && (size_t)off < sizeof(ready_extra)) {
+            snprintf(ready_extra + off, sizeof(ready_extra) - off,
+                     ",\"oled_drv\":\"%s\"", ui_driver_name(ui_get_driver()));
+        }
+    } else if (oled_ok) {
+        snprintf(ready_extra, sizeof(ready_extra), ",\"oled_drv\":\"%s\"",
+                 ui_driver_name(ui_get_driver()));
+    }
     Serial.printf("{\"t\":\"ready\",\"steps\":%u,\"sync_freq\":%lu,\"radio\":%u,\"oled\":%u%s}\n",
                   sweep.count, (unsigned long)(ELRS_2G4_SYNC_FREQ_HZ / 1000000),
                   radio_ok ? 1 : 0, oled_ok ? 1 : 0, ready_extra);
@@ -435,11 +478,28 @@ void setup()
 
 void loop()
 {
-    // 'P' on the serial console forces a full pin re-probe
+    // console commands: P = radio pin re-probe, D = toggle OLED driver
     if (Serial.available()) {
         int c = Serial.read();
         if (c == 'P' || c == 'p') g_force_reprobe = true;
+        else if (c == 'D' || c == 'd') toggle_oled_driver();
     }
+
+#if defined(PIN_BUTTON)
+    // BOOT button (GPIO0, active low): hold >= 1.5 s toggles the OLED driver.
+    // Edge-armed + one-shot per press = debounce by construction.
+    static bool btn_last = HIGH, btn_fired = false;
+    static uint32_t btn_press_t = 0;
+    bool btn = digitalRead(PIN_BUTTON);
+    if (btn == LOW) {
+        if (btn_last == HIGH) { btn_press_t = millis(); btn_fired = false; }
+        else if (!btn_fired && millis() - btn_press_t >= 1500) {
+            btn_fired = true;
+            toggle_oled_driver();
+        }
+    }
+    btn_last = btn;
+#endif
 
     if (g_force_reprobe) {
         g_force_reprobe = false;

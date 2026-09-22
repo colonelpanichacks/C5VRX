@@ -44,9 +44,13 @@ silently deaf front end. Note the chip has **4 MB embedded flash** —
 `board_build.flash_size = 4MB` / `default.csv` are set in the env, and
 `flash.sh` flashes with `--flash-size 4MB` (see flash.md).
 
-If the OLED shows column junk instead of text, the panel is an SH1106:
-swap the constructor in `src/ui.cpp` (`U8G2_SSD1306_...` →
-`U8G2_SH1106_128X64_NONAME_F_HW_I2C`) — one line.
+If the OLED shows column junk instead of text, or stays dark while the
+boot log says `oled:1`, the panel is an SH1106 shipped as "SSD1306" (or
+vice versa) — the firmware **defaults to SH1106** and both drivers are
+compiled in. To switch: send `D` on the serial console, or **hold the
+BOOT button (GPIO0) for ≥1.5 s**; the splash names the active driver
+(`OLED:SH1106` / `OLED:SSD1306`) for 1.5 s, the choice persists across
+reboots, and a `{"t":"event","what":"oled_driver",...}` line is emitted.
 
 ## Flashing
 

@@ -88,7 +88,8 @@ Boot/lifecycle:
   ran (bad flash/hardware), not an app problem.
 - `ready` reports init outcomes: `radio`/`oled` 0 = that subsystem faulted;
   stats still flow. `pins` (optional) names the pin set the radio probe
-  settled on (see `probe`).
+  settled on, `oled_drv` (optional) the active panel driver (`sh1106`/
+  `ssd1306`, default sh1106 — see `event`).
 - `error.what` values: `radio_init`, `oled_init`, `sx1280_init` (legacy
   string may still appear on very old builds).
 - `radio_up` fires when a previously faulted radio recovers (retried every
@@ -102,6 +103,14 @@ Boot/lifecycle:
   marks the NVS-cached set tried first; `{"t":"probe","info":"manual
   sweep start"}` precedes a console-forced re-probe (send `P`). The probe
   caches its winner in flash, so later boots try it first.
+- `event` — runtime happenings (additive catch-all):
+  ```json
+  {"t":"event","what":"oled_driver","drv":"sh1106"}
+  ```
+  emitted when the OLED driver is toggled (`what:"oled_driver"`,
+  `drv:"sh1106"|"ssd1306"`). Console commands: `P` = radio pin re-probe,
+  `D` = toggle OLED driver. The T3-S3 BOOT button (GPIO0) held ≥1.5 s also
+  toggles the OLED driver. Manual toggles pause `stats` for ~1.5 s (splash).
 
 ## Notes for the dashboard integration
 

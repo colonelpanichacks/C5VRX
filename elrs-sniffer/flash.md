@@ -106,6 +106,22 @@ A truly silent board after this flash = still a boot-stage problem (bad
 image, flash-mode mismatch, or hardware), not an app init stall: re-check
 `verify_flash` output and try download mode (BOOT+RST).
 
+## OLED driver toggle (SH1106 vs SSD1306)
+
+LilyGo ships the 0.96" OLED interchangeably and sometimes mislabelled: an
+SH1106 panel answers the I2C ACK probe fine but stays dark on the SSD1306
+init sequence (and vice versa for the column-offset symptom). The firmware
+compiles **both** U8G2 drivers and **defaults to SH1106**. If the panel is
+dark or garbled after flashing:
+
+- send `D` on the serial console (460800 baud), **or**
+- **hold the BOOT button for ≥ 1.5 s** (edge-armed, one toggle per press).
+
+Each toggle re-inits the other driver, shows a 1.5 s splash naming it in
+the corner (`OLED:SH1106` / `OLED:SSD1306`), persists it in flash, and
+prints `{"t":"event","what":"oled_driver","drv":"..."}`. The next boot
+uses the persisted driver; `ready` reports it as `oled_drv`.
+
 ## Radio pin auto-probe
 
 At boot the firmware probes a small table of known T3-S3 SX1280 pin sets
