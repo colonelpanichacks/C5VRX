@@ -66,8 +66,8 @@ int16_t SnifferRadio::begin(const radio_pin_set_t *ps)
     // T3-S3 radio SPI bus (FSPI) at verified pins 5/3/6/7 — board_pins.h.
     spi = new SPIClass(FSPI);
     spi->begin(ps->sck, ps->miso, ps->mosi, ps->nss);
-    Module *mod = new Module(ps->nss, ps->dio1, ps->rst, ps->busy, *spi,
-                             SPISettings(8000000, MSBFIRST, SPI_MODE0));
+    mod = new Module(ps->nss, ps->dio1, ps->rst, ps->busy, *spi,
+                     SPISettings(8000000, MSBFIRST, SPI_MODE0));
     radio = new SnifferSX1280(mod);
     // placeholder params; every dwell reconfigures via apply()
     int16_t st = radio->begin(2441.4, 812.5, 9, 7);
@@ -118,5 +118,15 @@ bool SnifferRadio::read_packet(uint8_t *buf, size_t len, float &rssi, float &snr
     snr = radio->getSNR();
     start_rx(); // readData drops to standby; resume continuous RX
     return st == RADIOLIB_ERR_NONE;
+}
+
+int16_t SnifferRadio::rssiInst(float &rssi_dbm)
+{
+    if (mod == NULL) return RADIOLIB_ERR_WRONG_MODEM; // radio not constructed yet
+    uint8_t v = 0;
+    // SX1280_RADIO_GET_RSSIINST = 0x1F (SX1280_Regs.h); rssi = -v/2 dBm
+    int16_t st = mod->SPIreadStream(0x1F, &v, 1);
+    if (st == RADIOLIB_ERR_NONE) rssi_dbm = -v / 2.0f;
+    return st;
 }
 #endif // ARDUINO

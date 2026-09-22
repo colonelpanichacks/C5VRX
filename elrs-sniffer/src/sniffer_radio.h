@@ -59,14 +59,20 @@ public:
     void start_rx();
     // Called from loop; when a packet demodded, fills buf/len/rssi/snr.
     bool read_packet(uint8_t *buf, size_t len, float &rssi, float &snr);
+    // Instantaneous RSSI via the SX1280 GET_RSSIINST command (0x1F, per
+    // SX1280_Regs.h / datasheet) — unlike the packet-status based getRSSI()
+    // this is live energy in any RX state, which is what the sweep
+    // diagnostic needs. rssi in dBm; returns the RadioLib status.
+    int16_t rssiInst(float &rssi_dbm);
 
     static volatile bool dio1_fired;
     static void on_dio1();
 
 private:
-    SPIClass *spi;
-    SX1280 *radio;
-    uint8_t payload_len;
+    SPIClass *spi = nullptr;
+    Module *mod = nullptr;
+    SX1280 *radio = nullptr;
+    uint8_t payload_len = 0;
 };
 
 extern SnifferRadio g_radio;

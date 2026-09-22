@@ -28,7 +28,8 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 |---|---|---|---|
 | `rate` | string | — | dwell rate name: `LoRa 500Hz`, `LoRa 333Hz8`, `LoRa 250Hz`, `LoRa 150Hz`, `LoRa 100Hz8`, `LoRa 50Hz`; legacy 2.x sweeps append `*` |
 | `iq` | char | — | `n` = standard IQ, `i` = inverted (ELRS `invertIQ = UID[5]&1`) |
-| `rssi` | int | dBm | **sniffer's own** receiver, peak-hold over the 1 s window |
+| `rssi` | int | dBm | **live energy max** over the 1 s window (SX1280 GET_RSSIINST sampled at ~10 Hz) — includes noise floor; see below |
+| `rssi_now` | int | dBm | most recent live sample |
 | `snr10` | int | dB×10 | SNR of the last classified packet (sniffer receiver) |
 | `pps` | uint | packets/s | ELRS-classified packets demodulated in the window |
 | `lq_permille` | uint | ‰ | while `lock=1`: `pps / expected_pps_for_rate × 1000` (sniffer-side estimate, quantized by the 1 s window; 1000 = ceiling). While unlocked: last link-reported LQ ×10 from a `linkstats` event, else 0 |
@@ -40,10 +41,15 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 
 ## Events
 
-`dwell` — sweep moved to a new (rate, IQ) step:
+`dwell` — emitted when a sweep dwell ENDS, carrying that dwell's energy
+fingerprint (fixed 1.5 s dwells; a dwell whose `rssi_max` exceeds −80 dBm
+is immediately repeated once before advancing, to catch the sync window):
 ```json
-{"t":"dwell","step":7,"rate":"LoRa 250Hz","iq":"i","legacy":0}
+{"t":"dwell","step":7,"rate":"LoRa 250Hz","iq":"i","legacy":0,"rssi_max":-71}
 ```
+`rssi_max` −128 means "no sample" (radio fault); with a working front end
+the noise floor reads ≈ −120…−110, and a nearby TX produces bursts well
+above −80 on its rate — so this line is the per-rate RF-health signature.
 
 `sync` — a sync packet decoded (`ok=1` means the ELRS software CRC validated):
 ```json

@@ -19,6 +19,9 @@
 #define RADIO_INIT_TIMEOUT_MS 15000u
 #define RADIO_PROBE_TIMEOUT_MS 5000u
 #define RADIO_RETRY_MS 15000u
+#define DWELL_MS 1500u             // fixed dwell per rate (sync can be seconds apart)
+#define REDWELL_RSSI_DB -80        // dwells hotter than this get one repeat
+#define RSSI_SAMPLE_MS 100u        // ~10 Hz live energy sampling
 #define PREF_NAMESPACE "elrs-sniffer"
 
 static elrs_decode_ctx_t dctx;
@@ -36,28 +39,49 @@ static float last_rssi = -128.0f;
 static float last_snr = 0.0f;
 static uint32_t lock_total_pkts;
 
+// live energy (GET_RSSIINST sampling): per-dwell max, per-stats-window max,
+// and last sample. -128 = no sample yet (radio faulted) — with a working RF
+// front end the noise floor itself reads ~ -120, so these are discriminators.
+static float dwell_rssi_max = -128.0f;
+static float window_rssi_max = -128.0f;
+static float rssi_now = -128.0f;
+static uint32_t last_sample_ms;
+static bool redwell_scheduled;
+
 static ui_state_t uist;
 
-// dwell: short while blind, stretch once anything ELRS-ish demods
-static uint32_t current_dwell_ms()
-{
-    uint32_t since_pkt = millis() - last_pkt_ms;
-    if (since_pkt < 1500) return 4000;   // something is here — listen longer
-    return 700;
-}
-
-static void apply_step(uint8_t i)
+// Configure the radio for a sweep step. The "dwell" event is emitted when a
+// dwell ENDS (dwell_advance), carrying that dwell's rssi_max — so the serial
+// log prints an energy fingerprint per rate as the sweep runs.
+static void dwell_begin(uint8_t i)
 {
     step_idx = i % sweep.count;
     const sniffer_step_t &s = sweep.steps[step_idx];
     g_radio.apply(s, ELRS_2G4_SYNC_FREQ_HZ);
     g_radio.start_rx();
     step_entered_ms = millis();
+    dwell_rssi_max = -128.0f;
     snprintf(uist.rate, sizeof(uist.rate), "%s", s.rate->name);
     uist.iq_inverted = s.iq_inverted;
     uist.freq_hz = ELRS_2G4_SYNC_FREQ_HZ;
-    Serial.printf("{\"t\":\"dwell\",\"step\":%u,\"rate\":\"%s\",\"iq\":\"%c\",\"legacy\":%u}\n",
-                  step_idx, s.rate->name, s.iq_inverted ? 'i' : 'n', s.legacy_2x ? 1 : 0);
+}
+
+// End the current dwell: print its energy fingerprint, then either re-dwell
+// the same rate once (it showed energy — catch the sync window) or advance.
+static void dwell_advance()
+{
+    const sniffer_step_t &s = sweep.steps[step_idx];
+    Serial.printf("{\"t\":\"dwell\",\"step\":%u,\"rate\":\"%s\",\"iq\":\"%c\",\"legacy\":%u,"
+                  "\"rssi_max\":%d}\n",
+                  step_idx, s.rate->name, s.iq_inverted ? 'i' : 'n',
+                  s.legacy_2x ? 1 : 0, (int)dwell_rssi_max);
+    if (dwell_rssi_max > REDWELL_RSSI_DB && !redwell_scheduled) {
+        redwell_scheduled = true;   // hot dwell: listen once more, same rate
+        dwell_begin(step_idx);
+    } else {
+        redwell_scheduled = false;
+        dwell_begin(step_idx + 1);
+    }
 }
 
 // jump the sweep straight to a rate index heard in a sync packet
@@ -68,7 +92,7 @@ static void goto_rate(uint8_t rate_index, bool iq_inverted)
             const sniffer_step_t &s = sweep.steps[i];
             bool iq_match = s.iq_inverted == (pass == 0 ? iq_inverted : !iq_inverted);
             if (!s.legacy_2x && s.rate->rate_index == rate_index && iq_match) {
-                apply_step(i);
+                dwell_begin(i);
                 return;
             }
         }
@@ -166,7 +190,7 @@ static void stats_tick()
         uint32_t lq = expected ? (uint32_t)uist.pps * 1000 / expected : 0;
         uist.lq_permille = lq > 1000 ? 1000 : lq;
     }
-    uist.rssi_dbm = last_rssi;
+    uist.rssi_dbm = window_rssi_max;
     uist.snr_db = last_snr;
     uist.locked = locked;
     uist.radio_ok = radio_ok;
@@ -178,12 +202,14 @@ static void stats_tick()
         uist.fault[0] = 0;
     }
     last_rssi = -128.0f; // reset peak-hold for the next window
+    window_rssi_max = -128.0f;
 
     Serial.printf("{\"t\":\"stats\",\"ms\":%lu,\"rate\":\"%s\",\"iq\":\"%c\",\"rssi\":%d,"
-                  "\"snr10\":%d,\"pps\":%lu,\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
+                  "\"rssi_now\":%d,\"snr10\":%d,\"pps\":%lu,\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
                   "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u",
                   (unsigned long)now, uist.rate, uist.iq_inverted ? 'i' : 'n',
-                  (int)last_rssi, (int)(last_snr * 10), (unsigned long)uist.pps,
+                  (int)uist.rssi_dbm, (int)rssi_now, (int)(last_snr * 10),
+                  (unsigned long)uist.pps,
                   (unsigned long)uist.lq_permille,
                   locked ? 1 : 0, radio_ok ? 1 : 0,
                   (unsigned long)uist.ch_us[0], (unsigned long)uist.ch_us[1],
@@ -472,7 +498,7 @@ void setup()
     Serial.printf("{\"t\":\"ready\",\"steps\":%u,\"sync_freq\":%lu,\"radio\":%u,\"oled\":%u%s}\n",
                   sweep.count, (unsigned long)(ELRS_2G4_SYNC_FREQ_HZ / 1000000),
                   radio_ok ? 1 : 0, oled_ok ? 1 : 0, ready_extra);
-    if (radio_ok) apply_step(0);
+    if (radio_ok) dwell_begin(0);
     last_stats_ms = millis();
 }
 
@@ -513,7 +539,7 @@ void loop()
             g_working_pins = ps;
             radio_ok = true;
             Serial.println("{\"t\":\"radio_up\"}");
-            apply_step(0);
+            dwell_begin(0);
         } else {
             report_radio_fault(err);
         }
@@ -532,11 +558,22 @@ void loop()
             g_working_pins = ps;
             radio_ok = true;
             Serial.println("{\"t\":\"radio_up\"}");
-            apply_step(0);
+            dwell_begin(0);
         } // stay quiet otherwise: the 1 Hz stats line already says radio:0
     }
 
     if (radio_ok) {
+        // live energy sampling (~10 Hz) — the RF-path discriminator
+        if (millis() - last_sample_ms >= RSSI_SAMPLE_MS) {
+            last_sample_ms = millis();
+            float db;
+            if (g_radio.rssiInst(db) == RADIOLIB_ERR_NONE) {
+                rssi_now = db;
+                if (db > window_rssi_max) window_rssi_max = db;
+                if (db > dwell_rssi_max) dwell_rssi_max = db;
+            }
+        }
+
         uint8_t buf[ELRS_OTA8_LEN];
         float rssi, snr;
         size_t want = sweep.steps[step_idx].rate->payload;
@@ -559,13 +596,13 @@ void loop()
             }
         }
 
-        if (!locked && millis() - step_entered_ms > current_dwell_ms()) {
-            apply_step(step_idx + 1);
+        if (!locked && millis() - step_entered_ms > DWELL_MS) {
+            dwell_advance();
         }
         if (locked && millis() - last_pkt_ms > 5000) {
             locked = false;
             Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
-            apply_step(step_idx + 1);
+            dwell_advance();
         }
     }
 
