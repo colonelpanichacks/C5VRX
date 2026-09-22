@@ -247,25 +247,45 @@ bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
     //      (init = (UID4<<8|UID5) ^ OTA_VERSION_ID) — that self-acquisition
     //      is how the sniffer captures a link fingerprint. Bind mode uses 0.
     if (out->type == ELRS_PKT_SYNC) {
+        // CRC init candidates, in order:
+        //  1. already-known init (link captured earlier)
+        //  2. raw derived from the packet's UID[4..5] bytes
+        //  3. the 64 MODEL-MATCH variants: with model match enabled, the TX
+        //     sends UID5 ^ ((~modelId) & 0x3f) (tx_main.cpp GenerateSync-
+        //     PacketData, MODELMATCH_MASK from OTA.h), so the packet byte is
+        //     NOT UID[5] and the naive init misses. modelId is 6 bits, so
+        //     the XOR can be ANY value 0..63 — sweep all of them.
+        //  4. bind mode (init 0).
         uint16_t derived = elrs_crc_init_from_uid(data[5], data[6]);
-        if (is8 ? ota8_crc_ok(data, derived) : ota4_crc_ok(data, derived, 0)) {
-            crc_ok = true;
-            if (!ctx->crc_init_known) {
-                ctx->crc_init = derived;
-                ctx->crc_init_known = true;
+        uint16_t init = 0;
+        bool got = false;
+        if (ctx->crc_init_known &&
+            (is8 ? ota8_crc_ok(data, ctx->crc_init) : ota4_crc_ok(data, ctx->crc_init, 0))) {
+            init = ctx->crc_init; got = true;
+        } else if (is8 ? ota8_crc_ok(data, derived) : ota4_crc_ok(data, derived, 0)) {
+            init = derived; got = true;
+        } else {
+            for (uint8_t m = 0; m < 64 && !got; m++) {
+                uint16_t cand = (uint16_t)((((uint16_t)data[5] << 8) | (uint16_t)(data[6] ^ m)) ^ ELRS_OTA_VERSION_ID_3X);
+                if (cand == derived) continue;
+                if (is8 ? ota8_crc_ok(data, cand) : ota4_crc_ok(data, cand, 0)) {
+                    init = cand; got = true;
+                }
             }
-        } else if (is8 ? ota8_crc_ok(data, 0) : ota4_crc_ok(data, 0, 0)) {
-            crc_ok = true; // bind mode (CRC init 0)
+            if (!got && (is8 ? ota8_crc_ok(data, 0) : ota4_crc_ok(data, 0, 0))) {
+                init = 0; got = true; // bind mode (CRC init 0)
+            }
         }
-        if (crc_ok && !ctx->uid_known) {
+        crc_ok = got;
+        if (got && !ctx->crc_init_known) {
+            ctx->crc_init = init;
+            ctx->crc_init_known = true;
+        }
+        if (got && !ctx->uid_known) {
             ctx->uid3 = data[4];
             ctx->uid4 = data[5];
-            ctx->uid5 = data[6];
+            ctx->uid5 = (uint8_t)((init ^ ELRS_OTA_VERSION_ID_3X) & 0xFF); // recovered TRUE UID[5]
             ctx->uid_known = true;
-            if (!ctx->crc_init_known) {
-                ctx->crc_init = elrs_crc_init_from_uid(ctx->uid4, ctx->uid5);
-                ctx->crc_init_known = true;
-            }
         }
     } else if (ctx->crc_init_known) {
         if (is8) {

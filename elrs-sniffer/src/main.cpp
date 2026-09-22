@@ -451,6 +451,8 @@ static const radio_pin_set_t *probe_pin_sets(int first_idx, uint32_t timeout_ms,
 
 static const radio_pin_set_t *g_working_pins = NULL;
 static bool g_force_reprobe = false;
+static bool g_verbose = false;      // V: print every packet as rawpkt (10/s)
+static int g_park_step = -1;        // R <step>: park sweep; -1 = auto-sweep
 
 static void report_radio_fault(const char *detail)
 {
@@ -561,11 +563,42 @@ void setup()
 
 void loop()
 {
-    // console commands: P = radio pin re-probe, D = toggle OLED driver
-    if (Serial.available()) {
+    // console commands: P = radio pin re-probe, D = toggle OLED driver,
+    // V = verbose rawpkt toggle, R [step] = park sweep / resume
+    static bool r_pending = false;
+    static uint8_t r_digits = 0;
+    static int r_num = 0;
+    while (Serial.available()) {
         int c = Serial.read();
+        if (r_pending) {
+            if (c >= '0' && c <= '9' && r_digits < 2) {
+                r_num = r_num * 10 + (c - '0');
+                r_digits++;
+                continue;
+            }
+            if (c == ' ') continue; // "R 1" — spaces ignored while pending
+            // finalize the R command
+            if (r_digits == 0) {
+                g_park_step = -1;
+                Serial.println("{\"t\":\"event\",\"what\":\"sweep_resume\"}");
+            } else {
+                g_park_step = r_num % sweep.count;
+                const sniffer_step_t &s = sweep.steps[g_park_step];
+                Serial.printf("{\"t\":\"event\",\"what\":\"parked\",\"step\":%d,\"rate\":\"%s\",\"iq\":\"%c\"}\n",
+                              g_park_step, s.rate->name, s.iq_inverted ? 'i' : 'n');
+                if (!locked) dwell_begin((uint8_t)g_park_step);
+            }
+            r_pending = false; r_num = 0; r_digits = 0;
+            continue;
+        }
         if (c == 'P' || c == 'p') g_force_reprobe = true;
         else if (c == 'D' || c == 'd') toggle_oled_driver();
+        else if (c == 'V' || c == 'v') {
+            g_verbose = !g_verbose;
+            Serial.printf("{\"t\":\"event\",\"what\":\"%s\"}\n", g_verbose ? "verbose_on" : "verbose_off");
+        } else if (c == 'R' || c == 'r') {
+            r_pending = true; r_num = 0; r_digits = 0;
+        }
     }
 
 #if defined(PIN_BUTTON)
@@ -657,6 +690,14 @@ void loop()
                 last_pkt_ms = millis();
                 dwell_pkts++;
                 if (!dwell_first_pkt_ms) dwell_first_pkt_ms = millis();
+                // verbose (V): EVERY demodded packet as rawpkt, 10/s
+                if (g_verbose && millis() - last_rawpkt_ms >= 100) {
+                    last_rawpkt_ms = millis();
+                    char hex[2 * ELRS_OTA8_LEN + 1];
+                    to_hex(buf, want, hex);
+                    Serial.printf("{\"t\":\"rawpkt\",\"cls\":%u,\"hex\":\"%s\"}\n",
+                                  (unsigned)pkt.cls, hex);
+                }
                 switch (pkt.type) {
                 case ELRS_PKT_SYNC:
                     n_sync++; dwell_sync++;
@@ -705,8 +746,8 @@ void loop()
                     Serial.printf("{\"t\":\"dwell_ext\",\"rate\":\"%s\",\"iq\":\"%c\",\"rssi_max\":%d,\"dwell_ms\":%u}\n",
                                   cur.rate->name, cur.iq_inverted ? 'i' : 'n',
                                   (int)dwell_rssi_max, dwell_len_ms);
-                } else {
-                    dwell_advance();
+                } else if (g_park_step < 0) {
+                    dwell_advance(); // parked (R <step>): stay seated
                 }
             }
             // patience heartbeat: packets flowing for >3 s, no sync yet
@@ -730,7 +771,8 @@ void loop()
         if (locked && millis() - last_pkt_ms > 5000) {
             locked = false;
             Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
-            dwell_begin(last_good_step); // re-enter sweep at the last good rate+IQ
+            // re-enter sweep: parked step if set, else last good rate+IQ
+            dwell_begin(g_park_step >= 0 ? (uint8_t)g_park_step : last_good_step);
         }
     }
 

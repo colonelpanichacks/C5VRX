@@ -288,6 +288,56 @@ int main()
     }
     printf("ok: seed search (hits found, corruption rejects all)\n");
 
+    // 10) REAL-CAPTURE LAYOUT ANALYSIS: ce3f0000000031a1 from the field unit
+    //     (RadioMaster Pocket 3.x, disconnected fast-sync, drone off).
+    //     Prove the 3.6.4 OTA4 sync struct against it and answer: does ANY
+    //     CRC init validate these bytes under the exact struct?
+    {
+        static const uint8_t cap[8] = { 0xce, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x31, 0xa1 };
+        printf("capture ce3f0000000031a1 under OTA4 sync struct 3.6.4:\n");
+        printf("  type=%u (2=sync) fhss=%u nonce=%u swMode=%u tlmRatio=%u rateIdx=%u uid3..5=%02x%02x%02x incrc=%04x\n",
+               cap[0] & 3, cap[1], cap[2], cap[3] & 1, (cap[3] >> 1) & 7, cap[3] >> 4,
+               cap[4], cap[5], cap[6], (unsigned)((cap[0] >> 2) << 8 | cap[7]));
+        // derived init + 64 model-match candidates (as the parser now does)
+        elrs_decode_ctx_t ctx;
+        elrs_decode_init(&ctx);
+        elrs_packet_t out;
+        bool parsed_ok = elrs_decode_packet(&ctx, cap, 8, &out);
+        printf("  parser: classified=%d crc_ok=%d (model-match search incl.)\n",
+               parsed_ok, out.cls == ELRS_PKT_CLASS_CRC_OK);
+        // exhaustive 0..65535 seed search — NOTE: ~1 hit per packet is
+        // EXPECTED BY CHANCE (2^14 effective inits x 2^-14 CRC), so raw hits
+        // prove nothing. The real criterion: a hit must be CONSISTENT with
+        // the packet's own UID bytes (derived init, any of the 64 model-match
+        // variants, or bind-mode 0). tx_main.cpp: UID5 may be XORed by
+        // (~modelId)&0x3f when model match is on.
+        unsigned hits = 0;
+        uint16_t hit_inits[16];
+        for (uint32_t s = 0; s < 65536; s++) {
+            uint8_t tmp[7]; tmp[0] = cap[0] & 0x03; memcpy(tmp + 1, cap + 1, 6);
+            uint16_t incrc = (uint16_t)(((uint16_t)(cap[0] >> 2) << 8) | cap[7]);
+            if (elrs_crc14(tmp, 7, (uint16_t)s) == incrc && hits < 16) hit_inits[hits++] = (uint16_t)s;
+        }
+        bool consistent = false;
+        uint16_t derived = elrs_crc_init_from_uid(cap[5], cap[6]);
+        for (uint32_t m = 0; m < 64 && !consistent; m++) {
+            uint16_t cand = (uint16_t)((((uint16_t)cap[5] << 8) | (uint16_t)(cap[6] ^ m)) ^ ELRS_OTA_VERSION_ID_3X);
+            for (unsigned i = 0; i < hits; i++) if (hit_inits[i] == cand) consistent = true;
+        }
+        for (unsigned i = 0; i < hits; i++) if (hit_inits[i] == 0) consistent = true; // bind mode
+        printf("  seed search: %u raw hit(s) (chance expectation ~4 incl. bit14/15 twins); "
+               "derived init %04x consistent: %s\n", hits, derived, consistent ? "YES" : "NO");
+        if (!consistent) {
+            printf("  VERDICT: NO UID-consistent init validates the capture -> it is NOT a\n");
+            printf("  3.x OTA4 sync. Note: rateIdx=0 is the FLRC-1000 table slot; a TX on an\n");
+            printf("  FLRC rate sends NO software CRC at all (radio CRC instead) -> next step\n");
+            printf("  is FLRC dwell support, not more CRC archaeology.\n");
+        } else {
+            printf("  VERDICT: capture IS a 3.x OTA4 sync (UID-consistent init found).\n");
+        }
+    }
+    printf("ok: real-capture layout analysis (informational)\n");
+
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }

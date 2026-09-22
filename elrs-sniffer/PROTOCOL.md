@@ -137,9 +137,15 @@ Boot/lifecycle:
   {"t":"event","what":"oled_driver","drv":"sh1106"}
   ```
   emitted when the OLED driver is toggled (`what:"oled_driver"`,
-  `drv:"sh1106"|"ssd1306"`). Console commands: `P` = radio pin re-probe,
-  `D` = toggle OLED driver. The T3-S3 BOOT button (GPIO0) held ≥1.5 s also
-  toggles the OLED driver. Manual toggles pause `stats` for ~1.5 s (splash).
+  `drv:"sh1106"|"ssd1306"`); `verbose_on`/`verbose_off` for the V command;
+  `parked`/`sweep_resume` for the R command.
+  Console commands: `P` = radio pin re-probe, `D` = toggle OLED driver,
+  `V` = print every demodded packet as `rawpkt` (10/s), `R [step]` = park
+  the sweep on a step (`R` alone resumes; steps are numbered 0..N-1 as
+  listed in the `dwell` lines). The T3-S3 BOOT button (GPIO0) held ≥1.5 s
+  also toggles the OLED driver. Manual toggles pause `stats` for ~1.5 s
+  (splash); while parked, dwell extensions still apply and the unlock path
+  re-enters at the parked step.
 
 ## Notes for the dashboard integration
 
