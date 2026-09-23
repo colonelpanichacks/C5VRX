@@ -225,6 +225,37 @@ hop-following runs in both cases (syncs re-anchor the sequence).
   `stats` for ~1.5 s (splash); while parked, dwell extensions still apply
   and the unlock path re-enters at the parked step.
 
+## Find mode (passive bind-phrase/UID discovery)
+
+`sync_frame` — a sync-shaped frame captured while parked on the sync
+channel during a harvest cycle (alternates with sweep passes when unlocked;
+never starves detection). Throttled to ~4/s, deduped by (nonce, fhssIndex):
+```json
+{"t":"sync_frame","band":"flrc","rate":"FLRC 1000Hz","hex":"024129...","rssi":-55}
+```
+`band` `lora` frames also flow through the normal self-seeded sync path and
+can lock directly. `band` `flrc` frames feed the on-device seed brute.
+
+`uid45` — the FLRC HW-CRC seed (2^16 brute across the explicit CRC24
+variants, 2-frame confirmation) leaked by a captured FLRC sync frame:
+```json
+{"t":"event","what":"uid45","uid4":"61","uid5":"ce","model_id":37,"variant":0,"uid3":"2f"}
+```
+`variant` identifies which SX1280 CRC24 model validated — until
+tools/flrc_crc_probe.py confirms the variant against a known-phrase capture,
+treat uid45 as strong-but-unconfirmed. Phrase check offline:
+`python3 tools/phrase_crack.py <uid_tail> --frames capture.jsonl`.
+
+`harvest` — `{"t":"event","what":"harvest","state":"start"}` marks each
+find-mode cycle (6 dwells x ~750 ms on the sync frequency).
+
+`uid_cracked` may now carry `"via":"uid2-trackers"` and `uid2_alt`: the
+FHSS sequence cannot distinguish UID[2] bit 7 (mod 2^31 drops it), so the
+tracker survivor is reported with its `survivor|0x80` alternate.
+
+Junk-hardening note: `lq` is clamped to 100 (values above are corruption)
+and RC/arm stick values come ONLY from CRC-validated packets.
+
 ## FHSS hop-following
 
 After a validated sync the sniffer brute-forces UID[2] (the byte ELRS

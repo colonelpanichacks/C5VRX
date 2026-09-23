@@ -10,6 +10,7 @@
 #include "elrs_parse.h"
 #include "elrs_fhss.h"
 #include "sniffer_radio.h"
+#include "elrs_crc24flrc.h"
 
 // ---- independent CRC formulation: verbatim port of the ELRS 3.6.4 table
 // implementation (src/lib/CRC/crc.cpp Crc2Byte), kept structurally different
@@ -678,6 +679,58 @@ int main()
         assert(sw.steps[8].iq_inverted == false); // FLRC: IQ n/a, single polarity
     }
     printf("ok: sweep order LoRa-first (d)\n");
+
+    // 14h) FLRC CRC24 seed mechanism (round-6): golden round-trip with the
+    //     best-guess variant (UNVERIFIED against silicon — see
+    //     elrs_crc24flrc.h; tools/flrc_crc_probe.py confirms the live
+    //     variant from a known-phrase capture) + brute recovery of the seed
+    //     (= UID[4],UID[5] ^ 3) from a captured frame.
+    {
+        const uint8_t UID4 = 0x61, UID5 = 0xce;
+        uint16_t seed = elrs_crc_init_from_uid(UID4, UID5);
+        uint8_t payload[5] = { 0x2a, 0x41, 0x07, 0x64, 0x10 }; // sync-shaped-ish
+        uint8_t frame[8];
+        memcpy(frame, payload, 5);
+        uint32_t crc = elrs_crc24flrc_calc(0, seed, frame, 5);
+        frame[5] = (uint8_t)(crc >> 16); frame[6] = (uint8_t)(crc >> 8); frame[7] = (uint8_t)crc;
+        assert(elrs_crc24flrc_check(0, seed, frame, 8));
+        uint16_t got_seed; uint8_t got_variant;
+        assert(elrs_crc24flrc_brute(frame, 8, &got_seed, &got_variant));
+        assert(got_seed == seed && got_variant == 0);
+        uint16_t raw = (uint16_t)(got_seed ^ ELRS_OTA_VERSION_ID_3X);
+        assert((uint8_t)(raw >> 8) == UID4 && (uint8_t)(raw & 0xFF) == UID5);
+        // wrong seed / corrupted frame rejected
+        assert(!elrs_crc24flrc_check(0, seed ^ 1, frame, 8));
+        frame[3] ^= 0x01;
+        assert(!elrs_crc24flrc_check(0, seed, frame, 8));
+    }
+    printf("ok: FLRC CRC24 seed mechanism (golden, variant-pending silicon check)\n");
+
+    // 14i) UID[2] TRACKERS: real LCG sequence, true uid2 survives, others die
+    {
+        const uint8_t UID2T = 0x42, UID3 = 0x61, UID4 = 0xac, UID5 = 0xe1;
+        elrs_uid2_track_t t;
+        // anchor sync: nonce 100 at fhss 20 (hop=4)
+        elrs_uid2_track_init(&t, 100, 20);
+        // second sync 40 packets later: idx = (20 + 40/4) % 160 = 30
+        uint8_t seq[FHSS_SEQ_COUNT];
+        elrs_fhss_build(((uint32_t)UID2T << 24) | ((uint32_t)UID3 << 16) |
+                        ((uint32_t)UID4 << 8) | ((uint32_t)UID5 ^ 3), seq);
+        // each sync kills ~79/80 of wrong candidates; 2 constraints leave
+        // ~3 by chance, so feed syncs until a unique survivor emerges
+        int r = -1;
+        for (uint8_t k = 1; k <= 8 && r < 0; k++) {
+            uint8_t nonce = (uint8_t)(100 + 40 * k);
+            uint16_t idx = (uint16_t)((20 + (uint8_t)(40 * k) / 4) % FHSS_SEQ_COUNT);
+            r = elrs_uid2_track_update(&t, 0xFF, UID3, UID4, UID5, nonce, seq[idx], 4);
+        }
+        assert(r == (UID2T & 0x7F)); // bit7 invisible: survivor is the 7-bit value
+        // ghost sequence: wrong fhss kills everyone
+        elrs_uid2_track_init(&t, 100, 20);
+        r = elrs_uid2_track_update(&t, 0xFF, UID3, UID4, UID5, 140, seq[30] ^ 0xFF, 4);
+        assert(r == -2);
+    }
+    printf("ok: UID2 trackers (real sequence vectors)\n");
 
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,

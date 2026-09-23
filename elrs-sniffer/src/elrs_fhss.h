@@ -116,3 +116,54 @@ static inline bool elrs_nonce_on_track(const elrs_nonce_track_t *t, uint32_t now
     if (t->interval_ms == 0) return false;
     return nonce == elrs_nonce_expected(t, now_ms);
 }
+
+// --- UID[2] trackers (find mode) -------------------------------------------
+// A validated LoRa sync gives UID[3..5] but the FHSS seed macSeed also needs
+// UID[2] (never broadcast). 256 parallel trackers, one per candidate UID[2]:
+// each predicts the sequence entry at the sync's position; a mismatch kills
+// the tracker. Survivor after >=2 syncs = full UID. Host-tested with the
+// real LCG/sequence code.
+typedef struct {
+    uint8_t alive[16];     // 128 bits — UID[2] bit7 is INVISIBLE to the FHSS
+    uint8_t t0_nonce;      // sequence (mod 2^31 drops it): u2 and u2^0x80
+    uint8_t t0_fhss;       // produce identical sequences
+    bool armed;
+    uint8_t syncs;         // validated syncs processed
+} elrs_uid2_track_t;
+
+static inline void elrs_uid2_track_init(elrs_uid2_track_t *t, uint8_t nonce, uint8_t fhss)
+{
+    memset(t->alive, 0xFF, sizeof(t->alive));
+    t->t0_nonce = nonce;
+    t->t0_fhss = fhss;
+    t->armed = true;
+    t->syncs = 1;
+}
+
+// returns the surviving UID[2] (0..255) once exactly one candidate remains
+// and at least 2 syncs have been processed; -1 otherwise; -2 = all dead.
+static inline int elrs_uid2_track_update(elrs_uid2_track_t *t, uint8_t uid2_skip,
+                                         uint8_t uid3, uint8_t uid4, uint8_t uid5,
+                                         uint8_t sync_nonce, uint8_t sync_fhss,
+                                         uint8_t hop)
+{
+    if (!t->armed) return -1;
+    t->syncs++;
+    uint32_t slots = (uint8_t)(sync_nonce - t->t0_nonce); // per-packet nonce
+    uint16_t idx = (uint16_t)((t->t0_fhss + slots / hop) % FHSS_SEQ_COUNT);
+    int survivor = -1;
+    unsigned alive_n = 0;
+    for (uint16_t u2 = 0; u2 < 128; u2++) {
+        if (!(t->alive[u2 / 8] & (uint8_t)(1u << (u2 % 8)))) continue;
+        uint8_t seq[FHSS_SEQ_COUNT];
+        elrs_fhss_build(((uint32_t)u2 << 24) | ((uint32_t)uid3 << 16) |
+                        ((uint32_t)uid4 << 8) | ((uint32_t)uid5 ^ ELRS_OTA_VERSION_ID_3X), seq);
+        if (seq[idx] != sync_fhss)
+            t->alive[u2 / 8] &= (uint8_t)~(1u << (u2 % 8));
+        else { survivor = (int)u2; alive_n++; }
+    }
+    (void)uid2_skip;
+    if (alive_n == 0) return -2;
+    if (alive_n == 1 && t->syncs >= 2) return survivor; // 7-bit survivor; the
+    return -1;                                        // real UID[2] is this or
+}                                                     // this | 0x80

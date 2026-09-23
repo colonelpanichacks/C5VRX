@@ -15,6 +15,7 @@
 #include "elrs_defs.h"
 #include "elrs_parse.h"
 #include "elrs_fhss.h"
+#include "elrs_crc24flrc.h"
 #include "sniffer_radio.h"
 #include "ui.h"
 
@@ -64,6 +65,41 @@ static uint8_t g_hot[SNIFFER_MAX_STEPS / 8 + 1]; // hot-junk marks, one sweep pa
 static uint32_t g_last_demote_ms; // last-link tail decay clock
 static bool g_int_aborted;        // round 5: interferer verdict fired this dwell
 static uint32_t g_int_t0, g_int_rx0, g_int_log_ms;
+
+// ---- FIND MODE (round 6): sync-harvest alternating with sweep passes ----
+// Sync channel = FHSS idx 41 (2441.4 MHz); syncs recur constantly. After
+// each sweep pass (when unlocked), run a short harvest cycle parked on the
+// sync frequency: FLRC trio (promiscuous/discovery) + LoRa 250/500 (both
+// IQ). Sync-shaped frames are exported as sync_frame events (throttled);
+// LoRa frames validate via the self-seeded CRC14 (direct lock possible);
+// FLRC frames feed the uid45 seed brute (2^16 x 4 CRC24 variants).
+#define HARVEST_STEPS 6
+#define HARVEST_DWELL_MS 750u
+static const sniffer_step_t g_harvest_steps[HARVEST_STEPS] = {
+    { &ELRS_RATES_FLRC[0], false, false },  // FLRC 1000Hz (discovery)
+    { &ELRS_RATES_FLRC[1], false, false },  // DVDA 500
+    { &ELRS_RATES_FLRC[2], false, false },  // DVDA 250
+    { &ELRS_RATES_3X[2], false, false },    // LoRa 250 n
+    { &ELRS_RATES_3X[2], true, false },     // LoRa 250 i
+    { &ELRS_RATES_3X[0], false, false },    // LoRa 500 n
+};
+static bool g_harvest;
+static uint8_t g_harvest_idx;
+// sync_frame dedupe ring (per harvest cycle): recent (nonce, fhss)
+static uint8_t g_sf_ring[16][2];
+static uint8_t g_sf_n;
+static uint32_t g_sf_last_ms;
+static uint8_t g_sf_count_1s;
+static uint32_t g_sf_window_ms;
+// uid45 brute confirmation memory
+static uint16_t g_u45_seed; static uint8_t g_u45_variant; static uint8_t g_u45_count;
+// uid2 trackers: 256 bits, fed by validated LoRa syncs
+static uint8_t g_uid2_alive[32];
+static bool g_uid2_armed;
+static uint8_t g_t0_nonce, g_t0_fhss;
+// pending uid2 survivor -> crack success
+static int16_t g_uid2_survivor;
+static uint8_t g_uid2_track_store[sizeof(elrs_uid2_track_t)];
 static uint32_t last_pkt_debug_ms;      // crc-ok pkt hex (2/s)
 static uint32_t last_rawpkt_ms;         // sync-classified raw hex (2/s)
 
@@ -483,7 +519,15 @@ static void dwell_advance()
     uint8_t next = step_idx;
     for (;;) {
         next = (uint8_t)((next + 1) % sweep.count);
-        if (next == 0) memset(g_hot, 0, sizeof(g_hot)); // new pass
+        if (next == 0) {
+            // sweep pass complete -> alternate with a find-mode harvest
+            // cycle (sync-frequency parking) before the next pass
+            memset(g_hot, 0, sizeof(g_hot));
+            g_harvest = true;
+            Serial.println("{\"t\":\"event\",\"what\":\"harvest\",\"state\":\"start\"}");
+            dwell_begin(0);
+            return;
+        }
         if (next == start || !(g_hot[next / 8] & (uint8_t)(1u << (next % 8)))) break;
     }
     dwell_begin(next);
@@ -534,6 +578,37 @@ static void on_sync(const elrs_packet_t &pkt)
         if (!tail_match || !g_id.known) return;       // no identity -> no lock
         if (!was_known) crack_emit("identity");
     }
+    // FIND MODE: UID[2] trackers — a validated LoRa sync carries UID[3..5];
+    // the sequence check kills wrong UID[2] candidates until one survives.
+    if (!g_uid2_known) {
+        if (!g_uid2_armed) {
+            elrs_uid2_track_init((elrs_uid2_track_t *)g_uid2_track_store,
+                                 pkt.sync.nonce, pkt.sync.fhss_index);
+            g_uid2_armed = true;
+        } else {
+            int surv = elrs_uid2_track_update((elrs_uid2_track_t *)g_uid2_track_store,
+                                              g_uid2, pkt.sync.uid3, pkt.sync.uid4,
+                                              pkt.sync.uid5, pkt.sync.nonce,
+                                              pkt.sync.fhss_index,
+                                              sweep.steps[step_idx].rate->hop_interval);
+            if (surv >= 0) {
+                g_uid2 = (uint8_t)surv;
+                g_uid2_known = true;
+                elrs_fhss_build(mac_seed_with_uid2(g_uid2), g_seq);
+                g_following = true;
+                g_fhss_idx = pkt.sync.fhss_index;
+                g_follow_freq = elrs_fhss_channel_hz(g_seq[g_fhss_idx]);
+                g_radio.tune(g_follow_freq);
+                uist.freq_hz = g_follow_freq;
+                crack_emit("cracked");
+                Serial.printf("{\"t\":\"event\",\"what\":\"uid_cracked\",\"uid\":\"%02x %02x %02x %02x %02x %02x\",\"via\":\"uid2-trackers\",\"uid2_alt\":\"%02x\"}\n",
+                              g_uid[0], g_uid[1], g_uid2, pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5,
+                              (unsigned)(g_uid2 | 0x80)); // bit7 is sequence-invisible
+            } else if (surv == -2) {
+                g_uid2_armed = false; // all dead: re-arm on next sync
+            }
+        }
+    }
     last_good_step = step_idx; // sweep re-enters here first after a drop
     if (pkt.sync.rate_index <= 9 &&
         pkt.sync.rate_index != sweep.steps[step_idx].rate->rate_index) {
@@ -559,7 +634,8 @@ static void on_tlm(const elrs_packet_t &pkt)
     const elrs_telemetry_t *tm = &pkt.tlm;
     if (pkt.linkstats.valid) {
         const elrs_linkstats_t *ls = &pkt.linkstats;
-        uist.lq_permille = ls->lq * 10;
+        uint8_t lq = ls->lq > 100 ? 100 : ls->lq; // junk hardening: lq>100 is corruption
+        uist.lq_permille = lq * 10;
         snprintf(uist.tlm[0], sizeof(uist.tlm[0]), "LQ %3u  rssi -%u/%u dBm  %+d dB",
                  ls->lq, ls->rssi1_db, ls->rssi2_db, ls->snr_db);
         Serial.printf("{\"t\":\"linkstats\",\"lq\":%u,\"rssi1\":-%u,\"rssi2\":-%u,\"snr\":%d}\n",
@@ -1214,6 +1290,54 @@ void loop()
                 switch (pkt.type) {
                 case ELRS_PKT_SYNC:
                     n_sync++; dwell_sync++;
+                    // ---- FIND MODE: sync-shaped frame on the sync channel ----
+                    if (g_harvest && !locked &&
+                        pkt.sync.fhss_index == FHSS_SYNC_INDEX &&
+                        pkt.sync.rate_index <= 9) {
+                        // dedupe by (nonce, fhss) within the harvest cycle
+                        bool seen = false;
+                        for (uint8_t i = 0; i < g_sf_n; i++)
+                            if (g_sf_ring[i][0] == pkt.sync.nonce &&
+                                g_sf_ring[i][1] == pkt.sync.fhss_index) { seen = true; break; }
+                        if (!seen) {
+                            uint8_t slot = g_sf_n < 16 ? g_sf_n++ : 15;
+                            g_sf_ring[slot][0] = pkt.sync.nonce;
+                            g_sf_ring[slot][1] = pkt.sync.fhss_index;
+                            // throttle to ~4/s
+                            uint32_t now = millis();
+                            if (now - g_sf_window_ms >= 1000) {
+                                g_sf_window_ms = now;
+                                g_sf_count_1s = 0;
+                            }
+                            if (g_sf_count_1s < 4) {
+                                g_sf_count_1s++;
+                                char hex[2 * ELRS_OTA4_LEN + 1];
+                                to_hex(buf, want, hex);
+                                Serial.printf("{\"t\":\"sync_frame\",\"band\":\"%s\",\"rate\":\"%s\","
+                                              "\"hex\":\"%s\",\"rssi\":%d}\n",
+                                              flrc_step ? "flrc" : "lora", uist.rate, hex, (int)rssi);
+                            }
+                            // FLRC: seed brute (2^16 x variants), 2-frame confirm
+                            if (flrc_step) {
+                                uint16_t seed; uint8_t variant;
+                                if (elrs_crc24flrc_brute(buf, want, &seed, &variant)) {
+                                    if (seed == g_u45_seed && variant == g_u45_variant)
+                                        g_u45_count++;
+                                    else { g_u45_seed = seed; g_u45_variant = variant; g_u45_count = 1; }
+                                    if (g_u45_count >= 2) {
+                                        uint16_t raw = (uint16_t)(seed ^ ELRS_OTA_VERSION_ID_3X);
+                                        uint8_t u4 = (uint8_t)(raw >> 8), u5 = (uint8_t)(raw & 0xFF);
+                                        uint8_t model = (uint8_t)(~(buf[6] ^ u5) & ELRS_MODELMATCH_MASK);
+                                        Serial.printf("{\"t\":\"event\",\"what\":\"uid45\",\"uid4\":\"%02x\","
+                                                      "\"uid5\":\"%02x\",\"model_id\":%u,\"variant\":%u,"
+                                                      "\"uid3\":\"%02x\"}\n",
+                                                      u4, u5, model, variant, buf[4]);
+                                        g_u45_count = 0; // emit once per seed
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if (flrc_step && g_radio.flrcDiscovery()) {
                         // Round-3 discovery path: the RSSI+pair gate decides.
                         // Pure-noise junk fails the RSSI floor; one-off tails
@@ -1289,7 +1413,9 @@ void loop()
                 case ELRS_PKT_TLM:
                     n_tlm++; dwell_tlm++; on_tlm(pkt); break;
                 case ELRS_PKT_RCDATA:
-                    n_rc++; dwell_rc++; on_rc(pkt); break;
+                    n_rc++; dwell_rc++;
+                    if (pkt.cls == ELRS_PKT_CLASS_CRC_OK) on_rc(pkt); // junk hardening: sticks only from validated
+                    break;
                 default:
                     n_msp++; dwell_msp++; break;
                 }
@@ -1326,7 +1452,19 @@ void loop()
                 }
             }
         }
-        if (!locked) {
+        if (!locked && g_harvest) {
+            // harvest cycle: fixed short dwells, no extensions/interferer
+            if (millis() - step_entered_ms > dwell_len_ms) {
+                if (g_harvest_idx + 1 >= HARVEST_STEPS) {
+                    g_harvest = false;
+                    g_sf_n = 0;
+                    memset(g_hot, 0, sizeof(g_hot));
+                    dwell_begin(0);
+                } else {
+                    dwell_begin(g_harvest_idx + 1);
+                }
+            }
+        } else if (!locked) {
             // Adaptive dwell, IQ-trap safe: extension requires VALIDATED or
             // SYNC-classified packets (junk rc/msp never extends — the field
             // trap was strong RSSI + rx junk extending a dead dwell to 24 s).

