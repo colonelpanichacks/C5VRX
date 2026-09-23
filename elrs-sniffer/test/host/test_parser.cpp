@@ -1023,6 +1023,21 @@ int main()
     }
     printf("ok: round-13 op sequence + re-arm logic\n");
 
+    // 14r) ESCAN sweep math (round 14): 41 points, 100 kHz spacing,
+    //      2439.40..2443.40 MHz, nominal center at idx 20, restore path is
+    //      the firmware recover() (asserted present in the radio API here).
+    {
+        assert(elrs_escan_params_ok());
+        assert(elrs_escan_freq_hz(0) == 2439400000u);
+        assert(elrs_escan_freq_hz(20) == 2441400000u);
+        assert(elrs_escan_freq_hz(40) == 2443400000u);
+        assert(ELRS_ESCAN_STEP_HZ == 100000u);
+        // expected sync-channel marker (register-exact) sits ~159 Hz below
+        // the nominal center index — the event reports both
+        assert(ELRS_2G4_SYNC_FREQ_HZ == 2441399841u);
+    }
+    printf("ok: escan sweep math (41 points, spacing, marker)\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

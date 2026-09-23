@@ -257,6 +257,23 @@ SX1280 datasheet).
   channel 41 — every 80 hops); list: LoRa 250/500 (n+i), DVDA 500/250,
   FLRC 500/1000. Bind parking (LoRa 50 i) remains in the SWEEP.
 
+## escan (round 14: air-energy diagnostic, no behavior change)
+
+`E` — energy scan: parks LoRa 250 iq=n on the sync frequency, sweeps
+2439.40-2443.40 MHz in 100 kHz steps (41 points, 60 ms/step, RSSIINST max of
+~4 samples per step), restores the current dwell:
+```json
+{"t":"event","what":"escan","center":2441400000,"step_hz":100000,
+ "expect":2441399841,"peak":-41,"rssi":[-97,-95,...41 ints...]}
+```
+`E 1` — repeats the sweep for 3 s, then polls RSSIINST at 1 ms for 500 ms at
+the center (`peak` catches 1.28 s-cadence sync bursts between 60 ms windows).
+`expect` is the register-exact ELRS sync channel (draw a UI marker there;
+the sweep center is the nominal 100 kHz grid point ~159 Hz above it).
+Refused while locked/following (`escan_refused`). Purpose: -40..-60 dBm at
+the marker with silent demod => packet-complete path bug; ~-100 dBm floor =>
+TX not reaching our antenna (hardware).
+
 ## Round 13: standby-first dwell config (smoking gun)
 
 `dwell_setup` dbg now reports `{rate,sf,bw,cr,cm_before,cm_after,raw}` —

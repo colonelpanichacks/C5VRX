@@ -1348,6 +1348,47 @@ void setup()
     last_stats_ms = millis();
 }
 
+static void escan_run(bool peak_mode)
+{
+    // park: LoRa 250 iq=n (the exact-match config), sync frequency
+    sniffer_step_t st = { &ELRS_RATES_3X[2], false, false };
+    g_radio.apply(st, ELRS_2G4_SYNC_FREQ_HZ);
+    g_radio.start_rx();
+    int rssi[ELRS_ESCAN_POINTS];
+    uint32_t t_end = millis() + (peak_mode ? 3000 : 0);
+    do {
+        for (uint32_t i = 0; i < ELRS_ESCAN_POINTS; i++) {
+            g_radio.tune(elrs_escan_freq_hz(i));
+            delay(60);
+            float m = -128.0f;
+            for (uint8_t s = 0; s < 4; s++) {
+                float db;
+                if (g_radio.rssiInst(db) == 0 && db > m) m = db;
+                delay(5);
+            }
+            rssi[i] = (int)m;
+        }
+    } while (peak_mode && millis() < t_end);
+    int peak = rssi[ELRS_ESCAN_CENTER_IDX];
+    if (peak_mode) { // 500 ms of 1 ms polling at center catches 1.28s-cadence syncs
+        g_radio.tune(elrs_escan_freq_hz(ELRS_ESCAN_CENTER_IDX));
+        for (uint16_t i = 0; i < 500; i++) {
+            float db;
+            if (g_radio.rssiInst(db) == 0 && (int)db > peak) peak = (int)db;
+            delay(1);
+        }
+    }
+    Serial.printf("{\"t\":\"event\",\"what\":\"escan\",\"center\":%lu,\"step_hz\":%lu,"
+                  "\"expect\":%lu,\"peak\":%d,\"rssi\":[",
+                  (unsigned long)elrs_escan_freq_hz(ELRS_ESCAN_CENTER_IDX),
+                  (unsigned long)ELRS_ESCAN_STEP_HZ,
+                  (unsigned long)ELRS_2G4_SYNC_FREQ_HZ, peak);
+    for (uint32_t i = 0; i < ELRS_ESCAN_POINTS; i++)
+        Serial.printf("%s%d", i ? "," : "", rssi[i]);
+    Serial.println("]}");
+    g_radio.recover(cur_step(), ELRS_2G4_SYNC_FREQ_HZ); // restore the dwell
+}
+
 void loop()
 {
     // console commands: P = radio pin re-probe, D = toggle OLED driver,
@@ -1397,6 +1438,23 @@ void loop()
         else if (c == 'V' || c == 'v') {
             g_verbose = !g_verbose;
             Serial.printf("{\"t\":\"event\",\"what\":\"%s\"}\n", g_verbose ? "verbose_on" : "verbose_off");
+        }
+        else if (c == 'E' || c == 'e') {
+            // Energy scan (round 14): park LoRa 250 iq=n on the sync freq,
+            // sweep 2439.40-2443.40 in 100 kHz steps, 60 ms/step, RSSIINST
+            // max per step. 'E 1' repeats for 3 s + 500 ms 1 ms peak poll at
+            // center. Refuses while locked/following. No behavior change.
+            if (locked || g_following) {
+                Serial.println("{\"t\":\"event\",\"what\":\"escan_refused\",\"why\":\"locked\"}");
+            } else {
+                bool peak_mode = false;
+                uint32_t wait_ms = millis() + 300; // trailing " 1"
+                while (millis() < wait_ms && Serial.available()) {
+                    int d = Serial.read();
+                    if (d == '1') peak_mode = true;
+                }
+                escan_run(peak_mode);
+            }
         }
         else if (c == 'Y' || c == 'y') {
             sniffer_set_y925(!sniffer_get_y925()); // A/B the 0x925 SF config live

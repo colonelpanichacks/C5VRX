@@ -294,6 +294,24 @@ static inline bool elrs_should_rearm(uint32_t now_ms, uint32_t last_pkt_ms,
     return (now_ms - last_pkt_ms > 2000) && (now_ms - last_arm_ms > 2000);
 }
 
+// escan (round 14): measure the AIR directly when LoRa packet-complete
+// gives no partial credit. Sweep math is host-tested; the firmware emits the
+// measurement.
+#define ELRS_ESCAN_START_HZ  2439400000u  // 2439.40 MHz
+#define ELRS_ESCAN_STEP_HZ   100000u      // 100 kHz
+#define ELRS_ESCAN_POINTS    41u          // 2439.40 .. 2443.40 MHz
+#define ELRS_ESCAN_CENTER_IDX 20u         // 2439.40 + 20*0.1 = 2441.40 MHz
+static inline uint32_t elrs_escan_freq_hz(uint32_t idx)
+{
+    return ELRS_ESCAN_START_HZ + idx * ELRS_ESCAN_STEP_HZ;
+}
+static inline bool elrs_escan_params_ok(void)
+{
+    return elrs_escan_freq_hz(ELRS_ESCAN_CENTER_IDX) == 2441400000u && // nominal center
+           ELRS_ESCAN_POINTS == 41u &&
+           elrs_escan_freq_hz(ELRS_ESCAN_POINTS - 1) == 2443400000u;
+}
+
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only
 // returns true the moment identity is ACCEPTED (2nd consistent sync)
