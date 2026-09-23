@@ -972,6 +972,13 @@ def _elrs_ep_end(reason: str) -> None:
         _pres_close_locked(reason)
 
 
+def _elrs_open_eps() -> int:
+    """Open band-2.4 episodes (presence + lock): detections in progress,
+    counted live in detections_total ahead of their CSV row at close."""
+    with _elrs_ep_lock:
+        return (PRES_EP is not None) + (ELRS_EP is not None)
+
+
 # ----- ELRS presence episodes (round-6 passive discovery) -----
 #
 # Receiving ELRS sync frames is itself a drone-presence indicator, even
@@ -1088,6 +1095,22 @@ def _presence_tick_locked(obj: dict) -> None:
             if len(same) >= PRES_MIN_FRAMES:
                 _pres_open_locked(tail, rate, rssi)
         _presence_publish_locked()
+    elif t == "sync" and obj.get("uid"):
+        # A CRC-validated sync (ok:1, or validated:"crc" on round-8+) is
+        # confirmed ELRS on its own — instant fingerprint, no 3-frame
+        # window. FLRC syncs arrive ok:0 (structural only) and never trip
+        # this; older firmware without the field is unaffected.
+        if obj.get("ok") or obj.get("validated") == "crc":
+            tail = str(obj.get("uid"))
+            if PRES_EP is not None:
+                if not PRES_EP["uid"]:
+                    PRES_EP["uid"] = tail
+                _stage_bump(PRES_EP, "fingerprinted")
+                _pres_refresh_locked(None, None, now)
+            elif not locked:
+                _pres_open_locked(tail, _last_frame.get("rate"),
+                                  _last_frame.get("rssi"))
+            _presence_publish_locked()
     elif t == "event" and obj.get("what") == "uid45":
         # Firmware-confirmed FLRC CRC seed: real ELRS, no counting needed.
         uid = "uid45:" + str(obj.get("uid4") or "??") + str(obj.get("uid5")
@@ -1674,6 +1697,7 @@ class ElrsState:
         self.presence = None     # live presence-episode line for the FIND panel
         self.bind_uid = None     # (payload, monotonic) latest bind capture
         self.fastlink = None     # (state, monotonic) latest fastlink event
+        self.sig = None          # stats.sig: {lora|flrc: none|weak|firm|strong}
 
     def update(self, obj: dict) -> None:
         now = time.monotonic()
@@ -1703,6 +1727,12 @@ class ElrsState:
                 self.crack_state = obj.get("crack", self.crack_state)
                 self.mode = obj.get("mode", self.mode)
                 self.sync_only = obj.get("sync_only", self.sync_only)
+                # Round-9 per-band signal quality {lora,flrc: none|weak|firm|
+                # strong}; absent on older firmware — keep-last when present.
+                sig = obj.get("sig")
+                if isinstance(sig, dict):
+                    self.sig = {k: v for k, v in sig.items()
+                                if k in ("lora", "flrc") and isinstance(v, str)}
                 ch = obj.get("ch")
                 if isinstance(ch, list) and len(ch) == 4:
                     self.ch = [int(c) for c in ch]
@@ -1886,6 +1916,7 @@ class ElrsState:
                 "mode": self.mode,
                 "crack_state": self.crack_state,
                 "sync_only": self.sync_only,
+                "sig": dict(self.sig) if self.sig else None,
                 "fastlink": bool(self.fastlink
                                  and self.fastlink[0] == "start"
                                  and now - self.fastlink[1] < 70),
@@ -2379,6 +2410,12 @@ PAGE = """<!DOCTYPE html>
   .ebadge.sweep { color:var(--amb); border-color:var(--amb); }
   .ebadge.flink { color:var(--amb); border-color:var(--amb); }
   #xfastlink { flex:0 0 74px; box-sizing:border-box; text-align:center; }
+  #xsig { flex:0 0 178px; box-sizing:border-box; text-align:center;
+          overflow:hidden; white-space:nowrap; }
+  .sigq.none { color:var(--dim); }
+  .sigq.weak { color:var(--amb); }
+  .sigq.firm { color:#31c8ff; }
+  .sigq.strong { color:var(--grn); }
   .followb { flex:0 0 auto; min-width:196px; box-sizing:border-box;
              display:inline-block; text-align:center;
              padding:0 8px; border-radius:3px; border:1px solid #31c8ff;
@@ -2479,6 +2516,8 @@ PAGE = """<!DOCTYPE html>
   #efind .esp { flex:1 1 auto; }
   #efindpres { flex:0 0 auto; min-width:210px; color:var(--grn);
                overflow:hidden; text-overflow:ellipsis; }
+  /* Open presence/bind episode = a live detection: amber, pulsing. */
+  #efindpres.det { color:var(--amb); animation:ckpulse 1.1s ease-in-out infinite; }
   #efindid { flex:0 1 auto; min-width:0; overflow:hidden;
              text-overflow:ellipsis; color:var(--dim); }
   #efindid.found { color:var(--grn); font-size:.92rem; letter-spacing:.12em;
@@ -2519,6 +2558,7 @@ PAGE = """<!DOCTYPE html>
   .etcard .etna { color:var(--dim); }
   .etcard .etage { color:var(--dim); margin-left:6px; letter-spacing:.04em;
                    font-size:.52rem; }
+  .etcard .etage.stale { color:var(--amb); }
   .etcard .etsub { color:var(--dim); font-size:.52rem; letter-spacing:.04em;
                    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .ecopy { font:inherit; font-size:.56rem; padding:0 4px; margin-left:4px;
@@ -2716,6 +2756,7 @@ PAGE = """<!DOCTYPE html>
     .etlm { grid-template-columns:repeat(2,1fr); gap:6px; padding:6px 10px; }
     #elinkhdr { gap:8px; padding:0 12px; font-size:.6rem; }
     #xfastlink { display:none; }
+    #xsig { display:none; }
     .followb { min-width:160px; }
     #ecrack { gap:5px; padding:0 12px; font-size:.5rem; }
     #ecrack .ckst { padding:2px 5px; }
@@ -2850,6 +2891,8 @@ PAGE = """<!DOCTYPE html>
     <span id="xelockb" class="ebadge">--</span>
     <span id="xfastlink" class="ebadge flink" style="visibility:hidden"
           title="boot window: trying the last-known UID first">FASTLINK</span>
+    <span id="xsig" class="ebadge" style="visibility:hidden"
+          title="per-band sync signal quality (stats.sig, firmware round-9+)"></span>
     <span class="esp"></span>
     <span id="xeuidwrap"></span>
     <span id="xearm" class="armb" style="visibility:hidden">ARMED</span>
@@ -3644,20 +3687,31 @@ const evLine = (ev, stamp) =>
    '—' instead of junk (defensive; the firmware clamps too). */
 const lqSane = (v, syncOnly) =>
   typeof v === 'number' && isFinite(v) && v >= 0 && v <= 100 && !syncOnly;
+/* Telemetry staleness: past 60 s a value is history, not live — cards and
+   intel lines render '--' (the lq-guard idiom) instead of a minutes-old
+   reading that merely LOOKS fresh. */
+const TLM_STALE_S = 60;
+const tlmStale = x => !!(x && typeof x.age_s === 'number' &&
+                         x.age_s > TLM_STALE_S);
 /* Latest intel items for the LIVE-tab card, preference-ordered:
-   GPS -> batt -> fm -> atti -> linkstats (model-reported uplink). */
+   GPS -> batt -> fm -> atti -> linkstats (model-reported uplink). Stale
+   entries (>60 s old) drop out entirely. */
 function intelItems(e) {
   const t = (e && e.tlm) || {}, out = [];
-  if (t.gps) out.push('GPS ' + (t.gps.lat_e7 / 1e7).toFixed(5) + ',' +
-    (t.gps.lon_e7 / 1e7).toFixed(5) + ' · ' + t.gps.sats + 'sat · ' +
-    (t.gps.spd_kmh10 / 10).toFixed(0) + 'km/h');
-  if (t.batt) out.push('BATT ' + (t.batt.v10 / 10).toFixed(1) + 'V · ' +
-    (t.batt.a10 / 10).toFixed(1) + 'A · ' + t.batt.mah + 'mAh');
-  if (t.fm) out.push('MODE ' + t.fm.m);
-  if (t.atti) out.push('ATTI p' + (t.atti.p / 10000 * 57.3).toFixed(0) +
-    ' r' + (t.atti.r / 10000 * 57.3).toFixed(0) +
-    ' y' + (t.atti.y / 10000 * 57.3).toFixed(0));
-  if (t.linkstats && lqSane(Number(t.linkstats.lq), e && e.sync_only))
+  if (t.gps && !tlmStale(t.gps))
+    out.push('GPS ' + (t.gps.lat_e7 / 1e7).toFixed(5) + ',' +
+      (t.gps.lon_e7 / 1e7).toFixed(5) + ' · ' + t.gps.sats + 'sat · ' +
+      (t.gps.spd_kmh10 / 10).toFixed(0) + 'km/h');
+  if (t.batt && !tlmStale(t.batt))
+    out.push('BATT ' + (t.batt.v10 / 10).toFixed(1) + 'V · ' +
+      (t.batt.a10 / 10).toFixed(1) + 'A · ' + t.batt.mah + 'mAh');
+  if (t.fm && !tlmStale(t.fm)) out.push('MODE ' + t.fm.m);
+  if (t.atti && !tlmStale(t.atti))
+    out.push('ATTI p' + (t.atti.p / 10000 * 57.3).toFixed(0) +
+      ' r' + (t.atti.r / 10000 * 57.3).toFixed(0) +
+      ' y' + (t.atti.y / 10000 * 57.3).toFixed(0));
+  if (t.linkstats && !tlmStale(t.linkstats) &&
+      lqSane(Number(t.linkstats.lq), e && e.sync_only))
     out.push('UPLINK lq=' + t.linkstats.lq + ' rssi2=' +
       t.linkstats.rssi2 + ' snr=' + t.linkstats.snr);
   const ci = crackInfo(e, true), cl = ci && crackLine(ci);
@@ -3801,14 +3855,18 @@ function updElrsFind(e, set, job) {
     (f && f.uid45) || (e.lock && !e.sync_only)));
   document.getElementById('efindlive').style.visibility =
     on && f && f.live && !uidKnown ? 'visible' : 'hidden';
-  // Live presence episode (sync frames = drone presence, even uncracked).
+  // Open presence episode = a live detection, first-class (pulsing amber).
   const pres = f && f.presence, presEl = document.getElementById('efindpres');
   if (on && pres) {
     presEl.style.visibility = 'visible';
-    presEl.textContent = 'PRESENCE // ' + (pres.rate || '?') + ' · ' +
+    presEl.className = 'det';
+    presEl.textContent = 'DETECTION // ' + (pres.rate || '?') + ' · ' +
       (typeof pres.rssi === 'number' ? pres.rssi : '--') + 'dBm · ' +
       (pres.frames_10s || 0) + ' frames/10s';
-  } else presEl.style.visibility = 'hidden';
+  } else {
+    presEl.style.visibility = 'hidden';
+    presEl.className = '';
+  }
   const idEl = document.getElementById('efindid');
   const applyBtn = document.getElementById('efindapply');
   const crackBtn = document.getElementById('efindcrack');
@@ -3898,8 +3956,10 @@ function updElrsEnc(on, lock, rssi, lq, uid) {
 /* Telemetry cards: each label:value card carries its value age (dim "Ns ago" beyond 5 s)
    and degrades to a dim placeholder; values are latest-of-type from the backend
    (tlm dict never expires, so presence == arrived at least once since connect). */
-const etAge = a => (typeof a === 'number' && a > 5)
-  ? '<span class="etage">' + Math.round(a) + 's ago</span>' : '';
+const etAge = a => (typeof a === 'number' && a > TLM_STALE_S)
+  ? '<span class="etage stale">--</span>'
+  : (typeof a === 'number' && a > 5)
+    ? '<span class="etage">' + Math.round(a) + 's ago</span>' : '';
 function etCard(id, label, valHtml, sub, age) {
   document.getElementById(id).innerHTML =
     '<div class="etk">' + esc(label) + etAge(age) + '</div>' +
@@ -3909,7 +3969,7 @@ function etCard(id, label, valHtml, sub, age) {
 function updElrsTlm(e, on) {
   const t = (e && e.tlm) || {}, na = '<span class="etna">—</span>';
   let gpsHtml, gpsAge = t.gps && t.gps.age_s;
-  if (!t.gps) gpsHtml = '<span class="etna">—</span>';
+  if (!t.gps || tlmStale(t.gps)) gpsHtml = na;
   else if (!t.gps.lat_e7 && !t.gps.lon_e7)
     gpsHtml = '<span class="etna">no GPS lock</span>';
   else {
@@ -3921,19 +3981,21 @@ function updElrsTlm(e, on) {
       '" title="copy coordinates">&#128203;</button>';
   }
   etCard('etgps', 'GPS', gpsHtml, '', gpsAge);
-  etCard('etbatt', 'BATTERY', t.batt ?
+  etCard('etbatt', 'BATTERY', t.batt && !tlmStale(t.batt) ?
     '<b>' + (t.batt.v10 / 10).toFixed(1) + 'V</b> · ' +
     (t.batt.a10 / 10).toFixed(1) + 'A · ' + esc(t.batt.mah) + 'mAh' : na,
     '', t.batt && t.batt.age_s);
-  etCard('etatti', 'ATTITUDE', t.atti ?
+  etCard('etatti', 'ATTITUDE', t.atti && !tlmStale(t.atti) ?
     'p<b>' + (t.atti.p / 10000 * 57.3).toFixed(0) + '°</b> r<b>' +
     (t.atti.r / 10000 * 57.3).toFixed(0) + '°</b> y<b>' +
     (t.atti.y / 10000 * 57.3).toFixed(0) + '°</b>' : na,
     '', t.atti && t.atti.age_s);
-  etCard('etfm', 'FLIGHT MODE', t.fm ? '<b>' + esc(t.fm.m) + '</b>' : na,
+  etCard('etfm', 'FLIGHT MODE', t.fm && !tlmStale(t.fm) ?
+    '<b>' + esc(t.fm.m) + '</b>' : na,
     '', t.fm && t.fm.age_s);
   etCard('etls', 'LINKSTATS // MODEL',
-    t.linkstats && lqSane(Number(t.linkstats.lq), e && e.sync_only) ?
+    t.linkstats && !tlmStale(t.linkstats) &&
+      lqSane(Number(t.linkstats.lq), e && e.sync_only) ?
     'lq <b>' + esc(t.linkstats.lq) + '</b> · rssi <b>' +
     esc(t.linkstats.rssi1) + '/' + esc(t.linkstats.rssi2) + '</b> · snr <b>' +
     esc(t.linkstats.snr) + '</b>' : na,
@@ -3992,6 +4054,18 @@ function updElrs(e, set) {
     on && e.arm ? 'visible' : 'hidden';
   document.getElementById('xfastlink').style.visibility =
     on && e.fastlink ? 'visible' : 'hidden';
+  // Per-band signal quality (round-9 stats.sig): badge only while the
+  // firmware supplies it; unknown quality words degrade to the dim style.
+  const sigEl = document.getElementById('xsig');
+  const sigOk = !!(on && e.sig && (e.sig.lora || e.sig.flrc));
+  sigEl.style.visibility = sigOk ? 'visible' : 'hidden';
+  if (sigOk)
+    sigEl.innerHTML = 'SIG ' + ['lora', 'flrc'].filter(b => e.sig[b]).map(b => {
+      const q = ['none', 'weak', 'firm', 'strong'].includes(e.sig[b])
+        ? e.sig[b] : 'none';
+      return '<span class="sigq ' + q + '">' + b.toUpperCase() + ':' +
+             esc(q) + '</span>';
+    }).join(' ');
   const fp = e.uid ? 'elrs:' + String(e.uid).toLowerCase() : null;
   document.getElementById('xeuidwrap').innerHTML = on && fp ?
     droneChip(fp, 'elrs:' + e.uid) : '';
@@ -4762,7 +4836,7 @@ def create_app() -> Flask:
                 "buzzer_enabled": STATE.buzzer_enabled,
                 "buzzer_desired": STATE.buzzer_desired,
                 "locked": STATE.locked,
-                "detections_total": _dets_total,
+                "detections_total": _dets_total + _elrs_open_eps(),
                 "spectrum": [dict(e) for e in STATE.spectrum],
                 "telemetry": snap,
                 "frame_age_s": None if frame_age is None else round(frame_age, 2),
