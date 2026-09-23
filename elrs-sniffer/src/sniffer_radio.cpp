@@ -64,6 +64,10 @@ const uint8_t RADIO_PIN_SET_DEFAULT = 0; // v12-sx1280
 
 volatile bool SnifferRadio::dio1_fired = false;
 
+static bool g_y925_state = true; // 'Y' toggle: write 0x925 SF config
+void sniffer_set_y925(bool en) { g_y925_state = en; }
+bool sniffer_get_y925() { return g_y925_state; }
+
 void SnifferRadio::on_dio1()
 {
     dio1_fired = true;
@@ -160,13 +164,17 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
     // (implicit header, fixed length, CRC OFF, IQ) go out in one explicit
     // call — exactly the ELRS air config from SX1280.cpp SetPacketParamsLoRa.
     static_cast<SnifferSX1280 *>(radio)->setPacketType(RADIOLIB_SX128X_PACKET_TYPE_LORA);
-    radio->setBandwidth(r->bw == 0x18 ? 812.5f : r->bw == 0x26 ? 406.25f : 203.125f);
+    // RAW SetModulationParams {sf, bw, cr} — bypasses RadioLib's setter
+    // chain entirely (no transformation, no stored-state drift); the audit's
+    // "verify what hits the register" is satisfied by construction + the
+    // lora_regs readback probe.
+    uint8_t mp[3] = { r->sf, r->bw, r->cr };
+    mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_MODULATION_PARAMS, mp, 3);
     // RadioLib OMITS REG_SF_ADDITIONAL_CONFIG (0x925) — ELRS writes it after
-    // every SetModulationParams (SX1280.cpp:283-299). A likely deafness cause;
-    // written raw here, every LoRa dwell, harvest steps included.
-    radio->setSpreadingFactor(r->sf >> 4);         // 0x50->5 .. 0x90->9
-    radio->setCodingRate(r->cr, true);             // LI variants, raw values match
-    radio->setPreambleLength(r->preamble);
+    // every SetModulationParams (SX1280.cpp:283-299). 'Y' toggles it live.
+    if (g_y925_state)
+        mod->SPIwriteRegister(ELRS_REG_SF_ADDITIONAL_CONFIG,
+                              elrs_sf_additional_config(r->sf));
     radio->setFrequency(freq_hz / 1000000.0);
     mod->SPIwriteRegister(ELRS_REG_SF_ADDITIONAL_CONFIG,
                           elrs_sf_additional_config(r->sf));
@@ -196,8 +204,13 @@ void SnifferRadio::setFlrcIdentity(const uint8_t uid[6])
 void SnifferRadio::start_rx()
 {
     dio1_fired = false;
-    radio->startReceive(RADIOLIB_SX128X_RX_TIMEOUT_INF,
-                        RADIOLIB_SX128X_IRQ_RX_DONE, RADIOLIB_SX128X_IRQ_RX_DONE);
+    // Raw SetRx: continuous receive (periodBase 0x32=1ms? use ELRS-style
+    // 0xFFFF count = infinite). RadioLib's startReceive is NOT used — it
+    // re-applies stored packet params and would clobber our dwell config.
+    uint8_t rx[3] = { 0x00, 0xFF, 0xFF }; // base 15.625ns, count 0xFFFF = infinite
+    mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_RX, rx, 3);
+    uint8_t clr[2] = { 0xFF, 0xFF };
+    mod->SPIwriteStream(RADIOLIB_SX128X_CMD_CLEAR_IRQ_STATUS, clr, 2);
 }
 
 bool SnifferRadio::recover(const sniffer_step_t &step, uint32_t freq_hz)

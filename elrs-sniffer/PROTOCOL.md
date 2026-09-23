@@ -257,6 +257,25 @@ SX1280 datasheet).
   channel 41 — every 80 hops); list: LoRa 250/500 (n+i), DVDA 500/250,
   FLRC 500/1000. Bind parking (LoRa 50 i) remains in the SWEEP.
 
+## Round 11/12 additions
+
+- `lora_regs` — once per LoRa rate per boot, at dwell start:
+  `{"t":"event","what":"lora_regs","rate":"LoRa 250Hz","sf":"60","bw":"18","cr":"07","reg925":"1e","pkt_type":"02","rx":"cont"}` —
+  sf/bw/cr are the raw bytes written (no register readback exists for
+  modulation params; they are now written via RAW SPI, bypassing RadioLib's
+  setter chain entirely); reg925/pkt_type are read back from the chip; `rx`
+  is always continuous raw SetRx (RadioLib's startReceive is NOT used — it
+  re-sent stored packet params and clobbered per-dwell config, the prime
+  LoRa-silence suspect).
+- `Y` command — toggles the 0x925 SF-config write live (`y925_on`/`y925_off`
+  events; default on) for A/B without reflashing.
+- Boot selftest now covers BOTH modems: `rxdiag ... "selftest":true,
+  "flrc_demod":N, "lora_demod":M` — a 200 ms FLRC-discovery window on
+  2480.5 MHz plus a 300 ms LoRa 250 iq=n window on the sync frequency.
+  `lora_demod:0` at boot = LoRa RX path fault.
+- `rxdiag` is now emitted for EVERY dwell end (LoRa sweep included).
+- Telemetry/linkstats events only fire from CRC-validated packets.
+
 ## Raw RX diagnostics (round 10)
 
 `rxpkt` — EVERY demodulated packet, unfiltered (command `N` toggles, default

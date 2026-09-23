@@ -96,6 +96,7 @@ static const sniffer_step_t g_fastlink_steps[4] = {
 static uint8_t g_mode; // 0 sweep, 1 harvest, 2 fastlink (uid_last retry)
 static uint32_t g_fastlink_t0;
 static uint8_t g_harvest_idx; // step within harvest/fastlink
+static uint8_t g_lora_regs_seen[2]; // once-per-rate probe bitmap
 // sync_frame dedupe ring (per harvest cycle): recent (nonce, fhss)
 static uint8_t g_sf_ring[16][2];
 static uint8_t g_sf_n;
@@ -497,8 +498,7 @@ static void dwell_begin(uint8_t i)
     // report the dwell that just ended (harvest/fastlink always; FLRC sweep
     // dwells too — that is where "radio deaf" vs "we drop packets" shows)
     if (!g_dwell_reported && g_dwell_name[0] &&
-        (g_mode != 0 || g_dwell_flrc) &&
-        (dwell_demod > 0 || dwell_swerr > 0))
+        (dwell_demod > 0 || dwell_swerr > 0)) // every dwell, LoRa sweep incl.
         rxdiag_emit(g_dwell_name, g_dwell_flrc, false);
     g_dwell_reported = false;
 
@@ -517,6 +517,25 @@ static void dwell_begin(uint8_t i)
     }
     const sniffer_step_t &s = *sp;
     g_radio.apply(s, ELRS_2G4_SYNC_FREQ_HZ);
+    if (!s.rate->flrc) {
+        // modem readback probe (round 12): once per rate per boot. sf/bw/cr
+        // are the raw bytes WE wrote (no register readback exists for
+        // SetModulationParams); reg925/pkt_type ARE read back; rx is raw
+        // continuous SetRx.
+        uint8_t idx = (s.rate->rate_index != 0xFF) ? s.rate->rate_index
+                                                   : (uint8_t)(10 + (s.rate - ELRS_RATES_2X));
+        if (idx < 16 && !(g_lora_regs_seen[idx / 8] & (uint8_t)(1u << (idx % 8)))) {
+            g_lora_regs_seen[idx / 8] |= (uint8_t)(1u << (idx % 8));
+            Module *m = g_radio.mod_ptr();
+            uint8_t v925 = m ? m->SPIreadRegister(ELRS_REG_SF_ADDITIONAL_CONFIG) : 0;
+            uint8_t pt = 0;
+            if (m) m->SPIreadStream(RADIOLIB_SX128X_CMD_GET_PACKET_TYPE, &pt, 1);
+            Serial.printf("{\"t\":\"event\",\"what\":\"lora_regs\",\"rate\":\"%s\","
+                          "\"sf\":\"%02x\",\"bw\":\"%02x\",\"cr\":\"%02x\","
+                          "\"reg925\":\"%02x\",\"pkt_type\":\"%02x\",\"rx\":\"cont\"}\n",
+                          s.rate->name, s.rate->sf, s.rate->bw, s.rate->cr, v925, pt);
+        }
+    }
     g_radio.start_rx();
     step_entered_ms = millis();
     dwell_rssi_max = -128.0f;
@@ -1283,7 +1302,27 @@ void setup()
             g_irq_prev = ni;
             delay(5);
         }
-        rxdiag_emit("selftest", true, true);
+        // LoRa variant: 300 ms LoRa 250 iq=n on the sync frequency — a
+        // total LoRa silence is a modem/RX-path fault, visible at boot.
+        uint32_t flrc_demod = dwell_demod;
+        uint32_t lora_demod = 0;
+        {
+            sniffer_step_t st2 = { &ELRS_RATES_3X[2], false, false };
+            g_radio.apply(st2, ELRS_2G4_SYNC_FREQ_HZ);
+            g_radio.start_rx();
+            uint32_t t1 = millis();
+            while (millis() - t1 < 300) {
+                uint8_t b[ELRS_OTA4_LEN];
+                float r, s2v;
+                uint16_t irqw = 0;
+                if (g_radio.read_packet(b, sizeof(b), r, s2v, &irqw)) lora_demod++;
+                delay(5);
+            }
+        }
+        Serial.printf("{\"t\":\"event\",\"what\":\"rxdiag\",\"rate\":\"selftest\","
+                      "\"band\":\"both\",\"flrc_demod\":%lu,\"lora_demod\":%lu,"
+                      "\"selftest\":true}\n",
+                      (unsigned long)flrc_demod, (unsigned long)lora_demod);
         g_radio.setFlrcDiscovery(false);
     }
     Serial.printf("{\"t\":\"ready\",\"steps\":%u,\"sync_freq\":%lu,\"radio\":%u,\"oled\":%u%s}\n",
@@ -1342,6 +1381,16 @@ void loop()
         else if (c == 'V' || c == 'v') {
             g_verbose = !g_verbose;
             Serial.printf("{\"t\":\"event\",\"what\":\"%s\"}\n", g_verbose ? "verbose_on" : "verbose_off");
+        }
+        else if (c == 'Y' || c == 'y') {
+            sniffer_set_y925(!sniffer_get_y925()); // A/B the 0x925 SF config live
+            Serial.printf("{\"t\":\"event\",\"what\":\"y925_%s\"}\n",
+                          sniffer_get_y925() ? "on" : "off");
+        }
+        else if (c == 'N' || c == 'n') {
+            g_rxpkt = !g_rxpkt; // raw RX export (30/s cap)
+            Serial.printf("{\"t\":\"event\",\"what\":\"%s\"}\n",
+                          g_rxpkt ? "rxpkt_on" : "rxpkt_off");
         } else if (c == 'R' || c == 'r') {
             r_pending = true; r_num = 0; r_digits = 0;
         } else if (c == 'U' || c == 'u') {
@@ -1427,8 +1476,28 @@ void loop()
         size_t want = step_now.rate->payload;
 
         g_rx_busy = true;
-        bool got = g_radio.read_packet(buf, want, rssi, snr);
+        uint16_t irq_word = 0;
+        bool got = g_radio.read_packet(buf, want, rssi, snr, &irq_word);
         g_rx_busy = false;
+        if (got) {
+            dwell_demod++;
+            if (rssi > dwell_rssi_max) dwell_rssi_max = rssi;
+            if (dwell_rssi_min == 0.0f || rssi < dwell_rssi_min) dwell_rssi_min = rssi;
+            if (g_rxpkt || (g_verbose && g_mode != 0)) {
+                if (elrs_rxcap_allow(millis(), &g_rxpkt_window_ms, &g_rxpkt_count, 30)) {
+                    dwell_exported++;
+                    char hex[2 * ELRS_OTA8_LEN + 1];
+                    to_hex(buf, want, hex);
+                    Serial.printf("{\"t\":\"rxpkt\",\"band\":\"%s\",\"rate\":\"%s\","
+                                  "\"hex\":\"%s\",\"rssi\":%d,\"irq\":%u}\n",
+                                  flrc_step ? "flrc" : "lora", step_now.rate->name,
+                                  hex, (int)rssi, irq_word);
+                } else {
+                    dwell_dropped++;
+                    n_rx_dropped++;
+                }
+            }
+        }
         if (got) {
             n_rx++; dwell_rx++; window_rx++;
             if (g_mode != 0) g_sig_frames[flrc_step ? 1 : 0]++;
@@ -1630,7 +1699,12 @@ void loop()
                     if (!flrc_step) on_sync(pkt); // FLRC already handled inline
                     break;
                 case ELRS_PKT_TLM:
-                    n_tlm++; dwell_tlm++; on_tlm(pkt); break;
+                    n_tlm++; dwell_tlm++;
+                    // junk hardening (round 12): telemetry/linkstats only
+                    // from CRC-validated packets — garbage linkstats during
+                    // sweep came from unvalidated tlm-shaped junk
+                    if (pkt.cls == ELRS_PKT_CLASS_CRC_OK) on_tlm(pkt);
+                    break;
                 case ELRS_PKT_RCDATA:
                     n_rc++; dwell_rc++;
                     if (pkt.cls == ELRS_PKT_CLASS_CRC_OK) on_rc(pkt); // junk hardening: sticks only from validated
@@ -1794,6 +1868,17 @@ void loop()
     }
 
     crack_tick();
+
+    // FLRC sync-word-error counting via non-destructive IRQ status diffs
+    // (sticky until the readData path clears them). A real link with a
+    // DIFFERENT sync word spikes swerr at its packet cadence.
+    if (radio_ok && cur_step().rate->flrc && millis() - last_sample_ms >= 50) {
+        uint16_t now_irq = g_radio.irq_status();
+        uint16_t newly = (uint16_t)(now_irq & (uint16_t)~g_irq_prev);
+        if (newly & 0x0200) dwell_swerr++; // SyncWordError bit 9
+        g_irq_prev = now_irq;
+        last_sample_ms = millis();
+    }
 
     led_update(locked, uist.pps);
     stats_tick(); // always runs — alive-with-no-radio still emits 1 Hz JSON

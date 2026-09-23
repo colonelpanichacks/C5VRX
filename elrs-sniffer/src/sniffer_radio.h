@@ -29,6 +29,8 @@ typedef struct {
 // legacy 2.x variants. FLRC rates are deliberately absent — their 32-bit sync
 // word is UID-derived (see elrs_defs.h); hunting them is a post-capture TODO.
 void sniffer_sweep_build(sniffer_sweep_t *sw);
+void sniffer_set_y925(bool en);
+bool sniffer_get_y925();
 
 // ---- pin-set table for the startup auto-probe ------------------------------
 // The V1.2 SX1280 wiring per LilyGo's factory sources, plus the alternates

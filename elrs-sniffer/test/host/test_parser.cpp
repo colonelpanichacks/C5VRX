@@ -963,6 +963,37 @@ int main()
     }
     printf("ok: SF config values + 4.x golden (master layout, ^0x0400, otaver tag)\n");
 
+    // 14p) TELEMETRY GATING (round 12): unvalidated tlm-shaped junk must
+    //      classify PLAUSIBLE (never CRC_OK) so the main-path gate
+    //      (on_tlm only for CRC_OK) suppresses linkstats/gps/batt events.
+    {
+        elrs_decode_ctx_t ctx;
+        elrs_decode_init(&ctx);
+        // OTA4 LINK-type tlm packet shape (type 3, tlmType 1) with plausible
+        // bytes but NO valid CRC (random junk)
+        uint8_t junk[ELRS_OTA4_LEN] = { ELRS_PKT_TLM, 0x45, 0x55, 0xAA, 0x33, 0x0F, 0x7F, 0x21 };
+        elrs_packet_t out;
+        bool ok = elrs_decode_packet(&ctx, junk, ELRS_OTA4_LEN, &out);
+        assert(ok && out.type == ELRS_PKT_TLM);
+        assert(out.cls != ELRS_PKT_CLASS_CRC_OK); // gate keeps it unvalidated
+        // junk must not set linkstats from the LINK branch
+        assert(!out.linkstats.valid || out.cls != ELRS_PKT_CLASS_CRC_OK);
+        // a VALIDATED tlm packet still parses linkstats (validated path intact)
+        ctx.crc_init_known = true;
+        ctx.crc_init = 0x1234;
+        uint8_t good[ELRS_OTA4_LEN] = { ELRS_PKT_TLM, 0x45, 0x55, 0xAA, 0x33, 0x0F, 0x7F, 0 };
+        uint16_t crc = elrs_crc14(good, 7, ctx.crc_init);
+        good[0] |= (uint8_t)((crc >> 8) << 2);
+        good[7] = (uint8_t)(crc & 0xFF);
+        elrs_decode_init(&ctx);
+        ctx.crc_init_known = true;
+        ctx.crc_init = 0x1234;
+        ok = elrs_decode_packet(&ctx, good, ELRS_OTA4_LEN, &out);
+        assert(ok && out.cls == ELRS_PKT_CLASS_CRC_OK && out.type == ELRS_PKT_TLM);
+        assert(out.linkstats.valid && out.linkstats.lq <= 100);
+    }
+    printf("ok: telemetry gating (junk unvalidated, validated emits)\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.
