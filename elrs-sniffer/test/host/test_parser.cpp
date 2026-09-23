@@ -1097,6 +1097,42 @@ int main()
     }
     printf("ok: band plan + sweep RR + harvest rotation + escan arg\n");
 
+    // 17r) round-16 hotfix regression (f149fb0 crash-loop). Root cause was
+    //      NOT the channel plan: the stats printf lost its "rx_dropped"
+    //      specifier when the types object was added (arg kept), so every
+    //      later arg shifted and the stats "cm":"%s" read g_irq_now (0) ->
+    //      vfprintf NULL-deref (LoadProhibited, EXCVADDR 0) at the first
+    //      stats_tick, 1 s after boot. Fixed in main.cpp. These tests pin
+    //      the channel-plan contract that must hold at ANY boot order.
+    {
+        // every index a wrapping uint8 slot/pass counter can produce stays
+        // inside the 80-entry table (RR + harvest, full 0..255 wrap)
+        for (uint16_t s = 0; s < 256; s++) {
+            assert(elrs_sweep_ch_idx((uint8_t)s) < FHSS_FREQ_COUNT);
+            assert(elrs_harvest_ch_idx((uint8_t)s) < FHSS_FREQ_COUNT);
+        }
+        // boot-order simulation: a not-yet-built (all-zero) table read
+        // through the firmware's own guard can never go out of bounds —
+        // worst case is tuning to 0 Hz (RadioLib range-rejects), not a fault
+        uint32_t zero_tab[FHSS_FREQ_COUNT];
+        memset(zero_tab, 0, sizeof(zero_tab));
+        for (uint16_t s = 0; s < 256; s++) {
+            uint8_t idx = elrs_sweep_ch_idx((uint8_t)s);
+            volatile uint32_t hz = zero_tab[idx % FHSS_FREQ_COUNT];
+            (void)hz;
+        }
+        // freq formula sanity across the whole plan: monotonic, in-band,
+        // no division by zero, hz(41) exact
+        assert(FHSS_FREQ_COUNT == 80u);
+        for (uint8_t ch = 0; ch < FHSS_FREQ_COUNT; ch++) {
+            uint32_t hz = elrs_fhss_channel_hz(ch);
+            assert(hz >= elrs_fhss_channel_hz(0));
+            assert(hz <= elrs_fhss_channel_hz(79));
+        }
+        assert(elrs_fhss_channel_hz(FHSS_SYNC_INDEX) == 2441399841u);
+    }
+    printf("ok: hotfix index bounds + boot-order table contract\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

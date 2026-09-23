@@ -316,6 +316,26 @@ the link lived on the other 2/3 of the band. Fix: cover the band.
   rotation: expect the `dwell` event's rate field to repeat with cycling
   `ch_idx`.
 
+## Round 16 hotfix: stats/dwell printf realignment (f149fb0 crash-loop)
+
+Field capture showed 13 boots/60 s, `Guru Meditation Error (LoadProhibited,
+EXCVADDR 0)` inside `_svfprintf_r` ~1 s after `ready`, before the first
+`stats` line ever printed. Root cause was NOT the channel plan: the `stats`
+printf format lost its `"rx_dropped":%lu` specifier when the `types` object
+was added (round 10), while the `n_rx_dropped` arg stayed — every later arg
+shifted one position, and the round-15 `"cm":"%s"` conversion received
+`g_irq_now` (0) → vfprintf dereferenced address 0. Round 14 and earlier
+survived only because all shifted conversions were numeric (silent garbage
+in `types`/`ch`). Round 15 was the first to place a `%s` after the shift and
+the first flashed since. Fix: the `rx_dropped` specifier is restored (it was
+documented in this table all along but was never actually emitted) and the
+mirror-image `dwell`-event arg added (`dwell.rx_dropped` now populated;
+before, the specifier existed but the arg didn't, also shifting `dwell`
+types counts). Channel-plan hardening at the same time: the table is built
+at the TOP of setup() (before any radio/OLED init) and all reads go through
+a bounds-guarded `dwell_ch_hz(idx)` accessor. Host test 17r pins the
+index/table contract for any boot order.
+
 ## Round 13: standby-first dwell config (smoking gun)
 
 `dwell_setup` dbg now reports `{rate,sf,bw,cr,cm_before,cm_after,raw}` —

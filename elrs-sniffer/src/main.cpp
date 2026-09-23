@@ -109,6 +109,10 @@ static uint32_t g_ch_freq[FHSS_FREQ_COUNT];
 static uint8_t g_dwell_ch = FHSS_SYNC_INDEX; // current dwell channel idx
 static uint8_t g_sweep_ch_slot;              // sweep round-robin position
 static uint8_t g_harvest_pass;               // harvest rotation counter
+// bounds-guarded table read (round-16 hotfix): every dwell channel index
+// comes from the RR/rotation helpers and is in range by construction; the
+// mod is belt-and-braces against a future caller passing a wild index.
+static uint32_t dwell_ch_hz(uint8_t idx) { return g_ch_freq[idx % FHSS_FREQ_COUNT]; }
 // sync_frame dedupe ring (per harvest cycle): recent (nonce, fhss)
 static uint8_t g_sf_ring[16][2];
 static uint8_t g_sf_n;
@@ -322,7 +326,7 @@ static void crack_tick()
         g_crack = false;
         crack_emit("failed");
         Serial.println("{\"t\":\"event\",\"what\":\"uid2_crack_failed\"}");
-        g_radio.tune(g_ch_freq[g_dwell_ch]); // back to the dwell's channel
+        g_radio.tune(dwell_ch_hz(g_dwell_ch)); // back to the dwell's channel
         return;
     }
     g_crack_score = 0;
@@ -544,7 +548,7 @@ static void dwell_begin(uint8_t i)
         g_sweep_ch_slot = (uint8_t)((g_sweep_ch_slot + 1) % ELRS_SWEEP_CH_N);
     }
     const sniffer_step_t &s = *sp;
-    g_radio.apply(s, g_ch_freq[g_dwell_ch]);
+    g_radio.apply(s, dwell_ch_hz(g_dwell_ch));
     if (!s.rate->flrc) {
         // modem readback probe (round 12): once per rate per boot. sf/bw/cr
         // are the raw bytes WE wrote (no register readback exists for
@@ -604,7 +608,7 @@ static void dwell_begin(uint8_t i)
     snprintf(g_dwell_name, sizeof(g_dwell_name), "%s", s.rate->name);
     g_dwell_flrc = s.rate->flrc != 0;
     uist.iq_inverted = s.iq_inverted;
-    uist.freq_hz = g_ch_freq[g_dwell_ch];
+    uist.freq_hz = dwell_ch_hz(g_dwell_ch);
 }
 
 static const char *pkt_type_name(uint8_t t)
@@ -637,9 +641,10 @@ static void dwell_advance()
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu}}\n",
                   step_idx, s.rate->name, s.iq_inverted ? 'i' : 'n',
                   s.legacy_2x ? 1 : 0, g_dwell_ch,
-                  (unsigned long)g_ch_freq[g_dwell_ch], (int)dwell_rssi_max,
+                  (unsigned long)dwell_ch_hz(g_dwell_ch), (int)dwell_rssi_max,
                   (int)g_disc.nf, (int)(g_disc.nf + ELRS_DISC_NF_MARGIN),
                   (unsigned long)dwell_rx, (unsigned long)dwell_crc_ok,
+                  (unsigned long)dwell_dropped,
                   (unsigned long)dwell_rc, (unsigned long)dwell_msp,
                   (unsigned long)dwell_sync, (unsigned long)dwell_tlm,
                   (unsigned long)dwell_unk);
@@ -660,7 +665,7 @@ static void dwell_advance()
             memset(g_sig_crc, 0, sizeof(g_sig_crc));
             g_sig_repeat_tails = 0;
             Serial.printf("{\"t\":\"event\",\"what\":\"harvest\",\"state\":\"start\",\"freq\":%lu,\"ch_idx\":%u}\n",
-                          (unsigned long)g_ch_freq[elrs_harvest_ch_idx(g_harvest_pass)],
+                          (unsigned long)dwell_ch_hz(elrs_harvest_ch_idx(g_harvest_pass)),
                           elrs_harvest_ch_idx(g_harvest_pass));
             dwell_begin(0);
             return;
@@ -868,7 +873,7 @@ static void stats_tick()
                   "\"crack\":\"%s\",\"mode\":\"%s\",\"conn\":\"%s\","
                   "\"sig\":{\"q\":\"%s\",\"frames\":%lu,\"sync_struct\":%lu,\"crc_pass\":%lu,"
                   "\"lora\":{\"f\":%lu,\"s\":%lu,\"c\":%lu},\"flrc\":{\"f\":%lu,\"s\":%lu,\"c\":%lu}},"
-                  "\"rx\":%lu,\"crc_ok\":%lu,"
+                  "\"rx\":%lu,\"crc_ok\":%lu,\"rx_dropped\":%lu,"
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},"
                   "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u,"
                   "\"irq\":\"%02x\",\"cm\":\"%s\",\"rxdone_latched\":%lu,\"dio_miss\":%lu",
@@ -1232,6 +1237,13 @@ static void early_banner()
 
 void setup()
 {
+    // round 16 hotfix: build the 80-channel table FIRST — before any radio /
+    // OLED / UI init. g_ch_freq is BSS (zero-init) so an early read can at
+    // worst tune to 0 Hz (RadioLib range-rejects it), but the table must be
+    // complete before the first dwell_begin.
+    for (uint8_t chi = 0; chi < FHSS_FREQ_COUNT; chi++)
+        g_ch_freq[chi] = elrs_fhss_channel_hz(chi);
+
     led_boot_marker_start();
     uint32_t boot_mark_t0 = millis();
     early_banner(); // MUST NOT be preceded by anything that can stall
@@ -1295,9 +1307,7 @@ void setup()
 
     // round 16: the 80-channel ELRS frequency table (register-exact plan,
     // elrs_fhss.h) — sweep/harvest dwells pick from this instead of
-    // squatting on the sync channel.
-    for (uint8_t chi = 0; chi < FHSS_FREQ_COUNT; chi++)
-        g_ch_freq[chi] = elrs_fhss_channel_hz(chi);
+    // squatting on the sync channel. (Built at the top of setup().)
 
     char ready_extra[64] = { 0 };
     if (g_working_pins) {
@@ -1431,7 +1441,7 @@ static void escan_run(bool peak_mode, uint32_t center_hz)
     for (uint32_t i = 0; i < ELRS_ESCAN_POINTS; i++)
         Serial.printf("%s%d", i ? "," : "", rssi[i]);
     Serial.println("]}");
-    g_radio.recover(cur_step(), g_ch_freq[g_dwell_ch]); // restore the dwell
+    g_radio.recover(cur_step(), dwell_ch_hz(g_dwell_ch)); // restore the dwell
 }
 
 // Reference RX mode (round 15): the KNOWN-GOOD RadioLib baseline. STOCK
@@ -1473,7 +1483,7 @@ static void ref_run()
         delay(1);
     }
     Serial.printf("{\"t\":\"event\",\"what\":\"refdone\",\"n\":%u}\n", n);
-    g_radio.recover(cur_step(), g_ch_freq[g_dwell_ch]); // restore the dwell
+    g_radio.recover(cur_step(), dwell_ch_hz(g_dwell_ch)); // restore the dwell
 }
 
 void loop()
@@ -1981,7 +1991,7 @@ void loop()
                         Serial.printf("{\"t\":\"dwell\",\"step\":%d,\"rate\":\"%s\",\"iq\":\"%c\",\"legacy\":%u,\"ch_idx\":%u,\"freq\":%lu,\"rssi_max\":%d,\"rx\":%lu,\"crc_ok\":%lu,\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},\"jump\":\"iq-twin\"}\n",
                                       step_idx, cur.rate->name, cur.iq_inverted ? 'i' : 'n',
                                       cur.legacy_2x ? 1 : 0, g_dwell_ch,
-                                      (unsigned long)g_ch_freq[g_dwell_ch], (int)dwell_rssi_max,
+                                      (unsigned long)dwell_ch_hz(g_dwell_ch), (int)dwell_rssi_max,
                                       (unsigned long)dwell_rx, (unsigned long)dwell_crc_ok,
                                       (unsigned long)dwell_rc, (unsigned long)dwell_msp,
                                       (unsigned long)dwell_sync, (unsigned long)dwell_tlm,
@@ -2010,7 +2020,7 @@ void loop()
             Serial.printf("{\"t\":\"error\",\"what\":\"dwell_timeout\",\"rate\":\"%s\",\"iq\":\"%c\",\"ms\":%lu}\n",
                           cur.rate->name, cur.iq_inverted ? 'i' : 'n',
                           (unsigned long)(millis() - step_entered_ms));
-            g_radio.recover(sweep.steps[step_idx], g_ch_freq[g_dwell_ch]);
+            g_radio.recover(sweep.steps[step_idx], dwell_ch_hz(g_dwell_ch));
             dwell_advance();
         }
         // RX demote rules (rx_main.cpp:2211 + 2222), sync-grace extended:
