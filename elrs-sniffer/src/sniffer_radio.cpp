@@ -120,6 +120,18 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
         rc_pp = static_cast<SnifferSX1280 *>(radio)->setPacketParamsGFSK(
             0x70, 0x04, 0x10, RADIOLIB_SX128X_GFSK_FLRC_CRC_3_BYTE,
             0x08, payload_len, RADIOLIB_SX128X_GFSK_FLRC_PACKET_FIXED);
+        if (flrc_discovery) {
+            // discovery: no sync-word match, CRC off — pure demod, parser gates
+            rc_pp = static_cast<SnifferSX1280 *>(radio)->setPacketParamsGFSK(
+                0x70, 0x00, 0x00, RADIOLIB_SX128X_GFSK_FLRC_CRC_OFF,
+                0x08, payload_len, RADIOLIB_SX128X_GFSK_FLRC_PACKET_FIXED);
+            uint8_t st = 0;
+            mod->SPIreadStream(RADIOLIB_SX128X_CMD_GET_STATUS, &st, 1);
+            Serial.printf("{\"t\":\"dbg\",\"what\":\"flrc_discovery\",\"fq\":%d,\"mp\":%d,"
+                          "\"pp\":%d,\"status\":%u}\n",
+                          (int)rc_fq, (int)rc_mp, (int)rc_pp, st);
+            return rc_fq == 0 && rc_mp == 0 && rc_pp == 0;
+        }
         // sync word at ELRS's REG_FLRC_SYNC_WORD (0x9CF), 4 bytes MSB-first,
         // DS 16.4 first-two-byte swap — direct write because RadioLib's
         // setSyncWord targets 0x9C5 and reverses byte order.

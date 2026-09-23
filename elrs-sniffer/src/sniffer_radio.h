@@ -59,6 +59,14 @@ public:
     // path underneath is bounded by RadioLib's busy-pin timeout — this is
     // the dwell watchdog's recovery hammer; it cannot hang the caller.
     bool recover(const sniffer_step_t &step, uint32_t freq_hz);
+    // FLRC discovery mode (unknown UID): no sync-word match and radio CRC
+    // OFF — the keyed 32-bit sync word and the seeded CRC both depend on
+    // the (unknown) UID, so exact filtering is impossible until a sync
+    // packet leaks UID[3..5]. Discovery takes raw demod bursts and lets the
+    // parser's structure gates do the filtering. (The SX1280 FLRC has no
+    // usable 16-bit-match-any mode; this is the physically real equivalent.)
+    void setFlrcDiscovery(bool d) { flrc_discovery = d; }
+    bool flrcDiscovery() const { return flrc_discovery; }
     // Retune only (FHSS hop-following). Bounded by RadioLib internals.
     bool tune(uint32_t freq_hz);
     // FLRC identity: 32-bit sync word = uidMacSeedGet(UID), radio CRC seed =
@@ -87,6 +95,7 @@ private:
     uint8_t flrc_sw[4] = { 0, 0, 0, 3 };  // uidMacSeedGet (default-phrase UID)
     uint16_t flrc_seed = 3;               // OtaCrcInitializer for the FLRC radio CRC
     bool flrc_id_ok = false;
+    bool flrc_discovery = false;
 };
 
 extern SnifferRadio g_radio;

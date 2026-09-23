@@ -40,6 +40,7 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 | `radio` | 0/1 | — | 0 = radio faulted (no SX1280); device alive but deaf. `rssi` is then the last/initial -128 sentinel |
 | `rx`, `crc_ok` | uint | count | cumulative since boot: RxDone demods / ELRS-CRC-validated packets |
 | `types` | object | count | cumulative per-type parses: `rc`, `msp`, `sync`, `tlm`, and `unk` (demodded but failed classification = noise) |
+| `sync_only` | 0/1 | — | locked but no validated RC data for >2 s — a sync-follow lock (TX beaconing, model disarmed/off). Sticks in `ch` are stale; expect no telemetry |
 | `uid` | string, optional | — | `UID[3..5]` as lowercase hex — **link fingerprint, not identity**; absent until a sync is captured |
 
 ## Events
@@ -158,6 +159,19 @@ Boot/lifecycle:
   - `uid_cracked` — full UID recovered, hop-following starts:
     `{"t":"event","what":"uid_cracked","uid":".. .. .. .. .. .."}`.
   - `uid2_crack_failed` — all 256 candidates exhausted.
+- `flrc_discovery` — FLRC unknown-UID discovery state machine:
+  `listening` (dwell parked in discovery: no sync-word match, CRC off) →
+  `sync_seen` (a sync-structured packet leaked a UID tail) → `cracking`
+  (tail adopted after 2 consistent syncs; exact per-candidate sync words,
+  radio-CRC scoring) → `cracked` (exact 32-bit sync + true seed, following).
+  Phrase-derived UID stays the fast path: `flrc_sync match:1` on the first
+  sync skips structural gating.
+
+Lock semantics (sync-only streams): a lock drops only when BOTH no
+validated data packet for 6 s AND no validated sync for 30 s — a TX
+beaconing syncs (disconnected fast-sync) holds `lock:1` with
+`sync_only:1` indefinitely instead of churning lock/unlock. FHSS
+hop-following runs in both cases (syncs re-anchor the sequence).
   Console commands: `P` = radio pin re-probe, `D` = toggle OLED driver,
   `V` = print every demodded packet as `rawpkt` (10/s), `R [step]` = park
   the sweep on a step (`R` alone resumes; steps are numbered 0..N-1 as
