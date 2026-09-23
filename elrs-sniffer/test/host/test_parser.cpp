@@ -925,6 +925,44 @@ int main()
     }
     printf("ok: rxpkt rate cap (30/s sliding window)\n");
 
+    // 14o) ROUND 11: SF additional config + ELRS 4.x (master) air support.
+    {
+        // REG_SF_ADDITIONAL_CONFIG (SX1280.cpp:283-299)
+        assert(elrs_sf_additional_config(0x50) == 0x1E); // SF5
+        assert(elrs_sf_additional_config(0x60) == 0x1E); // SF6
+        assert(elrs_sf_additional_config(0x70) == 0x37); // SF7
+        assert(elrs_sf_additional_config(0x80) == 0x37); // SF8
+        assert(elrs_sf_additional_config(0x90) == 0x32); // SF9 (legacy 2.x)
+
+        // 4.x golden sync (master OTA.h layout + tx_main GenerateSyncPacket-
+        // Data): b3 = rfRateEnum (RATE_LORA_250HZ = 7), b4 = packed
+        // switchEnc|tlm|gemini|proto, b5 = UID4, b6 = UID5, CRC init ^0x0400.
+        const uint8_t UID4 = 0x61, UID5 = 0xce, MODEL = 5;
+        elrs_decode_ctx_t ctx;
+        elrs_decode_init(&ctx);
+        uint8_t pkt[ELRS_OTA4_LEN] = { ELRS_PKT_SYNC, 80, 33, ELRS_RATE_ENUM_LORA250, 0, UID4, 0, 0 };
+        pkt[4] = (uint8_t)((1 << 0) | (2 << 1) | (0 << 4) | (1 << 5)); // sw=1 tlm=2 gemini=0 proto=1
+        pkt[6] = (uint8_t)(UID5 ^ (~MODEL & 0x3F));
+        uint16_t init = (uint16_t)((((uint16_t)UID4 << 8) | UID5) ^ ELRS_OTA4X_VER_XOR);
+        uint16_t crc = elrs_crc14(pkt, 7, init);
+        pkt[0] |= (uint8_t)((crc >> 8) << 2);
+        pkt[7] = (uint8_t)(crc & 0xFF);
+        elrs_packet_t out;
+        bool ok = elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out);
+        assert(ok && out.type == ELRS_PKT_SYNC);
+        assert(out.cls == ELRS_PKT_CLASS_CRC_OK);
+        assert(ctx.otaver == 4 && ctx.layout == 4);
+        assert(out.sync.rate_index == 6);   // enum LORA250 -> our table idx 6
+        assert(out.sync.uid4 == UID4);      // raw packet bytes
+        assert(ctx.uid4 == UID4 && ctx.uid5 == UID5); // TRUE uid5 (XOR removed)
+        assert(out.sync.uid3 == 0);         // 4.x broadcasts no UID3
+        assert(ctx.model_id == MODEL);      // modelId recovered via the sweep
+        // NOTE: a 4.x frame also validates under 3.x-family inits via the
+        // modelId sweep (the families are CRC-compatible by design) — layout
+        // disambiguation comes from the rfRateEnum byte sanity, not CRC.
+    }
+    printf("ok: SF config values + 4.x golden (master layout, ^0x0400, otaver tag)\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

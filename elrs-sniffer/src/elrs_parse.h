@@ -80,6 +80,10 @@ typedef struct {
     uint8_t  cfg_uid4, cfg_uid5;
     bool     cfg_uid_valid;
     uint8_t  model_id;      // recovered ELRS modelId (0xFF = model match off/none)
+    uint8_t  otaver;        // 0 unknown, 3, 4 (which CRC-init family validated)
+    uint8_t  exp_nonce;     // expected slot nonce (4.x non-sync init mixing)
+    bool     exp_valid;
+    uint8_t  layout;        // sync layout: 0 unknown, 3, 4
     bool     uid_known;
     uint8_t  uid3, uid4, uid5;
     uint8_t  switch_mode;       // ELRS_SW_* from sync packet (best guess if none)
@@ -242,6 +246,18 @@ static inline bool elrs_rxcap_allow(uint32_t now_ms, uint32_t *window_ms,
     (*count)++;
     return true;
 }
+
+// SX1280 REG_SF_ADDITIONAL_CONFIG (0x925) value per SF (SX1280.cpp:283-299):
+// 0x1E for SF5/SF6, 0x37 for SF7/SF8, 0x32 for SF9+. RadioLib omits this
+// register entirely — a likely deafness cause. sf is the register enum
+// (0x50 = SF5 .. 0x90 = SF9).
+static inline uint8_t elrs_sf_additional_config(uint8_t sf)
+{
+    if (sf <= 0x60) return 0x1E;
+    if (sf <= 0x80) return 0x37;
+    return 0x32;
+}
+#define ELRS_REG_SF_ADDITIONAL_CONFIG 0x925u
 
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only

@@ -32,6 +32,24 @@
 // 3.x = 3. 4.x increments this — one more thing that breaks naive decoding.
 // ---------------------------------------------------------------------------
 #define ELRS_OTA_VERSION_ID_3X   3u
+// ELRS 4.x (master) OTA_VERSION_ID is XORed into the HIGH byte of the CRC
+// init (master OTA.cpp OtaUpdateCrcInitFromUid: `^= OTA_VERSION_ID << 8`),
+// leaving room for the per-packet nonce mix on non-sync packets
+// (GeneratePacketCrcStd/Full: `OtaCrcInitializer ^ OtaNonce` for type != SYNC).
+#define ELRS_OTA4X_VER_XOR 0x0400u
+// 4.x sync rate byte is the RATE ENUM (master tx_main GenerateSyncPacketData:
+// rfRateEnum = enum_rate), not the table index. Map enum -> our rate_index.
+#define ELRS_RATE_ENUM_FLRC1000 13
+#define ELRS_RATE_ENUM_FLRC500  12
+#define ELRS_RATE_ENUM_DVDA500  10
+#define ELRS_RATE_ENUM_DVDA250  11
+#define ELRS_RATE_ENUM_LORA500   4
+#define ELRS_RATE_ENUM_LORA3338  5
+#define ELRS_RATE_ENUM_LORA250   7
+#define ELRS_RATE_ENUM_LORA150   6
+#define ELRS_RATE_ENUM_LORA1008  8
+#define ELRS_RATE_ENUM_LORA50    9
+#define ELRS_RATE_ENUM_MAX      19
 
 // ---------------------------------------------------------------------------
 // UID

@@ -389,28 +389,62 @@ bool elrs_sync_crc_selfseed(const uint8_t *data, size_t len,
     const uint8_t pkt_uid4 = data[5];
     const uint8_t pkt_uid5 = data[6];
 
-    // pass 1: seed derived from the frame's own bytes (model match OFF)
-    uint16_t init = elrs_crc_init_from_uid(pkt_uid4, pkt_uid5);
-    if (is8 ? ota8_crc_ok(data, init) : ota4_crc_ok(data, init, 0)) {
-        *init_out = init;
-        *uid5_true_out = pkt_uid5;
-        *model_id_out = 0xFF;
-        return true;
-    }
-    // pass 2: modelId sweep 0..63 — UID5' = UID5 ^ (~m & 0x3f), recompute
-    // seed+CRC; a hit recovers the true UID5 and the modelId
-    for (uint8_t m = 0; m < 64; m++) {
-        uint8_t uid5_true = (uint8_t)(pkt_uid5 ^ (uint8_t)(~m & ELRS_MODELMATCH_MASK));
-        uint16_t cand = elrs_crc_init_from_uid(pkt_uid4, uid5_true);
-        if (cand == init) continue;
-        if (is8 ? ota8_crc_ok(data, cand) : ota4_crc_ok(data, cand, 0)) {
-            *init_out = cand;
-            *uid5_true_out = uid5_true;
-            *model_id_out = m;
+    // Try BOTH OTA families (master OTA.cpp OtaUpdateCrcInitFromUid):
+    //   3.x: init = (UID4<<8|UID5) ^ 3
+    //   4.x: init = (UID4<<8|UID5) ^ (OTA_VERSION_ID << 8)   (VERSION_ID = 4)
+    // plus the 64-way modelId sweep per family.
+    for (uint8_t ver = 3; ver <= 4; ver++) {
+        uint16_t verxor = (ver == 3) ? ELRS_OTA_VERSION_ID_3X : ELRS_OTA4X_VER_XOR;
+        uint16_t init = (uint16_t)((((uint16_t)pkt_uid4 << 8) | pkt_uid5) ^ verxor);
+        if (is8 ? ota8_crc_ok(data, init) : ota4_crc_ok(data, init, 0)) {
+            *init_out = init;
+            *uid5_true_out = pkt_uid5;
+            *model_id_out = 0xFF;
             return true;
+        }
+        for (uint8_t m = 0; m < 64; m++) {
+            uint8_t uid5_true = (uint8_t)(pkt_uid5 ^ (uint8_t)(~m & ELRS_MODELMATCH_MASK));
+            uint16_t cand = (uint16_t)((((uint16_t)pkt_uid4 << 8) | uid5_true) ^ verxor);
+            if (cand == init) continue;
+            if (is8 ? ota8_crc_ok(data, cand) : ota4_crc_ok(data, cand, 0)) {
+                *init_out = cand;
+                *uid5_true_out = uid5_true;
+                *model_id_out = m;
+                return true;
+            }
         }
     }
     return false;
+}
+
+// 4.x sync layout (master OTA.h OTA_Sync_s + tx_main GenerateSyncPacketData):
+// byte3 = rfRateEnum (the RATE ENUM, not table index), byte4 = switchEnc:1 |
+// tlm:3 | gemini:1 | otaProto:2 | free:1, byte5 = UID4, byte6 = UID5 (NO UID3).
+static uint8_t sync_layout_detect(const uint8_t *d)
+{
+    uint8_t rate3 = (uint8_t)(d[3] >> 4);
+    uint8_t tlm3 = (uint8_t)((d[3] >> 1) & 0x07);
+    if (rate3 <= 9 && tlm3 <= 7) return 3;               // 3.x packed byte
+    uint8_t tlm4 = (uint8_t)((d[4] >> 1) & 0x07);
+    if (d[3] <= ELRS_RATE_ENUM_MAX && tlm4 <= 7) return 4; // 4.x rfRateEnum
+    return 0;
+}
+
+static uint8_t rate_enum_to_index(uint8_t e)
+{
+    switch (e) {
+    case ELRS_RATE_ENUM_FLRC1000: return 0;
+    case ELRS_RATE_ENUM_FLRC500:  return 1;
+    case ELRS_RATE_ENUM_DVDA500:  return 2;
+    case ELRS_RATE_ENUM_DVDA250:  return 3;
+    case ELRS_RATE_ENUM_LORA500:  return 4;
+    case ELRS_RATE_ENUM_LORA3338: return 5;
+    case ELRS_RATE_ENUM_LORA250:  return 6;
+    case ELRS_RATE_ENUM_LORA150:  return 7;
+    case ELRS_RATE_ENUM_LORA1008: return 8;
+    case ELRS_RATE_ENUM_LORA50:   return 9;
+    default: return 0xFF;
+    }
 }
 
 // --- main entry ---
@@ -477,15 +511,20 @@ bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
                 init = 0; got = true; // bind mode (CRC init 0)
             }
         }
-        // FP gate (round 9): a CRC pass is NOT enough — the sync fields must
-        // be structurally sane (rateIdx<=9, tlmRatio<=7, fhss<240). Without
-        // this, ~2^-14 chance hits emitted ok:1 with impossible rateIdx 11/15.
+        // otaver + layout come from the WINNING CRC family (the byte
+        // layouts are ambiguous: e.g. b3=0x07 parses plausibly under both).
+        // FP gate (round 9 + 11): a CRC pass is NOT enough — the fields must
+        // be structurally sane under the winning layout.
         if (got) {
-            elrs_sync_info_t chk;
-            chk.rate_index = data[3] >> 4;
-            chk.tlm_ratio = (data[3] >> 1) & 0x07;
-            chk.fhss_index = data[1];
-            if (!elrs_identity_sane(&chk)) got = false;
+            ctx->otaver = (((init ^ ELRS_OTA4X_VER_XOR) >> 8) == data[5]) ? 4 : 3;
+            ctx->layout = ctx->otaver; // layouts are 1:1 with the family here
+            if (ctx->layout == 4) {
+                if (rate_enum_to_index(data[3]) == 0xFF ||
+                    ((data[4] >> 1) & 0x07) > 7 || data[1] >= 240) got = false;
+            } else if ((data[3] >> 4) > 9 || ((data[3] >> 1) & 0x07) > 7 ||
+                       data[1] >= 240) {
+                got = false; // 3.x packed-byte sanity
+            }
         }
         crc_ok = got;
         if (got && !ctx->crc_init_known) {
@@ -502,10 +541,20 @@ bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
     } else if (ctx->crc_init_known) {
         if (is8) {
             crc_ok = ota8_crc_ok(data, ctx->crc_init);
+            // 4.x nonce-mixed init on non-sync packets (master OTA.cpp)
+            if (!crc_ok && ctx->exp_valid)
+                crc_ok = ota8_crc_ok(data, (uint16_t)(ctx->crc_init ^ ctx->exp_nonce));
         } else if (out->type == ELRS_PKT_RCDATA) {
             crc_ok = ota4_rc_crc_ok(ctx, data, 4); // hop=4 (250Hz class; TODO per-rate)
+            if (!crc_ok && ctx->exp_valid) {
+                uint8_t tmp[7]; memcpy(tmp, data, 7); tmp[0] = (data[0] & 0x03);
+                uint16_t incrc = (uint16_t)((((uint16_t)data[0] >> 2) << 8) | data[7]);
+                crc_ok = elrs_crc14(tmp, 7, (uint16_t)(ctx->crc_init ^ ctx->exp_nonce)) == incrc;
+            }
         } else {
             crc_ok = ota4_crc_ok(data, ctx->crc_init, 0);
+            if (!crc_ok && ctx->exp_valid)
+                crc_ok = ota4_crc_ok(data, (uint16_t)(ctx->crc_init ^ ctx->exp_nonce), 0);
         }
     }
     out->cls = crc_ok ? ELRS_PKT_CLASS_CRC_OK : ELRS_PKT_CLASS_PLAUSIBLE;
@@ -588,12 +637,22 @@ bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
     case ELRS_PKT_SYNC: {
         out->sync.fhss_index = data[1];
         out->sync.nonce = data[2];
-        out->sync.switch_mode = data[3] & 1;
-        out->sync.tlm_ratio = (data[3] >> 1) & 0x07;
-        out->sync.rate_index = data[3] >> 4;
-        out->sync.uid3 = data[4];
-        out->sync.uid4 = data[5];
-        out->sync.uid5 = data[6];
+        if (ctx->layout == 4) {
+            // master layout: rfRateEnum byte + packed gemini/otaProto byte
+            out->sync.rate_index = rate_enum_to_index(data[3]);
+            out->sync.switch_mode = data[4] & 1;
+            out->sync.tlm_ratio = (data[4] >> 1) & 0x07;
+            out->sync.uid3 = 0; // UID3 is NOT broadcast in 4.x syncs
+            out->sync.uid4 = data[5];
+            out->sync.uid5 = data[6];
+        } else {
+            out->sync.switch_mode = data[3] & 1;
+            out->sync.tlm_ratio = (data[3] >> 1) & 0x07;
+            out->sync.rate_index = data[3] >> 4;
+            out->sync.uid3 = data[4];
+            out->sync.uid4 = data[5];
+            out->sync.uid5 = data[6];
+        }
         out->nonce = data[2];
         if (!crc_ok) {
             // unknown link and not bind mode: only structurally sane 3.x

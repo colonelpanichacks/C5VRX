@@ -74,17 +74,18 @@ static uint32_t g_int_t0, g_int_rx0, g_int_log_ms;
 // LoRa frames validate via the self-seeded CRC14 (direct lock possible);
 // FLRC frames feed the uid45 seed brute (2^16 x 4 CRC24 variants).
 #define HARVEST_STEPS 8
-#define HARVEST_DWELL_MS 750u
+#define HARVEST_DWELL_MS 2200u // syncs only when the TX sequence visits ch41
+                               // (every 80 hops: ~1.28s LoRa250 / 0.32s DVDA)
 #define FASTLINK_MS 60000u
 static const sniffer_step_t g_harvest_steps[HARVEST_STEPS] = {
-    { &ELRS_RATES_FLRC[0], false, false },  // FLRC 1000Hz (discovery)
-    { &ELRS_RATES_FLRC[1], false, false },  // FLRC 500Hz (discovery)
-    { &ELRS_RATES_FLRC[2], false, false },  // DVDA 500
-    { &ELRS_RATES_FLRC[3], false, false },  // DVDA 250
-    { &ELRS_RATES_3X[2], false, false },    // LoRa 250 n
+    { &ELRS_RATES_3X[2], false, false },    // LoRa 250 n  (stock default)
     { &ELRS_RATES_3X[2], true, false },     // LoRa 250 i
     { &ELRS_RATES_3X[0], false, false },    // LoRa 500 n
-    { &ELRS_RATES_3X[5], true, false },     // LoRa 50 i  <- bind parking
+    { &ELRS_RATES_3X[0], true, false },     // LoRa 500 i
+    { &ELRS_RATES_FLRC[2], false, false },  // DVDA 500
+    { &ELRS_RATES_FLRC[3], false, false },  // DVDA 250
+    { &ELRS_RATES_FLRC[1], false, false },  // FLRC 500
+    { &ELRS_RATES_FLRC[0], false, false },  // FLRC 1000
 };
 static const sniffer_step_t g_fastlink_steps[4] = {
     { &ELRS_RATES_3X[2], false, false },    // LoRa 250 n
@@ -641,6 +642,8 @@ static void on_sync(const elrs_packet_t &pkt)
                   pkt.sync.fhss_index, pkt.sync.nonce,
                   pkt.sync.rate_index, pkt.sync.switch_mode, pkt.sync.tlm_ratio,
                   pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5);
+    Serial.printf("{\"t\":\"event\",\"what\":\"otaver\",\"v\":%u,\"layout\":%u}\n",
+                  (unsigned)dctx.otaver, (unsigned)dctx.layout);
     if (good && dctx.uid_known && pkt.sync.uid3 == dctx.uid3 &&
         pkt.sync.uid4 == dctx.uid4) {
         // recovered ELRS modelId rides on the validated sync (0xFF = off)
@@ -1246,6 +1249,19 @@ void setup()
                  ui_driver_name(ui_get_driver()));
     }
     if (radio_ok) {
+        // REG_SF_ADDITIONAL_CONFIG (0x925) probe: write + readback proves the
+        // SF config path ELRS depends on (SX1280.cpp:283-299) is alive.
+        {
+            Module *m = g_radio.mod_ptr();
+            if (m) {
+                m->SPIwriteRegister(ELRS_REG_SF_ADDITIONAL_CONFIG, 0x1E);
+                uint8_t v = m->SPIreadRegister(ELRS_REG_SF_ADDITIONAL_CONFIG);
+                Serial.printf("{\"t\":\"event\",\"what\":\"sfconf\",\"ok\":%u,\"val\":%u}\n",
+                              v == 0x1E ? 1 : 0, v);
+            } else {
+                Serial.println("{\"t\":\"event\",\"what\":\"sfconf\",\"ok\":0,\"val\":255}");
+            }
+        }
         // RX-path self-test (round 10): 200 ms FLRC-discovery window on a
         // quiet channel (2480.5 MHz, above the ELRS band). Noise produces
         // RxDone/demods -> proves DIO1 + IRQ + demod path end-to-end at
@@ -1417,6 +1433,9 @@ void loop()
             n_rx++; dwell_rx++; window_rx++;
             if (g_mode != 0) g_sig_frames[flrc_step ? 1 : 0]++;
             elrs_packet_t pkt;
+            dctx.exp_valid = (g_ntrack.interval_ms != 0);
+            if (dctx.exp_valid)
+                dctx.exp_nonce = elrs_nonce_expected(&g_ntrack, millis());
             bool ok = elrs_decode_packet(&dctx, buf, want, &pkt);
             if (rssi > last_rssi) last_rssi = rssi; // peak-hold for the stats window
             last_snr = snr;
@@ -1526,11 +1545,12 @@ void loop()
                                     if (g_u45_count >= 2) {
                                         uint16_t raw = (uint16_t)(seed ^ ELRS_OTA_VERSION_ID_3X);
                                         uint8_t u4 = (uint8_t)(raw >> 8), u5 = (uint8_t)(raw & 0xFF);
+                                        uint8_t u4_4x = (uint8_t)(((seed ^ ELRS_OTA4X_VER_XOR) >> 8) & 0xFF);
                                         uint8_t model = (uint8_t)(~(buf[6] ^ u5) & ELRS_MODELMATCH_MASK);
                                         Serial.printf("{\"t\":\"event\",\"what\":\"uid45\",\"uid4\":\"%02x\","
-                                                      "\"uid5\":\"%02x\",\"model_id\":%u,\"variant\":%u,"
+                                                      "\"uid4_4x\":\"%02x\",\"uid5\":\"%02x\",\"model_id\":%u,\"variant\":%u,"
                                                       "\"uid3\":\"%02x\"}\n",
-                                                      u4, u5, model, variant, buf[4]);
+                                                      u4, u4_4x, u5, model, variant, buf[4]);
                                         g_u45_count = 0; // emit once per seed
                                     }
                                 }

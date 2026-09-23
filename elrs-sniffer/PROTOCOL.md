@@ -235,6 +235,28 @@ sequence, not a channel). `uid45.variant` now spans 3 values (init placement
 / byte order only — the FLRC CRC24 poly is the fixed 0x5D6DCB per the
 SX1280 datasheet).
 
+## ELRS 4.x air support + SF config (round 11)
+
+- `sfconf` — boot probe: `{"t":"event","what":"sfconf","ok":1,"val":30}`
+  proves REG_SF_ADDITIONAL_CONFIG (0x925, SF5/6=0x1E, SF7/8=0x37) writes
+  and reads back — the register RadioLib omits and ELRS writes after every
+  SetModulationParams (SX1280.cpp:283-299).
+- `otaver` — emitted after each validated sync:
+  `{"t":"event","what":"otaver","v":3|4,"layout":3|4}`. 4.x CRC init family:
+  `(UID4<<8|UID5) ^ 0x0400` (master OTA.cpp OtaUpdateCrcInitFromUid), tried
+  alongside the 3.x `^3` in every validation path. 4.x syncs carry
+  `rfRateEnum` in byte 3 and NO UID3 (bytes: fhss, nonce, rfRateEnum,
+  packed switch/tlm/gemini/proto, UID4, UID5) — `sync.uid` shows "00xxxx"
+  for the absent UID3.
+- Non-sync packets in exact mode additionally validate with the 4.x
+  nonce-mixed init (`OtaCrcInitializer ^ OtaNonce`, master
+  GeneratePacketCrcStd/Full) using the tracked expected nonce.
+- `uid45` gains `uid4_4x` — the UID4 alternative under the 4.x high-byte
+  XOR (UID4 ^ 4). FLRC sync-word identity remains 3.x-family (`UID5^3`).
+- Harvest steps: 8 dwells x 2200 ms (syncs only when the TX sequence visits
+  channel 41 — every 80 hops); list: LoRa 250/500 (n+i), DVDA 500/250,
+  FLRC 500/1000. Bind parking (LoRa 50 i) remains in the SWEEP.
+
 ## Raw RX diagnostics (round 10)
 
 `rxpkt` — EVERY demodulated packet, unfiltered (command `N` toggles, default

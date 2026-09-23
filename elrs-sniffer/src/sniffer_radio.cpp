@@ -161,10 +161,15 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
     // call — exactly the ELRS air config from SX1280.cpp SetPacketParamsLoRa.
     static_cast<SnifferSX1280 *>(radio)->setPacketType(RADIOLIB_SX128X_PACKET_TYPE_LORA);
     radio->setBandwidth(r->bw == 0x18 ? 812.5f : r->bw == 0x26 ? 406.25f : 203.125f);
+    // RadioLib OMITS REG_SF_ADDITIONAL_CONFIG (0x925) — ELRS writes it after
+    // every SetModulationParams (SX1280.cpp:283-299). A likely deafness cause;
+    // written raw here, every LoRa dwell, harvest steps included.
     radio->setSpreadingFactor(r->sf >> 4);         // 0x50->5 .. 0x90->9
     radio->setCodingRate(r->cr, true);             // LI variants, raw values match
     radio->setPreambleLength(r->preamble);
     radio->setFrequency(freq_hz / 1000000.0);
+    mod->SPIwriteRegister(ELRS_REG_SF_ADDITIONAL_CONFIG,
+                          elrs_sf_additional_config(r->sf));
     static_cast<SnifferSX1280 *>(radio)->setPacketParamsLoRa(
         r->preamble, RADIOLIB_SX128X_LORA_HEADER_IMPLICIT, payload_len,
         0x00, step.iq_inverted ? RADIOLIB_SX128X_LORA_IQ_INVERTED
