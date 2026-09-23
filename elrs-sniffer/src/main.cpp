@@ -24,7 +24,6 @@
 #define DWELL_MIN_MS 2000u        // initial dwell per rate (sync can be seconds apart)
 #define DWELL_CHUNK_MS 2000u      // adaptive dwell grows in these steps...
 #define DWELL_MAX_MS 35000u       // ...up to this cap (connected sync can be slow)
-#define EXTEND_RSSI_DB -85        // hot dwells (or any packets) extend
 #define AWAIT_PKT_MS 3000u        // packets-for-this-long-without-sync = patient
 #define AWAIT_LOG_MS 5000u        // awaiting_sync heartbeat interval
 #define DWELL_WATCHDOG_GRACE_MS 2000u // wedged dwell -> restart + advance
@@ -276,8 +275,9 @@ static void dwell_begin(uint8_t i)
     g_radio.start_rx();
     step_entered_ms = millis();
     dwell_rssi_max = -128.0f;
-    dwell_len_ms = DWELL_MIN_MS;
+    dwell_len_ms = s.rate->flrc ? 4000 : DWELL_MIN_MS; // FLRC discovery base 4 s
     dwell_pkts = 0;
+    dwell_rx = 0;
     dwell_first_pkt_ms = 0;
     dwell_rx = dwell_crc_ok = dwell_rc = dwell_msp = dwell_sync = dwell_tlm = dwell_unk = 0;
     sampling_enabled = true;
@@ -1103,10 +1103,13 @@ void loop()
 
         const sniffer_step_t &cur = sweep.steps[step_idx];
         if (!locked) {
-            // adaptive dwell: hot (or packet-bearing) dwells extend in
-            // 2 s chunks up to the cap — a sync can be up to ~16 s away.
+            // adaptive dwell: extend only when packets actually demodulated
+            // since dwell start — pure RSSI leakage (strong FLRC seen by
+            // wrong-mode LoRa dwells) gets NO extension, so wrong modes stay
+            // cheap (2 s). FLRC discovery extends only on CLASSIFIED packets
+            // (no-sync/CRC-off demods plenty of junk bursts).
             if (millis() - step_entered_ms > dwell_len_ms) {
-                bool active = dwell_rssi_max > EXTEND_RSSI_DB || dwell_pkts > 0;
+                bool active = cur.rate->flrc ? (dwell_pkts > 0) : (dwell_rx > 0);
                 if (active && dwell_len_ms < DWELL_MAX_MS) {
                     dwell_len_ms += DWELL_CHUNK_MS;
                     Serial.printf("{\"t\":\"dwell_ext\",\"rate\":\"%s\",\"iq\":\"%c\",\"rssi_max\":%d,\"dwell_ms\":%u}\n",

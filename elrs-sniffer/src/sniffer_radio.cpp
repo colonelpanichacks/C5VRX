@@ -21,14 +21,13 @@ public:
 void sniffer_sweep_build(sniffer_sweep_t *sw)
 {
     sw->count = 0;
-    // Likelihood-ordered first pass — most-deployed LoRa rates first, each
-    // with normal IQ then inverted (invertIQ = UID[5]&1 splits real links
-    // ~50/50). FLRC trio (single polarity — ELRS ignores InvertIQ for the
-    // FLRC branch) sits after the four main LoRa pairs; 8ch variants and
-    // legacy 2.x rows last.
+    // Likelihood-ordered first pass — FLRC interleaved early (it is the
+    // modern ELRS default; a strong FLRC link must be reached in seconds,
+    // not after the whole LoRa table). Order: 250, 500 (IQ pairs), FLRC
+    // trio, 150, 50, then the 8ch variants and legacy 2.x rows.
     static const uint8_t order3x[ELRS_RATES_3X_COUNT] = { 2, 0, 3, 5, 1, 4 };
     //                         table idx ->   250, 500, 150, 50, 333-8, 100-8
-    for (uint8_t k = 0; k < 4; k++) { // the four main rates, IQ pairs
+    for (uint8_t k = 0; k < 2; k++) { // 250 + 500, IQ pairs
         uint8_t i = order3x[k];
         sw->steps[sw->count++] = { &ELRS_RATES_3X[i], false, false };
         sw->steps[sw->count++] = { &ELRS_RATES_3X[i], true, false };
@@ -36,7 +35,7 @@ void sniffer_sweep_build(sniffer_sweep_t *sw)
     for (uint8_t i = 0; i < ELRS_RATES_FLRC_COUNT; i++) {
         sw->steps[sw->count++] = { &ELRS_RATES_FLRC[i], false, false };
     }
-    for (uint8_t k = 4; k < ELRS_RATES_3X_COUNT; k++) { // 8ch variants
+    for (uint8_t k = 2; k < ELRS_RATES_3X_COUNT; k++) { // 150, 50, 8ch variants
         uint8_t i = order3x[k];
         sw->steps[sw->count++] = { &ELRS_RATES_3X[i], false, false };
         sw->steps[sw->count++] = { &ELRS_RATES_3X[i], true, false };
