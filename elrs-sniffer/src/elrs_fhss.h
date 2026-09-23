@@ -70,6 +70,41 @@ static inline uint32_t elrs_fhss_channel_hz(uint8_t ch)
 }
 #define ELRS_2G4_SYNC_FREQ_HZ_DRV elrs_fhss_channel_hz(FHSS_SYNC_INDEX) // 2441399841
 
+// --- round 16: band coverage (the field-deafness fix) -----------------------
+// Energy-probing root cause: EVERY sweep/harvest dwell squatted on the sync
+// channel (idx 41). Under a user's WiFi ch6 (2426-2448 MHz) an EU-CE LBT TX
+// defers on 41, so the sniffer starved while the link lived on the other 2/3
+// of the band. Sweep dwells now cycle a 16-channel round-robin (includes 41
+// so syncs still land); harvest rotates 4 channels per pass. Off-sync-channel
+// packets are RC/tlm — they still count toward elrs_sig/rawpkt/presence
+// cadence, just not sync fingerprints.
+#define ELRS_SWEEP_CH_N   16u
+#define ELRS_HARVEST_CH_N 4u
+
+// 16-entry sweep round-robin: 1,6,11,...,76 — 5 MHz spacing, slot 8 == 41
+// (the sync channel stays in the rotation, one dwell in 16).
+static inline uint8_t elrs_sweep_ch_idx(uint8_t slot)
+{
+    return (uint8_t)(1u + 5u * (slot % ELRS_SWEEP_CH_N));
+}
+
+// harvest rotation: 41 first (syncs/bind), then spread LBT-clean channels
+static inline uint8_t elrs_harvest_ch_idx(uint8_t pass)
+{
+    static const uint8_t plan[ELRS_HARVEST_CH_N] = { FHSS_SYNC_INDEX, 1, 21, 61 };
+    return plan[pass % ELRS_HARVEST_CH_N];
+}
+
+// nearest channel index on the NOMINAL 1 MHz grid — for reporting a measured
+// or commanded frequency (register-exact channel hz comes from
+// elrs_fhss_channel_hz).
+static inline uint8_t elrs_band_ch_nominal(uint32_t hz)
+{
+    if (hz <= 2400400000u) return 0;
+    if (hz >= 2479400000u) return (uint8_t)(FHSS_FREQ_COUNT - 1u);
+    return (uint8_t)((hz - 2400400000u + 500000u) / 1000000u);
+}
+
 // FIND-gate helper (round 8): fhssIndex is the SEQUENCE POINTER, not the
 // channel — a sync frame was sent ON the sync channel iff seq[pointer]==41,
 // which for any UID happens exactly at the block starts (p % 80 == 0).

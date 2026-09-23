@@ -68,11 +68,13 @@ static uint32_t g_int_t0, g_int_rx0, g_int_log_ms;
 
 // ---- FIND MODE (round 6): sync-harvest alternating with sweep passes ----
 // Sync channel = FHSS idx 41 (2441.4 MHz); syncs recur constantly. After
-// each sweep pass (when unlocked), run a short harvest cycle parked on the
-// sync frequency: FLRC trio (promiscuous/discovery) + LoRa 250/500 (both
-// IQ). Sync-shaped frames are exported as sync_frame events (throttled);
-// LoRa frames validate via the self-seeded CRC14 (direct lock possible);
-// FLRC frames feed the uid45 seed brute (2^16 x 4 CRC24 variants).
+// each sweep pass (when unlocked), run a short harvest cycle rotating across
+// 4 channels (41 first — syncs/bind — then spread LBT-clean channels): FLRC
+// trio (promiscuous/discovery) + LoRa 250/500 (both IQ). Sync-shaped frames
+// are exported as sync_frame events (throttled); LoRa frames validate via
+// the self-seeded CRC14 (direct lock possible); FLRC frames feed the uid45
+// seed brute (2^16 x 4 CRC24 variants). Round 16: sweep dwells also cycle a
+// 16-channel round-robin (elrs_sweep_ch_idx) instead of squatting on 41.
 #define HARVEST_STEPS 8
 #define HARVEST_DWELL_MS 2200u // syncs only when the TX sequence visits ch41
                                // (every 80 hops: ~1.28s LoRa250 / 0.32s DVDA)
@@ -101,6 +103,12 @@ static uint32_t g_last_arm_ms;
 static uint32_t g_rxdone_latched, g_dio_miss; // round 15: live IRQ visibility
 static bool g_dio_seen;
 static uint8_t g_irq_now;
+// round 16: band coverage — the 80-channel plan at boot (register-exact,
+// elrs_fhss.h) + the dwell channel state (index into g_ch_freq)
+static uint32_t g_ch_freq[FHSS_FREQ_COUNT];
+static uint8_t g_dwell_ch = FHSS_SYNC_INDEX; // current dwell channel idx
+static uint8_t g_sweep_ch_slot;              // sweep round-robin position
+static uint8_t g_harvest_pass;               // harvest rotation counter
 // sync_frame dedupe ring (per harvest cycle): recent (nonce, fhss)
 static uint8_t g_sf_ring[16][2];
 static uint8_t g_sf_n;
@@ -314,7 +322,7 @@ static void crack_tick()
         g_crack = false;
         crack_emit("failed");
         Serial.println("{\"t\":\"event\",\"what\":\"uid2_crack_failed\"}");
-        g_radio.tune(ELRS_2G4_SYNC_FREQ_HZ);
+        g_radio.tune(g_ch_freq[g_dwell_ch]); // back to the dwell's channel
         return;
     }
     g_crack_score = 0;
@@ -512,16 +520,31 @@ static void dwell_begin(uint8_t i)
         g_harvest_idx = i % HARVEST_STEPS;
         sp = &g_harvest_steps[g_harvest_idx];
         step_idx = 0;
+        if (g_harvest_idx == 0) {
+            // round 16: ONE channel per harvest PASS (constant across its 8
+            // steps): 41 first, then the spread LBT-clean set
+            g_dwell_ch = elrs_harvest_ch_idx(g_harvest_pass);
+            g_harvest_pass = (uint8_t)((g_harvest_pass + 1) % ELRS_HARVEST_CH_N);
+        }
     } else if (g_mode == 2) {   // fastlink (uid_last retry)
         g_harvest_idx = i % 4;
         sp = &g_fastlink_steps[g_harvest_idx];
         step_idx = 0;
+        g_dwell_ch = FHSS_SYNC_INDEX; // bind/sync retry lives on 41
     } else {
         step_idx = i % sweep.count;
         sp = &sweep.steps[step_idx];
+        // round 16: the deafness fix — sweep dwells cycle the 16-channel
+        // round-robin (1,6,...,76; slot 8 = 41), one channel per dwell,
+        // instead of squatting on the sync channel. Off-41 dwells hear
+        // RC/tlm (presence + elrs_sig still accrue); sync fingerprints only
+        // land on the 41 slot. FLRC discovery dwells rotate too — their
+        // sync-leak feedstock arrives on the 41 slot.
+        g_dwell_ch = elrs_sweep_ch_idx(g_sweep_ch_slot);
+        g_sweep_ch_slot = (uint8_t)((g_sweep_ch_slot + 1) % ELRS_SWEEP_CH_N);
     }
     const sniffer_step_t &s = *sp;
-    g_radio.apply(s, ELRS_2G4_SYNC_FREQ_HZ);
+    g_radio.apply(s, g_ch_freq[g_dwell_ch]);
     if (!s.rate->flrc) {
         // modem readback probe (round 12): once per rate per boot. sf/bw/cr
         // are the raw bytes WE wrote (no register readback exists for
@@ -581,7 +604,7 @@ static void dwell_begin(uint8_t i)
     snprintf(g_dwell_name, sizeof(g_dwell_name), "%s", s.rate->name);
     g_dwell_flrc = s.rate->flrc != 0;
     uist.iq_inverted = s.iq_inverted;
-    uist.freq_hz = ELRS_2G4_SYNC_FREQ_HZ;
+    uist.freq_hz = g_ch_freq[g_dwell_ch];
 }
 
 static const char *pkt_type_name(uint8_t t)
@@ -609,10 +632,12 @@ static void dwell_advance()
 {
     const sniffer_step_t &s = sweep.steps[step_idx];
     Serial.printf("{\"t\":\"dwell\",\"step\":%u,\"rate\":\"%s\",\"iq\":\"%c\",\"legacy\":%u,"
+                  "\"ch_idx\":%u,\"freq\":%lu,"
                   "\"rssi_max\":%d,\"nf\":%d,\"nf_thr\":%d,\"rx\":%lu,\"crc_ok\":%lu,\"rx_dropped\":%lu,"
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu}}\n",
                   step_idx, s.rate->name, s.iq_inverted ? 'i' : 'n',
-                  s.legacy_2x ? 1 : 0, (int)dwell_rssi_max,
+                  s.legacy_2x ? 1 : 0, g_dwell_ch,
+                  (unsigned long)g_ch_freq[g_dwell_ch], (int)dwell_rssi_max,
                   (int)g_disc.nf, (int)(g_disc.nf + ELRS_DISC_NF_MARGIN),
                   (unsigned long)dwell_rx, (unsigned long)dwell_crc_ok,
                   (unsigned long)dwell_rc, (unsigned long)dwell_msp,
@@ -634,8 +659,9 @@ static void dwell_advance()
             memset(g_sig_sync, 0, sizeof(g_sig_sync));
             memset(g_sig_crc, 0, sizeof(g_sig_crc));
             g_sig_repeat_tails = 0;
-            Serial.printf("{\"t\":\"event\",\"what\":\"harvest\",\"state\":\"start\",\"freq\":%lu}\n",
-                          (unsigned long)ELRS_2G4_SYNC_FREQ_HZ);
+            Serial.printf("{\"t\":\"event\",\"what\":\"harvest\",\"state\":\"start\",\"freq\":%lu,\"ch_idx\":%u}\n",
+                          (unsigned long)g_ch_freq[elrs_harvest_ch_idx(g_harvest_pass)],
+                          elrs_harvest_ch_idx(g_harvest_pass));
             dwell_begin(0);
             return;
         }
@@ -838,7 +864,7 @@ static void stats_tick()
     Serial.printf("{\"t\":\"stats\",\"ms\":%lu,\"rate\":\"%s\",\"iq\":\"%c\",\"rssi\":%d,"
                   "\"rssi_now\":%d,\"snr10\":%d,\"pps\":%lu,\"rx_per_s\":%lu,"
                   "\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
-                  "\"freq\":%lu,\"fhss\":%u,\"sync_only\":%u,"
+                  "\"freq\":%lu,\"ch_idx\":%u,\"fhss\":%u,\"sync_only\":%u,"
                   "\"crack\":\"%s\",\"mode\":\"%s\",\"conn\":\"%s\","
                   "\"sig\":{\"q\":\"%s\",\"frames\":%lu,\"sync_struct\":%lu,\"crc_pass\":%lu,"
                   "\"lora\":{\"f\":%lu,\"s\":%lu,\"c\":%lu},\"flrc\":{\"f\":%lu,\"s\":%lu,\"c\":%lu}},"
@@ -852,6 +878,7 @@ static void stats_tick()
                   (unsigned long)uist.lq_permille,
                   locked ? 1 : 0, radio_ok ? 1 : 0,
                   (unsigned long)uist.freq_hz,
+                  (unsigned)elrs_band_ch_nominal(uist.freq_hz),
                   g_following ? (unsigned)g_fhss_idx : 255,
                   (locked && now - last_rc_ms > 2000) ? 1u : 0u,
                   g_crack_state, mode,
@@ -1266,6 +1293,12 @@ void setup()
         report_radio_fault(detail);
     }
 
+    // round 16: the 80-channel ELRS frequency table (register-exact plan,
+    // elrs_fhss.h) — sweep/harvest dwells pick from this instead of
+    // squatting on the sync channel.
+    for (uint8_t chi = 0; chi < FHSS_FREQ_COUNT; chi++)
+        g_ch_freq[chi] = elrs_fhss_channel_hz(chi);
+
     char ready_extra[64] = { 0 };
     if (g_working_pins) {
         int off = snprintf(ready_extra, sizeof(ready_extra), ",\"pins\":\"%s\"",
@@ -1358,17 +1391,18 @@ void setup()
     last_stats_ms = millis();
 }
 
-static void escan_run(bool peak_mode)
+static void escan_run(bool peak_mode, uint32_t center_hz)
 {
-    // park: LoRa 250 iq=n (the exact-match config), sync frequency
+    // park: LoRa 250 iq=n (the exact-match config) on the requested center
+    // (round 16: any channel; default is the nominal sync grid 2441.40)
     sniffer_step_t st = { &ELRS_RATES_3X[2], false, false };
-    g_radio.apply(st, ELRS_2G4_SYNC_FREQ_HZ);
+    g_radio.apply(st, center_hz);
     g_radio.start_rx();
     int rssi[ELRS_ESCAN_POINTS];
     uint32_t t_end = millis() + (peak_mode ? 3000 : 0);
     do {
         for (uint32_t i = 0; i < ELRS_ESCAN_POINTS; i++) {
-            g_radio.tune(elrs_escan_freq_hz(i));
+            g_radio.tune(elrs_escan_centered_hz(center_hz, i));
             delay(60);
             float m = -128.0f;
             for (uint8_t s = 0; s < 4; s++) {
@@ -1381,7 +1415,7 @@ static void escan_run(bool peak_mode)
     } while (peak_mode && millis() < t_end);
     int peak = rssi[ELRS_ESCAN_CENTER_IDX];
     if (peak_mode) { // 500 ms of 1 ms polling at center catches 1.28s-cadence syncs
-        g_radio.tune(elrs_escan_freq_hz(ELRS_ESCAN_CENTER_IDX));
+        g_radio.tune(center_hz);
         for (uint16_t i = 0; i < 500; i++) {
             float db;
             if (g_radio.rssiInst(db) == 0 && (int)db > peak) peak = (int)db;
@@ -1389,14 +1423,15 @@ static void escan_run(bool peak_mode)
         }
     }
     Serial.printf("{\"t\":\"event\",\"what\":\"escan\",\"center\":%lu,\"step_hz\":%lu,"
-                  "\"expect\":%lu,\"peak\":%d,\"rssi\":[",
-                  (unsigned long)elrs_escan_freq_hz(ELRS_ESCAN_CENTER_IDX),
+                  "\"expect\":%lu,\"ch_idx\":%u,\"peak\":%d,\"rssi\":[",
+                  (unsigned long)center_hz,
                   (unsigned long)ELRS_ESCAN_STEP_HZ,
-                  (unsigned long)ELRS_2G4_SYNC_FREQ_HZ, peak);
+                  (unsigned long)ELRS_2G4_SYNC_FREQ_HZ,
+                  (unsigned)elrs_band_ch_nominal(center_hz), peak);
     for (uint32_t i = 0; i < ELRS_ESCAN_POINTS; i++)
         Serial.printf("%s%d", i ? "," : "", rssi[i]);
     Serial.println("]}");
-    g_radio.recover(cur_step(), ELRS_2G4_SYNC_FREQ_HZ); // restore the dwell
+    g_radio.recover(cur_step(), g_ch_freq[g_dwell_ch]); // restore the dwell
 }
 
 // Reference RX mode (round 15): the KNOWN-GOOD RadioLib baseline. STOCK
@@ -1438,7 +1473,7 @@ static void ref_run()
         delay(1);
     }
     Serial.printf("{\"t\":\"event\",\"what\":\"refdone\",\"n\":%u}\n", n);
-    g_radio.recover(cur_step(), ELRS_2G4_SYNC_FREQ_HZ); // restore the dwell
+    g_radio.recover(cur_step(), g_ch_freq[g_dwell_ch]); // restore the dwell
 }
 
 void loop()
@@ -1496,20 +1531,29 @@ void loop()
             ref_run();
         }
         else if (c == 'E' || c == 'e') {
-            // Energy scan (round 14): park LoRa 250 iq=n on the sync freq,
-            // sweep 2439.40-2443.40 in 100 kHz steps, 60 ms/step, RSSIINST
-            // max per step. 'E 1' repeats for 3 s + 500 ms 1 ms peak poll at
-            // center. Refuses while locked/following. No behavior change.
+            // Energy scan (round 14/16): park LoRa 250 iq=n, sweep center
+            // +/-2 MHz in 100 kHz steps (41 points), 60 ms/step, RSSIINST max
+            // per step. Default center: the nominal sync grid (2441.40).
+            // 'E <mhz>' centers anywhere in the band (e.g. E 2401.4);
+            // a trailing '1' adds the 3 s repeat + 500 ms 1 ms peak poll
+            // ('E 2401.4 1' combines both). Refuses while locked/following
+            // and on a malformed arg. No sweep-logic behavior change.
             if (locked || g_following) {
                 Serial.println("{\"t\":\"event\",\"what\":\"escan_refused\",\"why\":\"locked\"}");
             } else {
-                bool peak_mode = false;
-                uint32_t wait_ms = millis() + 300; // trailing " 1"
-                while (millis() < wait_ms && Serial.available()) {
-                    int d = Serial.read();
-                    if (d == '1') peak_mode = true;
+                char arg[17];
+                uint8_t arg_n = 0;
+                uint32_t wait_ms = millis() + 300; // trailing arg (to end of line)
+                while (millis() < wait_ms && Serial.available() && arg_n < sizeof(arg) - 1)
+                    arg[arg_n++] = (char)Serial.read();
+                arg[arg_n] = 0;
+                uint32_t center_hz;
+                bool peak_mode;
+                if (!elrs_escan_parse_arg(arg, &center_hz, &peak_mode)) {
+                    Serial.println("{\"t\":\"event\",\"what\":\"escan_refused\",\"why\":\"bad_arg\"}");
+                } else {
+                    escan_run(peak_mode, center_hz);
                 }
-                escan_run(peak_mode);
             }
         }
         else if (c == 'Y' || c == 'y') {
@@ -1934,9 +1978,10 @@ void loop()
                             s.iq_inverted != cur.iq_inverted) { twin = i; break; }
                     }
                     if (twin >= 0) {
-                        Serial.printf("{\"t\":\"dwell\",\"step\":%d,\"rate\":\"%s\",\"iq\":\"%c\",\"legacy\":%u,\"rssi_max\":%d,\"rx\":%lu,\"crc_ok\":%lu,\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},\"jump\":\"iq-twin\"}\n",
+                        Serial.printf("{\"t\":\"dwell\",\"step\":%d,\"rate\":\"%s\",\"iq\":\"%c\",\"legacy\":%u,\"ch_idx\":%u,\"freq\":%lu,\"rssi_max\":%d,\"rx\":%lu,\"crc_ok\":%lu,\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},\"jump\":\"iq-twin\"}\n",
                                       step_idx, cur.rate->name, cur.iq_inverted ? 'i' : 'n',
-                                      cur.legacy_2x ? 1 : 0, (int)dwell_rssi_max,
+                                      cur.legacy_2x ? 1 : 0, g_dwell_ch,
+                                      (unsigned long)g_ch_freq[g_dwell_ch], (int)dwell_rssi_max,
                                       (unsigned long)dwell_rx, (unsigned long)dwell_crc_ok,
                                       (unsigned long)dwell_rc, (unsigned long)dwell_msp,
                                       (unsigned long)dwell_sync, (unsigned long)dwell_tlm,
@@ -1965,7 +2010,7 @@ void loop()
             Serial.printf("{\"t\":\"error\",\"what\":\"dwell_timeout\",\"rate\":\"%s\",\"iq\":\"%c\",\"ms\":%lu}\n",
                           cur.rate->name, cur.iq_inverted ? 'i' : 'n',
                           (unsigned long)(millis() - step_entered_ms));
-            g_radio.recover(sweep.steps[step_idx], ELRS_2G4_SYNC_FREQ_HZ);
+            g_radio.recover(sweep.steps[step_idx], g_ch_freq[g_dwell_ch]);
             dwell_advance();
         }
         // RX demote rules (rx_main.cpp:2211 + 2222), sync-grace extended:

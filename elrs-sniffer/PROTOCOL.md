@@ -41,6 +41,7 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 | `rx`, `crc_ok` | uint | count | cumulative since boot: RxDone demods / ELRS-CRC-validated packets |
 | `types` | object | count | cumulative per-type parses: `rc`, `msp`, `sync`, `tlm`, and `unk` (demodded but failed classification = noise) |
 | `rx_dropped` | uint | count | cumulative rxpkt frames dropped by the 30/s export cap |
+| `ch_idx` | uint | 0..79 | **dwell channel index** (nominal nearest) — the FHSS channel the current dwell sits on: sweep cycles a 16-channel round-robin (slot 8 = 41, the sync channel), harvest rotates 41/1/21/61 per pass. During hop-following this is the LIVE channel (`freq`); it is NOT the sticks field (`ch`) — round 16 |
 | `sig` | object | — | elrs_sig quality: `q` = `none`/`weak`/`firm`/`strong` (firm = >=3 `crc_pass` in the harvest pass OR >=10 `sync_struct` with >=1 repeated tail; strong = >=10 `crc_pass`; weak = >=3 `sync_struct`), plus `frames`, `sync_struct`, `crc_pass` totals and per-band `lora`/`flrc` `{f,s,c}` sub-objects |
 | `sync_only` | 0/1 | — | locked but no validated RC data for >2 s — a sync-follow lock (TX beaconing, model disarmed/off). Sticks in `ch` are stale; expect no telemetry |
 | `uid` | string, optional | — | `UID[3..5]` as lowercase hex — **link fingerprint, not identity**; absent until a sync is captured |
@@ -55,9 +56,12 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 fingerprint. Dwells start at 2 s and extend in 2 s chunks (cap 35 s) while
 the dwell shows energy (`rssi_max` > −85 dBm) or classified packets — sync
 packets can be tens of seconds apart on a connected link, so hot dwells
-are patient:
+are patient. Round 16: each dwell also carries its channel: `ch_idx`
+(0..79, the FHSS channel index) and `freq` (the register-exact Hz the radio
+was tuned to — a `g_ch_freq` table entry, not a rounded MHz):
 ```json
-{"t":"dwell","step":0,"rate":"LoRa 250Hz","iq":"n","legacy":0,"rssi_max":-71,
+{"t":"dwell","step":0,"rate":"LoRa 250Hz","iq":"n","legacy":0,"ch_idx":41,
+ "freq":2441399841,"rssi_max":-71,
  "rx":14,"crc_ok":11,"types":{"rc":11,"msp":0,"sync":0,"tlm":0,"unk":3}}
 {"t":"dwell_ext","rate":"LoRa 250Hz","iq":"n","rssi_max":-69,"dwell_ms":4000}
 
@@ -261,22 +265,56 @@ SX1280 datasheet).
   channel 41 — every 80 hops); list: LoRa 250/500 (n+i), DVDA 500/250,
   FLRC 500/1000. Bind parking (LoRa 50 i) remains in the SWEEP.
 
-## escan (round 14: air-energy diagnostic, no behavior change)
+## escan (round 14: air-energy diagnostic; round 16: any center)
 
 `E` — energy scan: parks LoRa 250 iq=n on the sync frequency, sweeps
 2439.40-2443.40 MHz in 100 kHz steps (41 points, 60 ms/step, RSSIINST max of
 ~4 samples per step), restores the current dwell:
 ```json
 {"t":"event","what":"escan","center":2441400000,"step_hz":100000,
- "expect":2441399841,"peak":-41,"rssi":[-97,-95,...41 ints...]}
+ "expect":2441399841,"ch_idx":41,"peak":-41,"rssi":[-97,-95,...41 ints...]}
 ```
 `E 1` — repeats the sweep for 3 s, then polls RSSIINST at 1 ms for 500 ms at
 the center (`peak` catches 1.28 s-cadence sync bursts between 60 ms windows).
-`expect` is the register-exact ELRS sync channel (draw a UI marker there;
+`E <mhz>` (round 16, e.g. `E 2401.4`) — centers the same +/-2 MHz sweep on
+ANY channel in the band (2400.4..2479.4); `E <mhz> 1` combines both.
+A malformed arg refuses with `escan_refused`/`why":"bad_arg"`. `ch_idx` is
+the nominal nearest channel index of the center. `expect` is the
+register-exact ELRS sync channel (draw a UI marker there;
 the sweep center is the nominal 100 kHz grid point ~159 Hz above it).
 Refused while locked/following (`escan_refused`). Purpose: -40..-60 dBm at
 the marker with silent demod => packet-complete path bug; ~-100 dBm floor =>
 TX not reaching our antenna (hardware).
+
+## Round 16: band coverage (the field-deafness fix)
+
+Root cause (energy-probing confirmed): EVERY sweep/harvest dwell squatted on
+the ELRS sync channel (idx 41, 2441.4 MHz). Under a user's WiFi ch6
+(2426-2448 MHz) an EU-CE LBT TX defers on 41, so the sniffer starved while
+the link lived on the other 2/3 of the band. Fix: cover the band.
+
+- **Channel plan**: the 80-channel ELRS frequency table is built at boot from
+  the register-exact formula (`elrs_fhss_channel_hz`, start 2400.4 MHz,
+  ~999.9992 kHz spacing; idx 41 = sync = 2441399841; idx 79 ≈ 2479.4 MHz).
+- **Sweep**: dwells cycle a 16-entry round-robin — ch 1,6,11,16,21,26,31,36,
+  **41**,46,51,56,61,66,71,76 — one channel per dwell (detection/presence
+  logic otherwise unchanged). The sync channel stays in the rotation (1 of
+  16 dwells) so sync fingerprints still land; on all other dwells the
+  packets heard are RC/tlm — they still count toward `elrs_sig`, `rawpkt`
+  and presence/cadence metrics, just not sync fingerprints. FLRC discovery
+  dwells rotate too; their sync-leak feedstock arrives on the 41 slot.
+- **Harvest**: each harvest pass rotates across 4 channels — 41 (syncs/bind),
+  then 1, 21, 61 (spread, LBT-clean under mid-band WiFi). One channel per
+  pass, constant across its 8 steps; the `harvest`/`state":"start"` event
+  carries `freq` + `ch_idx`. Fastlink (uid_last retry) stays on 41.
+- **Hop-following / crack**: unchanged — they already tune per-channel.
+- Dashboard note: `stats` + `dwell` gained `ch_idx` (0..79); `dwell` also
+  gained `freq` (register-exact Hz). `stats.ch_idx` is the nominal nearest
+  channel of `freq` — during hop-following it tracks the live hop. It is
+  deliberately NOT named `ch` — `stats.ch` remains the 4 stick channels.
+  Sweep coverage means a given rate+IQ is now visited on 16 channels in
+  rotation: expect the `dwell` event's rate field to repeat with cycling
+  `ch_idx`.
 
 ## Round 13: standby-first dwell config (smoking gun)
 

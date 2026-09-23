@@ -301,15 +301,90 @@ static inline bool elrs_should_rearm(uint32_t now_ms, uint32_t last_pkt_ms,
 #define ELRS_ESCAN_STEP_HZ   100000u      // 100 kHz
 #define ELRS_ESCAN_POINTS    41u          // 2439.40 .. 2443.40 MHz
 #define ELRS_ESCAN_CENTER_IDX 20u         // 2439.40 + 20*0.1 = 2441.40 MHz
+// round 16: sweep center +/-2 MHz in 100 kHz steps (41 points) around ANY
+// channel, not just the sync grid. The legacy grid is center=2441.40 nominal.
+static inline uint32_t elrs_escan_centered_hz(uint32_t center_hz, uint32_t idx)
+{
+    return (idx >= ELRS_ESCAN_CENTER_IDX)
+        ? center_hz + (idx - ELRS_ESCAN_CENTER_IDX) * ELRS_ESCAN_STEP_HZ
+        : center_hz - (ELRS_ESCAN_CENTER_IDX - idx) * ELRS_ESCAN_STEP_HZ;
+}
 static inline uint32_t elrs_escan_freq_hz(uint32_t idx)
 {
-    return ELRS_ESCAN_START_HZ + idx * ELRS_ESCAN_STEP_HZ;
+    return elrs_escan_centered_hz(2441400000u, idx); // legacy sync-grid sweep
 }
 static inline bool elrs_escan_params_ok(void)
 {
     return elrs_escan_freq_hz(ELRS_ESCAN_CENTER_IDX) == 2441400000u && // nominal center
            ELRS_ESCAN_POINTS == 41u &&
            elrs_escan_freq_hz(ELRS_ESCAN_POINTS - 1) == 2443400000u;
+}
+
+// round 16: parse an escan center in MHz ("2401.4", "2441.40", "2401"):
+// integer-only, 1..3 fractional digits (kHz precision; the 100 kHz step grid
+// is the intended use), band range 2400.4..2479.4 MHz.
+static inline bool elrs_escan_parse_mhz(const char *s, uint32_t *hz_out)
+{
+    if (!s || !*s) return false;
+    uint32_t whole = 0, frac = 0, nd = 0;
+    bool dot = false;
+    for (const char *p = s; *p; p++) {
+        char c = *p;
+        if (c == '.' && !dot) { dot = true; continue; }
+        if (c < '0' || c > '9') return false;
+        if (!dot) {
+            whole = whole * 10u + (uint32_t)(c - '0');
+            if (whole > 100000u) return false; // runaway guard
+        } else {
+            if (++nd > 3u) return false;
+            frac = frac * 10u + (uint32_t)(c - '0');
+        }
+    }
+    uint32_t hz = whole * 1000000u;
+    if (nd == 1u) hz += frac * 100000u;
+    else if (nd == 2u) hz += frac * 10000u;
+    else if (nd == 3u) hz += frac * 1000u;
+    if (hz < 2400400000u || hz > 2479400000u) return false;
+    *hz_out = hz;
+    return true;
+}
+
+// parse the full trailing arg of the E command: space-separated tokens; a
+// dotted token is the center in MHz, "1" is peak mode. Bare E keeps the
+// legacy behavior (sync grid, no peak). false = refuse (bad token/freq).
+static inline bool elrs_escan_parse_arg(const char *arg, uint32_t *center_hz, bool *peak)
+{
+    *peak = false;
+    *center_hz = 2441400000u;
+    if (!arg || !*arg) return true;
+    bool have_center = false;
+    char cur[12];
+    uint8_t n = 0;
+    for (const char *p = arg;; p++) {
+        char c = *p;
+        if (c == ' ' || c == 0) {
+            if (n) {
+                bool dot = false;
+                for (uint8_t i = 0; i < n; i++) if (cur[i] == '.') dot = true;
+                cur[n] = 0;
+                if (dot) {
+                    if (have_center || !elrs_escan_parse_mhz(cur, center_hz)) return false;
+                    have_center = true;
+                } else if (n == 1 && cur[0] == '1') {
+                    if (*peak) return false; // duplicate peak token
+                    *peak = true;
+                } else {
+                    return false;
+                }
+                n = 0;
+            }
+            if (c == 0) break;
+        } else {
+            if (n >= sizeof(cur) - 1u) return false;
+            cur[n++] = c;
+        }
+    }
+    return true;
 }
 
 // round 15: live IRQ visibility predicates. RX_DONE is IRQ bit 1 (0x0002).

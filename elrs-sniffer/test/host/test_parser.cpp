@@ -1049,6 +1049,54 @@ int main()
     }
     printf("ok: irq rxdone latch + dio_miss predicates\n");
 
+    // 16r) band coverage (round 16): 80-ch register-exact plan, sweep
+    //      round-robin order, harvest rotation, escan center-arg parse.
+    {
+        // channel table (register-exact elrs_fhss formula; nominal in comments)
+        assert(elrs_fhss_channel_hz(0)  == 2400399932u); // 2400.4 MHz (-68 Hz quant)
+        assert(elrs_fhss_channel_hz(41) == 2441399841u); // == ELRS_2G4_SYNC_FREQ_HZ
+        assert(elrs_fhss_channel_hz(79) == 2479399688u); // 2479.4 MHz (-312 Hz)
+        assert(elrs_fhss_channel_hz(41) > elrs_fhss_channel_hz(40));
+        assert(elrs_fhss_channel_hz(41) - elrs_fhss_channel_hz(40) < 1001000u);
+        assert(elrs_fhss_channel_hz(42) - elrs_fhss_channel_hz(41) > 999000u);
+        // sweep round-robin: 1,6,11,...,76; slot 8 == 41; wraps at 16
+        assert(ELRS_SWEEP_CH_N == 16u);
+        for (uint8_t s = 0; s < 16; s++)
+            assert(elrs_sweep_ch_idx(s) == (uint8_t)(1 + 5 * s));
+        assert(elrs_sweep_ch_idx(8) == FHSS_SYNC_INDEX);
+        assert(elrs_sweep_ch_idx(16) == elrs_sweep_ch_idx(0));
+        // harvest rotation: 41,1,21,61 then wraps
+        assert(ELRS_HARVEST_CH_N == 4u);
+        assert(elrs_harvest_ch_idx(0) == 41 && elrs_harvest_ch_idx(1) == 1 &&
+               elrs_harvest_ch_idx(2) == 21 && elrs_harvest_ch_idx(3) == 61);
+        assert(elrs_harvest_ch_idx(4) == 41);
+        // escan arg parse (integer-only, 1..3 frac digits, band range)
+        uint32_t hz = 0; bool peak = false;
+        assert(elrs_escan_parse_mhz("2401.4", &hz) && hz == 2401400000u);
+        assert(elrs_escan_parse_mhz("2441.40", &hz) && hz == 2441400000u);
+        assert(elrs_escan_parse_mhz("2401", &hz) && hz == 2401000000u);
+        assert(elrs_escan_parse_mhz("2479.4", &hz) && hz == 2479400000u);
+        assert(!elrs_escan_parse_mhz("2400.3", &hz));    // below band
+        assert(!elrs_escan_parse_mhz("2479.5", &hz));    // above band
+        assert(!elrs_escan_parse_mhz("24x1.4", &hz));
+        assert(!elrs_escan_parse_mhz("", &hz));
+        assert(!elrs_escan_parse_mhz("2401.4999", &hz)); // >3 frac digits
+        // full E-arg tokenizing: dotted token = center, "1" = peak
+        assert(elrs_escan_parse_arg("", &hz, &peak) && hz == 2441400000u && !peak);
+        assert(elrs_escan_parse_arg("1", &hz, &peak) && peak && hz == 2441400000u);
+        assert(elrs_escan_parse_arg("2401.4", &hz, &peak) && hz == 2401400000u && !peak);
+        assert(elrs_escan_parse_arg("2401.4 1", &hz, &peak) && hz == 2401400000u && peak);
+        assert(!elrs_escan_parse_arg("2401x", &hz, &peak));
+        assert(!elrs_escan_parse_arg("0.5", &hz, &peak));
+        // centered sweep math: legacy grid unchanged, any center shifts
+        assert(elrs_escan_centered_hz(2441400000u, 0) == 2439400000u);
+        assert(elrs_escan_centered_hz(2441400000u, 40) == 2443400000u);
+        assert(elrs_escan_centered_hz(2401400000u, 20) == 2401400000u);
+        assert(elrs_band_ch_nominal(2441399841u) == 41);
+        assert(elrs_band_ch_nominal(2401400000u) == 1);
+    }
+    printf("ok: band plan + sweep RR + harvest rotation + escan arg\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.
