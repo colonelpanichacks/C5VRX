@@ -83,6 +83,7 @@ public:
     bool read_packet(uint8_t *buf, size_t len, float &rssi, float &snr,
                      uint16_t *irq_out = NULL);
     Module *mod_ptr() { return mod; }
+    void standby();
     // Non-destructive read of the IRQ status register (for error-IRQ
     // counting between packets; does NOT clear).
     uint16_t irq_status();

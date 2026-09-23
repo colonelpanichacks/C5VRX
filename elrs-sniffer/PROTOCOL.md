@@ -257,6 +257,17 @@ SX1280 datasheet).
   channel 41 — every 80 hops); list: LoRa 250/500 (n+i), DVDA 500/250,
   FLRC 500/1000. Bind parking (LoRa 50 i) remains in the SWEEP.
 
+## Round 13: standby-first dwell config (smoking gun)
+
+`dwell_setup` dbg now reports `{rate,sf,bw,cr,cm_before,cm_after,raw}` —
+chipmode decoded (`stdby_rc/stdby_xosc/fs/rx/tx`) BEFORE and AFTER config.
+The SX1280 IGNORES configuration written in RX mode, so every dwell now:
+standby -> packettype -> modparams -> 0x925 -> freq -> packetparams ->
+rx_cont -> setrx (all raw SPI, RadioLib-free), and `start_rx` skips re-arm
+when GET_STATUS already says RX. The ~4.1 s SetRx window is safety-netted by
+a >2 s no-RxDone re-arm. Boot selftest ends in STANDBY (known sweep start)
+and dumps a `lora_regs` fault trail immediately when `lora_demod` is 0.
+
 ## Round 11/12 additions
 
 - `lora_regs` — once per LoRa rate per boot, at dwell start:

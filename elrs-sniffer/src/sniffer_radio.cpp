@@ -101,10 +101,40 @@ int16_t SnifferRadio::begin(const radio_pin_set_t *ps)
     return RADIOLIB_ERR_NONE;
 }
 
+// GET_STATUS chipmode (bits 7:5): 2=STDBY_RC 3=STDBY_XOSC 4=FS 5=RX 6=TX
+static const char *chipmode_name(uint8_t st)
+{
+    switch ((st >> 5) & 0x07) {
+    case 2: return "stdby_rc";
+    case 3: return "stdby_xosc";
+    case 4: return "fs";
+    case 5: return "rx";
+    case 6: return "tx";
+    default: return "?";
+    }
+}
+
+static uint8_t chipmode_read(Module *m)
+{
+    uint8_t st = 0;
+    if (m) m->SPIreadStream(RADIOLIB_SX128X_CMD_GET_STATUS, &st, 1);
+    return st;
+}
+
+
 bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
 {
     const elrs_rate_t *r = step.rate;
     payload_len = r->payload;
+    // SMOKING-GUN FIX (round 13): the SX1280 IGNORES configuration written
+    // while it is in RX — ELRS always SetMode(STDBY_RC) before reconfig
+    // (SX1280.cpp L79/L156-188). Without this, every dwell silently ran the
+    // PREVIOUS dwell's modem config (FLRC junk self-perpetuated; LoRa dwells
+    // never became LoRa). Raw ops, RadioLib-free.
+    uint8_t st_before = chipmode_read(mod);
+    uint8_t standby[1] = { 0x00 }; // SetStandby(STDBY_RC)
+    mod->SPIwriteStream(0x80, standby, 1);
+    delay(2); // ELRS uses 1500us for the standby transition
     if (r->flrc) {
         // FLRC branch — ELRS SX1280.cpp Config/SetPacketParamsFLRC semantics
         // with register-level writes where RadioLib stores/rewrites
@@ -176,17 +206,16 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
         mod->SPIwriteRegister(ELRS_REG_SF_ADDITIONAL_CONFIG,
                               elrs_sf_additional_config(r->sf));
     radio->setFrequency(freq_hz / 1000000.0);
-    mod->SPIwriteRegister(ELRS_REG_SF_ADDITIONAL_CONFIG,
-                          elrs_sf_additional_config(r->sf));
     static_cast<SnifferSX1280 *>(radio)->setPacketParamsLoRa(
         r->preamble, RADIOLIB_SX128X_LORA_HEADER_IMPLICIT, payload_len,
         0x00, step.iq_inverted ? RADIOLIB_SX128X_LORA_IQ_INVERTED
                                : RADIOLIB_SX128X_LORA_IQ_STANDARD);
-    uint8_t pt = 0, st = 0;
-    mod->SPIreadStream(RADIOLIB_SX128X_CMD_GET_PACKET_TYPE, &pt, 1);
-    mod->SPIreadStream(RADIOLIB_SX128X_CMD_GET_STATUS, &st, 1);
-    Serial.printf("{\"t\":\"dbg\",\"what\":\"dwell_setup\",\"rate\":\"%s\",\"pt\":%u,\"status\":%u}\n",
-                  r->name, pt & 0x03, st);
+    uint8_t st_after = chipmode_read(mod);
+    Serial.printf("{\"t\":\"dbg\",\"what\":\"dwell_setup\",\"rate\":\"%s\","
+                  "\"sf\":\"%02x\",\"bw\":\"%02x\",\"cr\":\"%02x\","
+                  "\"cm_before\":\"%s\",\"cm_after\":\"%s\",\"raw\":1}\n",
+                  r->name, r->sf, r->bw, r->cr,
+                  chipmode_name(st_before), chipmode_name(st_after));
     return true;
 }
 
@@ -204,10 +233,13 @@ void SnifferRadio::setFlrcIdentity(const uint8_t uid[6])
 void SnifferRadio::start_rx()
 {
     dio1_fired = false;
-    // Raw SetRx: continuous receive (periodBase 0x32=1ms? use ELRS-style
-    // 0xFFFF count = infinite). RadioLib's startReceive is NOT used — it
-    // re-applies stored packet params and would clobber our dwell config.
-    uint8_t rx[3] = { 0x00, 0xFF, 0xFF }; // base 15.625ns, count 0xFFFF = infinite
+    // ELRS-exact re-arm (SX1280.cpp SetMode RX_CONT): SetRx(periodBase
+    // 0x01, count 0xFFFF) -> ~4.1 s window; ELRS re-arms constantly and so
+    // do we (main.cpp 2 s no-RxDone watchdog). Skip when already RX so an
+    // ongoing receive is never disturbed.
+    uint8_t st = chipmode_read(mod);
+    if (((st >> 5) & 0x07) == 5) return; // already RX
+    uint8_t rx[3] = { 0x01, 0xFF, 0xFF }; // base 62.5us, count 0xFFFF
     mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_RX, rx, 3);
     uint8_t clr[2] = { 0xFF, 0xFF };
     mod->SPIwriteStream(RADIOLIB_SX128X_CMD_CLEAR_IRQ_STATUS, clr, 2);
@@ -240,6 +272,13 @@ bool SnifferRadio::read_packet(uint8_t *buf, size_t len, float &rssi, float &snr
     snr = radio->getSNR();
     start_rx(); // readData drops to standby; resume continuous RX
     return st == RADIOLIB_ERR_NONE;
+}
+
+void SnifferRadio::standby()
+{
+    uint8_t p[1] = { 0x00 }; // SetStandby(STDBY_RC)
+    if (mod) mod->SPIwriteStream(0x80, p, 1);
+    delay(2);
 }
 
 uint16_t SnifferRadio::irq_status()

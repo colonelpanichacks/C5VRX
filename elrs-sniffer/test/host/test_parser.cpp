@@ -994,6 +994,35 @@ int main()
     }
     printf("ok: telemetry gating (junk unvalidated, validated emits)\n");
 
+    // 14q) ROUND-13 op-sequence + re-arm logic: the dwell sequence is
+    //      standby -> packettype -> modparams -> 0x925 -> freq ->
+    //      packetparams -> rx_cont -> setrx (guarded against reordering);
+    //      re-arm skips when already RX and fires only after >2 s silence.
+    {
+        static const dwell_op_t seq[] = {
+            DWELL_OP_STANDBY, DWELL_OP_PACKET_TYPE, DWELL_OP_MOD_PARAMS,
+            DWELL_OP_SF925, DWELL_OP_FREQUENCY, DWELL_OP_PACKET_PARAMS,
+            DWELL_OP_RX_CONT, DWELL_OP_SET_RX
+        };
+        assert(sizeof(seq) / sizeof(seq[0]) == DWELL_OP_COUNT);
+        assert(seq[0] == DWELL_OP_STANDBY); // standby FIRST (config-in-RX is
+        assert(seq[1] == DWELL_OP_PACKET_TYPE); // ignored by the SX1280)
+        assert(seq[2] == DWELL_OP_MOD_PARAMS);
+        assert(seq[3] == DWELL_OP_SF925);
+        assert(strcmp(dwell_op_name(DWELL_OP_STANDBY), "standby") == 0);
+        assert(strcmp(dwell_op_name(DWELL_OP_SET_RX), "setrx") == 0);
+        // start_rx skip-when-RX (GET_STATUS chipmode bits 7:5, 5 = RX)
+        assert(elrs_chipmode_is_rx(0xA6)); // 0b101xxxxx
+        assert(!elrs_chipmode_is_rx(0x43)); // stdby_rc
+        assert(!elrs_chipmode_is_rx(0x86)); // tx
+        // re-arm: silence >2 s, no recent re-arm; not during activity
+        assert(elrs_should_rearm(5000, 2900, 2900));   // 2.1s silence
+        assert(!elrs_should_rearm(5000, 3100, 1000));  // packet just seen
+        assert(!elrs_should_rearm(5000, 2900, 4900));  // re-armed 100ms ago
+        assert(!elrs_should_rearm(4000, 3999, 3999));  // 1ms silence
+    }
+    printf("ok: round-13 op sequence + re-arm logic\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

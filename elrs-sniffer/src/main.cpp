@@ -97,6 +97,7 @@ static uint8_t g_mode; // 0 sweep, 1 harvest, 2 fastlink (uid_last retry)
 static uint32_t g_fastlink_t0;
 static uint8_t g_harvest_idx; // step within harvest/fastlink
 static uint8_t g_lora_regs_seen[2]; // once-per-rate probe bitmap
+static uint32_t g_last_arm_ms;
 // sync_frame dedupe ring (per harvest cycle): recent (nonce, fhss)
 static uint8_t g_sf_ring[16][2];
 static uint8_t g_sf_n;
@@ -1323,7 +1324,22 @@ void setup()
                       "\"band\":\"both\",\"flrc_demod\":%lu,\"lora_demod\":%lu,"
                       "\"selftest\":true}\n",
                       (unsigned long)flrc_demod, (unsigned long)lora_demod);
+        if (lora_demod == 0) {
+            // fault trail: dump the LoRa 250 modem state immediately
+            Module *m = g_radio.mod_ptr();
+            uint8_t v925 = m ? m->SPIreadRegister(ELRS_REG_SF_ADDITIONAL_CONFIG) : 0;
+            uint8_t pt = 0, st = 0;
+            if (m) {
+                m->SPIreadStream(RADIOLIB_SX128X_CMD_GET_PACKET_TYPE, &pt, 1);
+                m->SPIreadStream(RADIOLIB_SX128X_CMD_GET_STATUS, &st, 1);
+            }
+            Serial.printf("{\"t\":\"event\",\"what\":\"lora_regs\",\"rate\":\"LoRa 250Hz (fault)\","
+                          "\"sf\":\"60\",\"bw\":\"18\",\"cr\":\"07\",\"reg925\":\"%02x\","
+                          "\"pkt_type\":\"%02x\",\"status\":\"%02x\",\"rx\":\"cont\"}\n",
+                          v925, pt, st);
+        }
         g_radio.setFlrcDiscovery(false);
+        g_radio.standby(); // sweep starts from a known state
     }
     Serial.printf("{\"t\":\"ready\",\"steps\":%u,\"sync_freq\":%lu,\"radio\":%u,\"oled\":%u%s}\n",
                   sweep.count, (unsigned long)(ELRS_2G4_SYNC_FREQ_HZ / 1000000),
@@ -1878,6 +1894,13 @@ void loop()
         if (newly & 0x0200) dwell_swerr++; // SyncWordError bit 9
         g_irq_prev = now_irq;
         last_sample_ms = millis();
+    }
+
+    // round 13: FS-expiry safety net — the SetRx window is ~4.1 s; if no
+    // RxDone for >2 s, re-arm (exactly like ELRS re-issuing SetRx).
+    if (radio_ok && elrs_should_rearm(millis(), last_pkt_ms, g_last_arm_ms)) {
+        g_last_arm_ms = millis();
+        g_radio.start_rx();
     }
 
     led_update(locked, uist.pps);

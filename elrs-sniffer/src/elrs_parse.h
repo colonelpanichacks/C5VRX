@@ -259,6 +259,41 @@ static inline uint8_t elrs_sf_additional_config(uint8_t sf)
 }
 #define ELRS_REG_SF_ADDITIONAL_CONFIG 0x925u
 
+// ROUND 13: the exact per-dwell op sequence (ELRS-matched, src/sniffer_radio
+// apply()/start_rx() emit these in order). The enum order IS the contract;
+// the host test guards against reordering. Sequence: standby -> packettype
+// -> modparams -> 0x925 -> freq -> packetparams -> rx_cont -> setrx.
+typedef enum {
+    DWELL_OP_STANDBY = 0,
+    DWELL_OP_PACKET_TYPE,
+    DWELL_OP_MOD_PARAMS,
+    DWELL_OP_SF925,
+    DWELL_OP_FREQUENCY,
+    DWELL_OP_PACKET_PARAMS,
+    DWELL_OP_RX_CONT,
+    DWELL_OP_SET_RX,
+    DWELL_OP_COUNT
+} dwell_op_t;
+static inline const char *dwell_op_name(dwell_op_t op)
+{
+    static const char *names[] = {
+        "standby", "packettype", "modparams", "sf925",
+        "frequency", "packetparams", "rx_cont", "setrx"
+    };
+    return (op >= 0 && op < DWELL_OP_COUNT) ? names[op] : "?";
+}
+// GET_STATUS chipmode (bits 7:5): 5 = RX
+static inline bool elrs_chipmode_is_rx(uint8_t status_byte)
+{
+    return ((status_byte >> 5) & 0x07) == 5;
+}
+// FS-expiry safety net: re-arm only if no RxDone AND no re-arm for >2 s
+static inline bool elrs_should_rearm(uint32_t now_ms, uint32_t last_pkt_ms,
+                                     uint32_t last_arm_ms)
+{
+    return (now_ms - last_pkt_ms > 2000) && (now_ms - last_arm_ms > 2000);
+}
+
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only
 // returns true the moment identity is ACCEPTED (2nd consistent sync)
