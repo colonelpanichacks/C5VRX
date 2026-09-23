@@ -1324,6 +1324,9 @@ class ElrsState:
         self.tlm = {}           # type -> (payload dict, monotonic)
         self.events = []        # newest-last [(monotonic, seq, payload)]
         self.event_seq = 0
+        self.crack_state = None  # stats.crack mirror (keep-last)
+        self.mode = None         # stats.mode: sweep|park|follow|discovery
+        self.crack_ev = None     # (payload, monotonic) latest t=="crack" line
 
     def update(self, obj: dict) -> None:
         now = time.monotonic()
@@ -1347,11 +1350,20 @@ class ElrsState:
                 if obj.get("uid"):
                     self.uid = obj["uid"]
                 self.arm = obj.get("arm", 0)
+                # Crack machine mirrors (dashboard contract): crack = last state
+                # string, mode = sweep|park|follow|discovery. Keep-last so a lost crack
+                # event line still leaves the panel stateable from stats alone.
+                self.crack_state = obj.get("crack", self.crack_state)
+                self.mode = obj.get("mode", self.mode)
                 ch = obj.get("ch")
                 if isinstance(ch, list) and len(ch) == 4:
                     self.ch = [int(c) for c in ch]
                 self.stats_time = now
             else:
+                if t == "crack":
+                    # Keep-last full crack payload (state/uid_tail/done/
+                    # valids_best[/uid_full]) — survives the events ring.
+                    self.crack_ev = (obj, now)
                 if t in ELRS_TLM_TYPES:
                     self.tlm[t] = (obj, now)
                     if t == "sync" and obj.get("uid"):
@@ -1382,6 +1394,12 @@ class ElrsState:
                 "ch": list(self.ch),
                 "freq": self.freq,
                 "fhss": self.fhss,
+                "mode": self.mode,
+                "crack_state": self.crack_state,
+                "crack": (None if self.crack_ev is None else
+                          {"age_s": round(now - self.crack_ev[1], 1),
+                           **{k: v for k, v in self.crack_ev[0].items()
+                              if k != "t"}}),
                 "stats_age_s": (None if self.stats_time is None
                                 else round(now - self.stats_time, 1)),
                 "tlm": {k: {"age_s": round(now - ts, 1),
@@ -1789,7 +1807,7 @@ PAGE = """<!DOCTYPE html>
   .evl.k-gps .etag, .evl.k-batt .etag, .evl.k-atti .etag,
   .evl.k-fm .etag { color:var(--txt); }
   .evl.k-fp .etag, .evl.k-uid_cracked .etag, .evl.k-uid2_crack .etag,
-  .evl.k-uid2_crack_failed .etag { color:#ff3ac8; }
+  .evl.k-uid2_crack_failed .etag, .evl.k-crack .etag { color:#ff3ac8; }
   .evl.k-error .etag { color:var(--red); }
   .evl .eage { color:var(--dim); margin-left:5px; }
   /* ELRS tab: gauges on top, sparkline middle, intel + log bottom. */
@@ -1831,6 +1849,41 @@ PAGE = """<!DOCTYPE html>
              padding:0 8px; border-radius:3px; border:1px solid #31c8ff;
              color:#31c8ff; font-size:.58rem; letter-spacing:.1em; }
   #xestickwrap { flex:1 1 220px; max-width:420px; position:relative; }
+  /* Crack panel: the FLRC acquisition pipeline as stage chips between the
+     link header and the gauges. FIXED-height strip that always reserves its
+     slot (the panel itself is visibility-toggled, never display:none); every
+     chip has a fixed width + reserved sub-line, so state changes, progress
+     numbers and the CRACKED/FAILED swap never reflow the tab. Passed stages
+     solid lit, current stage pulses, future stages dim. */
+  #ecrack { flex:0 0 40px; height:40px; display:flex; align-items:center;
+            gap:8px; flex-wrap:nowrap; overflow:hidden; padding:0 18px;
+            box-sizing:border-box; border-bottom:1px solid var(--dim);
+            font-size:.58rem; letter-spacing:.1em; white-space:nowrap;
+            font-variant-numeric:tabular-nums; }
+  .ckst { flex:0 0 auto; height:30px; box-sizing:border-box; overflow:hidden;
+          display:inline-flex; flex-direction:column; justify-content:center;
+          padding:2px 8px; border:1px solid var(--dim); border-radius:3px;
+          color:var(--dim); text-align:center; }
+  .ckst b { font-weight:normal; letter-spacing:.14em; }
+  .ckst i { display:block; font-style:normal; font-size:.5rem; color:var(--dim);
+            letter-spacing:.06em; min-height:.66rem; line-height:.66rem;
+            overflow:hidden; text-overflow:ellipsis; }
+  #cks-sweep { width:86px; } #cks-sync { width:110px; }
+  #cks-ident { width:96px; } #cks-crack { width:186px; }
+  #cks-done { width:220px; }
+  .ckarr { flex:0 0 auto; color:var(--dim); }
+  .ckst.pass { color:var(--grn); border-color:var(--grn); opacity:.7; }
+  .ckst.on { color:var(--grn); border-color:var(--grn);
+             text-shadow:0 0 6px rgba(57,255,106,.6);
+             animation:ckpulse 1.1s ease-in-out infinite; }
+  .ckst.on.ok { animation:none; }               /* CRACKED holds solid, machine done */
+  .ckst.on.fail { color:var(--amb); border-color:var(--amb);
+                  text-shadow:0 0 6px rgba(255,176,32,.6); }
+  @keyframes ckpulse { 50% { opacity:.45; } }
+  .ckbar { display:block; height:3px; margin-top:2px; background:rgba(51,80,47,.5);
+           border-radius:2px; overflow:hidden; }
+  #ckfill { display:block; height:100%; width:0%; background:var(--grn); }
+  #ckdone-sub b { font-weight:normal; color:var(--grn); }
   .staletag { position:absolute; top:-7px; right:0; font-size:.5rem;
               letter-spacing:.14em; color:var(--amb); border:1px solid var(--amb);
               border-radius:3px; padding:0 4px; background:var(--panel); }
@@ -2049,6 +2102,11 @@ PAGE = """<!DOCTYPE html>
     .etlm { grid-template-columns:repeat(2,1fr); gap:6px; padding:6px 10px; }
     #elinkhdr { gap:8px; padding:0 12px; font-size:.6rem; }
     .followb { min-width:160px; }
+    #ecrack { gap:5px; padding:0 12px; font-size:.5rem; }
+    #ecrack .ckst { padding:2px 5px; }
+    #cks-sweep { width:64px; } #cks-sync { width:84px; }
+    #cks-ident { width:72px; } #cks-crack { width:140px; }
+    #cks-done { width:160px; }
     .ebot { flex:0 0 220px; flex-direction:column; overflow:auto; }
     #gtitle, #fstitle { font-size:.58rem; }
     #gcur b { font-size:1.1rem; }
@@ -2171,6 +2229,17 @@ PAGE = """<!DOCTYPE html>
     <span id="xeuidwrap"></span>
     <span id="xearm" class="armb" style="visibility:hidden">ARMED</span>
     <span id="xefollow" class="followb" style="visibility:hidden"></span>
+  </div>
+  <div id="ecrack" style="visibility:hidden">
+    <span class="ckst" id="cks-sweep"><b>SWEEP</b><i id="cksweep-sub"></i></span>
+    <span class="ckarr">&#8250;</span>
+    <span class="ckst" id="cks-sync"><b>SYNC</b><i id="cktail"></i></span>
+    <span class="ckarr">&#8250;</span>
+    <span class="ckst" id="cks-ident"><b>IDENTITY</b><i id="ckident-sub"></i></span>
+    <span class="ckarr">&#8250;</span>
+    <span class="ckst" id="cks-crack"><b>CRACKING</b><i id="ckprog"></i><span class="ckbar"><span id="ckfill"></span></span></span>
+    <span class="ckarr">&#8250;</span>
+    <span class="ckst" id="cks-done"><b id="ckdone-lbl">CRACKED</b><i id="ckdone-sub"></i></span>
   </div>
   <div class="etop">
     <div class="egauge"><span class="ek">RSSI</span><b id="xerssi">--</b><span class="eu">dBm</span><i class="gsub" id="xerssinow"></i></div>
@@ -2803,6 +2872,12 @@ function fmtEv(ev) {
     case 'radio_up': return 'recovered';
     case 'error': return (ev.what || '?') + ' ' + (ev.detail || '');
     case 'probe': return (ev.set || ev.info || '') + (ev.ok ? ' ok' : '');
+    case 'crack':
+      return ev.state + (ev.uid_tail ? ' tail=' + ev.uid_tail : '') +
+        (ev.state === 'cracking' ? ' ' + (ev.done || 0) + '/' + (ev.total || 256) +
+         ' best=' + (ev.valids_best || 0) : '') +
+        (ev.uid_full ? ' uid=' + ev.uid_full : '') +
+        (ev.state === 'failed' ? ' — auto-retry' : '');
     case 'event':
       switch (ev.what) {
         case 'fp': return 'band=' + (ev.band || '?') + ' tail=' +
@@ -2820,7 +2895,7 @@ function fmtEv(ev) {
   }
 }
 /* Class key for color-coding: t="event" lines classify by their `what`
-   (fp/uid_cracked/uid2_crack/flrc_sync are the OSINT events -> magenta). */
+   (fp/uid_cracked/uid2_crack/flrc_sync + t=crack are the OSINT events -> magenta). */
 const evKey = ev => ev.t === 'event' ? (ev.what || 'event') : (ev.t || '?');
 const evLine = (ev, stamp) =>
   '<div class="evl k-' + esc(evKey(ev)) + '">' +
@@ -2844,7 +2919,82 @@ function intelItems(e) {
     ' y' + (t.atti.y / 10000 * 57.3).toFixed(0));
   if (t.linkstats) out.push('UPLINK lq=' + t.linkstats.lq + ' rssi2=' +
     t.linkstats.rssi2 + ' snr=' + t.linkstats.snr);
+  const ci = crackInfo(e, true), cl = ci && crackLine(ci);
+  if (cl) out.unshift(cl);
   return out;
+}
+/* Crack machine state (dashboard contract): the last t="crack" event is
+   keep-last (backend mirrors it on every poll) and stats.crack carries the
+   last state string, so the panel survives an event line lost on the wire. */
+let crackEv = null;                      // keep-last latest crack payload
+function crackInfo(e, on) {
+  if (!on || !e) return null;
+  if (e.crack) crackEv = e.crack;
+  const state = e.crack_state || (crackEv && crackEv.state) || null;
+  return { state, ev: crackEv || {}, mode: e.mode || null,
+           lora: !!(e.lock && /^LoRa/.test(e.rate || '')) };
+}
+/* LIVE-card intel line while the pipeline runs (cracked is shown by the UID
+   chips + panel instead). */
+function crackLine(ci) {
+  const ck = ci.ev;
+  switch (ci.state) {
+    case 'listening': return ci.mode === 'discovery' ? 'LISTENING // discovery'
+                                                     : 'LISTENING';
+    case 'sync_seen': return 'SYNC ' + (ck.uid_tail || '?');
+    case 'identity': return 'IDENTITY ' + (ck.uid_tail || '?');
+    case 'cracking': return 'CRACK ' + (ck.done || 0) + '/' + (ck.total || 256) +
+                         ' best=' + (ck.valids_best || 0);
+    case 'failed': return 'CRACK FAILED · auto-retry';
+    default: return null;
+  }
+}
+/* Crack panel: SWEEP -> SYNC -> IDENTITY -> CRACKING -> CRACKED/FAILED stage
+   chips. Passed = solid lit, current = pulsing, future = dim. LoRa locks
+   never enter the pipeline: CRACKING shows a dim N/A. The strip is fixed
+   height and always reserves its slot (visibility-toggled only). */
+const CK_IDX = { listening: 0, sync_seen: 1, identity: 2, cracking: 3,
+                 cracked: 4, failed: 4 };
+function updElrsCrack(e, on, set) {
+  document.getElementById('ecrack').style.visibility = on ? 'visible' : 'hidden';
+  const ci = crackInfo(e, on), st = ci && ci.state;
+  const ck = (ci && ci.ev) || {}, mode = ci && ci.mode;
+  const idx = st !== null && st !== undefined ? CK_IDX[st] : (mode ? 0 : -1);
+  ['cks-sweep', 'cks-sync', 'cks-ident', 'cks-crack', 'cks-done']
+    .forEach((id, i) => {
+      let cls = 'ckst';
+      if (idx >= 0 && i < idx) cls += ' pass';
+      else if (idx >= 0 && i === idx)
+        cls += ' on' + (st === 'failed' ? ' fail' : st === 'cracked' ? ' ok' : '');
+      document.getElementById(id).className = cls;
+    });
+  set('cksweep-sub', mode || '');
+  set('cktail', idx >= 1 && ck.uid_tail ? 'tail ' + ck.uid_tail : '');
+  set('ckident-sub', st === 'identity' ? '2nd sync ok' : '');
+  // LoRa lock that never entered the pipeline: CRACKING goes dim "N/A".
+  const loraNa = ci && ci.lora && (!st || st === 'listening');
+  if (loraNa) {
+    document.getElementById('cks-crack').className = 'ckst';
+    set('ckprog', 'N/A');
+  } else {
+    set('ckprog', st === 'cracking' ?
+      (ck.done || 0) + '/' + (ck.total || 256) + ' best=' + (ck.valids_best || 0) :
+      (idx >= 3 && ck.done ? ck.done + '/' + (ck.total || 256) : ''));
+  }
+  document.getElementById('ckfill').style.width =
+    st === 'cracking' && ck.total ?
+      Math.min(100, (ck.done || 0) / ck.total * 100) + '%' :
+      (st === 'cracked' ? '100%' : '0%');
+  document.getElementById('ckdone-lbl').textContent =
+    st === 'failed' ? 'FAILED' : 'CRACKED';
+  const ds = document.getElementById('ckdone-sub');
+  if (st === 'cracked' && ck.uid_full) {
+    // uid_full's first bytes are a phrase-derived guess — only the tail is
+    // ground truth: dim the guess, keep the tail bright (label via phrase_crack).
+    const uf = String(ck.uid_full), tail = String(ck.uid_tail || '');
+    ds.innerHTML = esc(uf.slice(0, uf.length - tail.length)) +
+                   '<b>' + esc(tail) + '</b>';
+  } else ds.textContent = st === 'failed' ? 'auto-retry' : '';
 }
 let elrsHist = [];                     // {t, rssi, lq} per poll, 60 s window
 let elogSeen = 0;                      // last event seq in the tab log
@@ -2994,6 +3144,7 @@ function updElrs(e, set) {
   document.getElementById('xestale').style.visibility =
     on && (!e.lock || allZero) ? 'visible' : 'hidden';
   updElrsTlm(e, on);
+  updElrsCrack(e, on, set);
   // Scrolling event log: append only events newer than the last seen seq.
   (on ? e.last_events || [] : []).forEach(ev => {
     if (ev.seq > elogSeen) {
