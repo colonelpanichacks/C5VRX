@@ -107,6 +107,19 @@ static uint32_t g_crack_t0 = 0;
 static uint32_t g_crack_score = 0;
 // Identity gating (field-proven: rejects chance hits + discovery noise)
 static elrs_identity_t g_id;
+
+// Connection state machine — behavior port of rx_main.cpp 3.6.4:
+// disconnected -> tentative on a re-anchoring sync; tentative -> connected
+// when validated packets exceed minLqForChaos (LQ rule, rx_main.cpp:2227);
+// tentative drops without a sync for RxLockTimeoutMs, connected drops
+// without a validated packet for DisconnectTimeoutMs (grace-extended by
+// SYNC_LOCK_MS for sync-only beacon streams — an RX-only-TX case the RX
+// never sees because a real RX always receives the RC stream).
+typedef enum { CONN_DISCONNECTED, CONN_TENTATIVE, CONN_CONNECTED } conn_state_t;
+static conn_state_t g_conn = CONN_DISCONNECTED;
+static uint32_t g_valid_since_tentative;
+static elrs_nonce_track_t g_ntrack;
+static uint32_t g_next_hop_ms;   // time-based hop schedule (RX HandleFHSS)
 // sync anchor for position prediction
 static uint8_t g_anchor_idx = 0;
 static uint8_t g_anchor_nonce = 0;
@@ -224,26 +237,68 @@ static void crack_tick()
     if (g_crack_cand % 16 == 0) crack_emit("cracking"); // progress line
 }
 
-static void follow_on_valid_packet()
+// RX HandleFHSS port: the hop schedule free-runs on wall time (the RX's
+// timer keeps hopping through fades); missed slots do not delay it.
+static void follow_tick()
 {
     if (!g_following || g_crack) return;
     const elrs_rate_t *r = sweep.steps[step_idx].rate;
-    if (++g_pkts_since_hop < r->hop_interval) return;
-    g_pkts_since_hop = 0;
-    g_fhss_idx = (uint16_t)((g_fhss_idx + 1) % FHSS_SEQ_COUNT);
-    uint32_t f = elrs_fhss_channel_hz(g_seq[g_fhss_idx]);
-    if (f != g_follow_freq) {
-        g_follow_freq = f;
-        g_radio.tune(f);
+    uint32_t hop_ms = (uint32_t)r->hop_interval * r->interval_us / 1000;
+    if (hop_ms == 0) hop_ms = 1;
+    uint32_t now = millis();
+    while ((int32_t)(now - g_next_hop_ms) >= 0) {
+        g_fhss_idx = (uint16_t)((g_fhss_idx + 1) % FHSS_SEQ_COUNT);
+        g_next_hop_ms += hop_ms;
+        uint32_t f = elrs_fhss_channel_hz(g_seq[g_fhss_idx]);
+        if (f != g_follow_freq) {
+            g_follow_freq = f;
+            g_radio.tune(f);
+        }
+        uist.freq_hz = f;
     }
-    uist.freq_hz = f;
+}
+
+// conn helpers — ProcessRfPacket_SYNC / GotConnection ports
+static void conn_on_sync(const elrs_packet_t &pkt)
+{
+    uint32_t now = millis();
+    last_sync_ms = now;
+    bool was = g_conn;
+    // RX: sync re-anchors when disconnected OR nonce off-track (1092)
+    bool on_track = elrs_nonce_on_track(&g_ntrack, now, pkt.sync.nonce);
+    if (g_conn == CONN_DISCONNECTED || !on_track) {
+        fhss_anchor(pkt);                 // FHSSsetCurrIndex + OtaNonce =
+        g_conn = CONN_TENTATIVE;          //   sync.nonce, TentativeConnection
+        g_valid_since_tentative = 0;
+        locked = true;
+        if (was == CONN_DISCONNECTED) Serial.println("{\"t\":\"lock\"}");
+    }
+    last_pkt_ms = now;
+}
+
+static void conn_on_valid()
+{
+    last_valid_ms = millis();
+    if (g_conn == CONN_TENTATIVE &&
+        ++g_valid_since_tentative >
+            elrs_min_lq_for_chaos(sweep.steps[step_idx].rate->hop_interval)) {
+        g_conn = CONN_CONNECTED;          // GotConnection (2227)
+    }
 }
 
 static void fhss_anchor(const elrs_packet_t &pkt)
 {
+    const elrs_rate_t *r = sweep.steps[step_idx].rate;
+    uint32_t now = millis();
     g_anchor_idx = pkt.sync.fhss_index;
     g_anchor_nonce = pkt.sync.nonce;
-    g_anchor_ms = millis();
+    g_anchor_ms = now;
+    // RX port: OtaNonce = sync.nonce (rx_main.cpp:1098) — time-based track
+    elrs_nonce_anchor(&g_ntrack, pkt.sync.nonce, now, r->interval_us / 1000);
+    // RX HandleFHSS hops when (OtaNonce+1) % hopInterval == 0 (rx_main.cpp:413)
+    uint8_t hop = r->hop_interval;
+    uint32_t slots_to_boundary = (uint8_t)(hop - 1 - (pkt.sync.nonce % hop)) + 1;
+    g_next_hop_ms = now + slots_to_boundary * (r->interval_us / 1000);
     g_fhss_idx = g_anchor_idx;
     if (g_uid2_known) {
         uint32_t f = elrs_fhss_channel_hz(g_seq[g_fhss_idx]);
@@ -375,17 +430,12 @@ static void on_sync(const elrs_packet_t &pkt)
     }
     last_good_step = step_idx; // sweep re-enters here first after a drop
     emit_fingerprint("lora");
-    fhss_anchor(pkt);
+    conn_on_sync(pkt);
     if (g_crack && g_crack_flrc) { // strong LoRa lock beats an FLRC crack
         g_crack = false;
         g_radio.tune(ELRS_2G4_SYNC_FREQ_HZ);
     } else if (!g_uid2_known && !g_crack) {
         start_crack(false); // find UID[2], then hop-follow this link
-    }
-    if (!locked) {
-        locked = true;
-        lock_total_pkts = 0;
-        Serial.println("{\"t\":\"lock\"}");
     }
     snprintf(uist.ident, sizeof(uist.ident), "link %02x%02x%02x %s",
              pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5, uist.rate);
@@ -489,7 +539,7 @@ static void stats_tick()
                   "\"rssi_now\":%d,\"snr10\":%d,\"pps\":%lu,\"rx_per_s\":%lu,"
                   "\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
                   "\"freq\":%lu,\"fhss\":%u,\"sync_only\":%u,"
-                  "\"crack\":\"%s\",\"mode\":\"%s\","
+                  "\"crack\":\"%s\",\"mode\":\"%s\",\"conn\":\"%s\","
                   "\"rx\":%lu,\"crc_ok\":%lu,"
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},"
                   "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u",
@@ -502,6 +552,7 @@ static void stats_tick()
                   g_following ? (unsigned)g_fhss_idx : 255,
                   (locked && now - last_rc_ms > 2000) ? 1u : 0u,
                   g_crack_state, mode,
+                  g_conn == CONN_CONNECTED ? "connected" : (g_conn == CONN_TENTATIVE ? "tentative" : "disconnected"),
                   (unsigned long)n_rx, (unsigned long)n_crc_ok,
                   (unsigned long)n_rc, (unsigned long)n_msp,
                   (unsigned long)n_sync, (unsigned long)n_tlm, (unsigned long)n_unk,
@@ -1013,7 +1064,7 @@ void loop()
                     if (locked) lock_total_pkts++;
                     // rule 5: discovery-mode garbage must not extend a lock's
                     // liveness; only real (non-discovery) validated packets do
-                    if (!(g_radio.flrcDiscovery() && locked)) last_valid_ms = millis();
+                    if (!(g_radio.flrcDiscovery() && locked)) conn_on_valid();
                     if (pkt.type == ELRS_PKT_SYNC) {
                         // syncs refresh liveness only if they match the identity
                         if (!g_id.known ||
@@ -1024,7 +1075,7 @@ void loop()
                     }
                     if (pkt.type == ELRS_PKT_RCDATA) last_rc_ms = millis();
                     if (g_crack) g_crack_score++;
-                    follow_on_valid_packet();
+                    follow_tick();
                     // sync-first debug: SHOW validated packets (2/s cap)
                     if (millis() - last_pkt_debug_ms >= PKT_DEBUG_MIN_MS) {
                         last_pkt_debug_ms = millis();
@@ -1073,10 +1124,8 @@ void loop()
                                               g_id.u3, g_id.u4, g_id.u5);
                             }
                             emit_fingerprint("flrc");
-                            fhss_anchor(pkt);
+                            conn_on_sync(pkt);
                             if (!g_uid2_known && !g_crack) start_crack(true);
-                            if (!locked) Serial.println("{\"t\":\"lock\"}");
-                            locked = true;
                             last_good_step = step_idx;
                         }
                     }
@@ -1137,11 +1186,20 @@ void loop()
             g_radio.recover(sweep.steps[step_idx], ELRS_2G4_SYNC_FREQ_HZ);
             dwell_advance();
         }
-        // Persistent lock (BUG 1: sync-only streams stay locked): drop only
-        // when BOTH no validated data for LOCK_DROP_MS AND no validated sync
-        // for SYNC_LOCK_MS (>= 4x the slowest sync interval, generous).
-        if (locked && millis() - last_valid_ms > LOCK_DROP_MS &&
-            millis() - last_sync_ms > SYNC_LOCK_MS) {
+        // RX demote rules (rx_main.cpp:2211 + 2222), sync-grace extended:
+        // tentative drops after RxLockTimeoutMs without a sync; connected
+        // drops after DisconnectTimeoutMs without a validated packet, with
+        // SYNC_LOCK_MS grace for sync-only beacon streams (an RX never sees
+        // those - a real RX receives the RC stream of a live TX).
+        const elrs_rate_t *cr = sweep.steps[step_idx].rate;
+        bool demote = false;
+        if (g_conn == CONN_TENTATIVE && millis() - last_sync_ms > cr->rx_lock_ms)
+            demote = true;
+        if (g_conn == CONN_CONNECTED && millis() - last_valid_ms > cr->disc_ms &&
+            millis() - last_sync_ms > SYNC_LOCK_MS)
+            demote = true;
+        if (demote) {
+            g_conn = CONN_DISCONNECTED;   // LostConnection (rx_main.cpp:838)
             locked = false;
             g_following = false;
             g_crack = false;

@@ -467,6 +467,35 @@ int main()
     }
     printf("ok: identity gating (beacon accepts, chaos rejects)\n");
 
+    // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
+    //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
+    //     ghost (field chaos) nonces off-track.
+    {
+        // minLqForChaos: hop=4, 80 ch -> 4; hop=2 -> 2 (LQ must EXCEED this)
+        assert(elrs_min_lq_for_chaos(4) == 4);
+        assert(elrs_min_lq_for_chaos(2) == 2);
+        // nonce track: 250Hz class, interval 4ms
+        elrs_nonce_track_t nt;
+        elrs_nonce_anchor(&nt, 100, 10000, 4);
+        assert(elrs_nonce_expected(&nt, 10000) == 100);
+        assert(elrs_nonce_expected(&nt, 10040) == 110);   // 10 slots later
+        // genuine sync on-track (RX: OtaNonce == sync.nonce)
+        assert(elrs_nonce_on_track(&nt, 10040, 110));
+        // ghost sync (random nonce) off-track -> resync event, no promote
+        assert(!elrs_nonce_on_track(&nt, 10040, 0x61));
+        // RX re-anchor semantics: adopt sync nonce + fhssIndex verbatim
+        elrs_nonce_anchor(&nt, 200, 10040, 4);
+        assert(elrs_nonce_expected(&nt, 10080) == 210);
+        // field chaos pattern: random nonces vs a fixed expectation are
+        // chance-level (~1/256 per sample)
+        srand(4242);
+        unsigned hits = 0;
+        for (int i = 0; i < 1000; i++)
+            if (elrs_nonce_on_track(&nt, 10080, rand() & 0xFF)) hits++;
+        assert(hits <= 12); // ~3.9 expected, generous bound
+    }
+    printf("ok: RX-port nonce discipline + minLqForChaos\n");
+
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }

@@ -69,3 +69,44 @@ static inline uint16_t elrs_fhss_advance(uint16_t idx, uint32_t packets, uint8_t
 {
     return (uint16_t)((idx + packets / hop) % FHSS_SEQ_COUNT);
 }
+
+// --- reference-RX port (rx_main.cpp 3.6.4) ---------------------------------
+// minLqForChaos (rx_main.cpp:273): most CRC-passing packets receivable on
+// ONE channel per 100-slot LQ window by chance; tentative->connected needs
+// LQ GREATER than this (rx_main.cpp:2227). hop=4, 80 ch -> 4; hop=2 -> 2.
+static inline uint8_t elrs_min_lq_for_chaos(uint8_t hop)
+{
+    return (uint8_t)(hop * ((hop * FHSS_FREQ_COUNT + 99) / (hop * FHSS_FREQ_COUNT)));
+}
+
+// Nonce tracking per the RX. The RX free-runs a timer at the air rate and
+// increments OtaNonce per slot (HWtimerCallbackTick, rx_main.cpp:678); a
+// sync re-anchors only when sync.nonce == tracked OtaNonce, otherwise the
+// mismatch IS a resync event (ProcessRfPacket_SYNC, rx_main.cpp:1092-1100:
+// FHSSsetCurrIndex(sync.fhssIndex), OtaNonce = sync.nonce, TentativeConn).
+// We have no hw timer: expected nonce is derived from WALL TIME since the
+// anchor at the locked rate's packet interval (same discipline).
+typedef struct {
+    uint8_t  anchor_nonce;
+    uint32_t anchor_ms;
+    uint32_t interval_ms;   // locked rate packet period
+} elrs_nonce_track_t;
+
+static inline void elrs_nonce_anchor(elrs_nonce_track_t *t, uint8_t nonce,
+                                     uint32_t now_ms, uint32_t interval_ms)
+{
+    t->anchor_nonce = nonce;
+    t->anchor_ms = now_ms;
+    t->interval_ms = interval_ms ? interval_ms : 1;
+}
+
+static inline uint8_t elrs_nonce_expected(const elrs_nonce_track_t *t, uint32_t now_ms)
+{
+    return (uint8_t)(t->anchor_nonce + (now_ms - t->anchor_ms) / t->interval_ms);
+}
+
+// RX semantics: a sync is on-track iff sync.nonce == expected slot nonce
+static inline bool elrs_nonce_on_track(const elrs_nonce_track_t *t, uint32_t now_ms, uint8_t nonce)
+{
+    return nonce == elrs_nonce_expected(t, now_ms);
+}

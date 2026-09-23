@@ -75,16 +75,18 @@ typedef struct {
     uint8_t     hop_interval;
     uint8_t     rate_index;// ELRS index (sync packet rateIndex field)
     uint8_t     flrc;      // 1 = FLRC modem (sync word = uidMacSeed, radio CRC)
+    uint16_t    rx_lock_ms;  // RFperf RxLockTimeoutMs (tentative drop w/o sync)
+    uint16_t    disc_ms;     // RFperf DisconnectTimeoutMs (connected drop w/o data)
 } elrs_rate_t;
 
 static const elrs_rate_t ELRS_RATES_3X[] = {
     // name           bw     sf     cr     pre  interval  len  hop  idx
-    { "LoRa 500Hz",   0x18,  0x50,  0x06,  12,   2000,     8,   4,   4 },
-    { "LoRa 333Hz8",  0x18,  0x50,  0x08,  12,   3003,    13,   4,   5 },
-    { "LoRa 250Hz",   0x18,  0x60,  0x08,  14,   4000,     8,   4,   6 },
-    { "LoRa 150Hz",   0x18,  0x70,  0x08,  12,   6666,     8,   4,   7 },
-    { "LoRa 100Hz8",  0x18,  0x70,  0x08,  12,  10000,    13,   4,   8 },
-    { "LoRa 50Hz",    0x18,  0x80,  0x08,  12,  20000,     8,   2,   9 },
+    { "LoRa 500Hz",   0x18,  0x50,  0x06,  12,   2000,     8,   4,   4 , 0, 2500, 2500 },
+    { "LoRa 333Hz8",  0x18,  0x50,  0x08,  12,   3003,    13,   4,   5 , 0, 2500, 2500 },
+    { "LoRa 250Hz",   0x18,  0x60,  0x08,  14,   4000,     8,   4,   6 , 0, 3000, 2500 },
+    { "LoRa 150Hz",   0x18,  0x70,  0x08,  12,   6666,     8,   4,   7 , 0, 3500, 2500 },
+    { "LoRa 100Hz8",  0x18,  0x70,  0x08,  12,  10000,    13,   4,   8 , 0, 3500, 2500 },
+    { "LoRa 50Hz",    0x18,  0x80,  0x08,  12,  20000,     8,   2,   9 , 0, 4000, 2500 },
 };
 #define ELRS_RATES_3X_COUNT (sizeof(ELRS_RATES_3X) / sizeof(ELRS_RATES_3X[0]))
 
@@ -94,10 +96,10 @@ static const elrs_rate_t ELRS_RATES_3X[] = {
 // ELRS_PKT_LEGACY_V2) — payload length 8 covers them, the parser marks the
 // CRC region unvalidated for these.
 static const elrs_rate_t ELRS_RATES_2X[] = {
-    { "LoRa 500Hz",   0x18,  0x50,  0x06,  12,   2000,     8,   4,  0xFF },
-    { "LoRa 250Hz*",  0x18,  0x60,  0x07,  14,   4000,     8,   4,  0xFF }, // CR 4/7
-    { "LoRa 150Hz*",  0x18,  0x70,  0x07,  12,   6666,     8,   4,  0xFF }, // CR 4/7
-    { "LoRa 50Hz*",   0x18,  0x90,  0x06,  12,  20000,     8,   2,  0xFF }, // SF9
+    { "LoRa 500Hz",   0x18,  0x50,  0x06,  12,   2000,     8,   4,  0xFF , 0, 2500, 2500 },
+    { "LoRa 250Hz*",  0x18,  0x60,  0x07,  14,   4000,     8,   4,  0xFF , 0, 3000, 2500 }, // CR 4/7
+    { "LoRa 150Hz*",  0x18,  0x70,  0x07,  12,   6666,     8,   4,  0xFF , 0, 3500, 2500 }, // CR 4/7
+    { "LoRa 50Hz*",   0x18,  0x90,  0x06,  12,  20000,     8,   2,  0xFF , 0, 4000, 2500 }, // SF9
 };
 #define ELRS_RATES_2X_COUNT (sizeof(ELRS_RATES_2X) / sizeof(ELRS_RATES_2X[0]))
 
@@ -109,9 +111,9 @@ static const elrs_rate_t ELRS_RATES_2X[] = {
 // single-polarity dwell steps.
 static const elrs_rate_t ELRS_RATES_FLRC[] = {
     // name            flrc-bw flrc-bt flrc-cr pre  interval  len  hop  idx  flrc
-    { "FLRC 1000Hz",   0x86,   0x10,   0x00,  32,   1000,     8,   2,   0,  1 },
-    { "DVDA 500Hz",    0x86,   0x10,   0x00,  32,   1000,     8,   2,   2,  1 },
-    { "DVDA 250Hz",    0x86,   0x10,   0x00,  32,   1000,     8,   2,   3,  1 },
+    { "FLRC 1000Hz",   0x86,   0x10,   0x00,  32,   1000,     8,   2,   0,  1 , 2500, 2500 },
+    { "DVDA 500Hz",    0x86,   0x10,   0x00,  32,   1000,     8,   2,   2,  1 , 2500, 2500 },
+    { "DVDA 250Hz",    0x86,   0x10,   0x00,  32,   1000,     8,   2,   3,  1 , 2500, 2500 },
 };
 #define ELRS_RATES_FLRC_COUNT (sizeof(ELRS_RATES_FLRC) / sizeof(ELRS_RATES_FLRC[0]))
 
