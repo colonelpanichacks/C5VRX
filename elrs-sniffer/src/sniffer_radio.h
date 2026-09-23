@@ -101,6 +101,8 @@ private:
     Module *mod = nullptr;
     SX1280 *radio = nullptr;
     uint8_t payload_len = 0;
+    int rf_rxen = -1;                     // H658 FEM antenna-switch control
+    int rf_txen = -1;
     uint8_t flrc_sw[4] = { 0, 0, 0, 3 };  // uidMacSeedGet (default-phrase UID)
     uint16_t flrc_seed = 3;               // OtaCrcInitializer for the FLRC radio CRC
     bool flrc_id_ok = false;

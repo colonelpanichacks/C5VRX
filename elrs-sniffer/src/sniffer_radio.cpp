@@ -94,8 +94,18 @@ int16_t SnifferRadio::begin(const radio_pin_set_t *ps)
     // ELRS SX1280.cpp Begin(): register 0x0891 |= 0xC0 (high sensitivity)
     mod->SPIwriteRegister(0x0891, mod->SPIreadRegister(0x0891) | 0xC0);
     if (ps->rxen != -1) {
-        // PA variant: antenna switch enables (verified SX1280PA_PingPong.ino)
+        // PA variant: H658 FEM antenna switch. RadioLib only toggles these
+        // pins inside its own receive()/transmit() — the sniffer's raw-SPI
+        // RX path bypasses those, so the switch must be driven explicitly:
+        // RXEN high connects the antenna to the LNA path. Without this the
+        // FEM leaves the antenna disconnected in RX (live RSSI, zero signal).
         radio->setRfSwitchPins(ps->rxen, ps->txen);
+        rf_rxen = ps->rxen;
+        rf_txen = ps->txen;
+        pinMode(rf_rxen, OUTPUT);
+        pinMode(rf_txen, OUTPUT);
+        digitalWrite(rf_rxen, HIGH);
+        digitalWrite(rf_txen, LOW);
     }
     radio->setDio1Action(on_dio1);
     return RADIOLIB_ERR_NONE;
@@ -233,6 +243,12 @@ void SnifferRadio::setFlrcIdentity(const uint8_t uid[6])
 void SnifferRadio::start_rx()
 {
     dio1_fired = false;
+    // H658 FEM: keep the antenna switch on the RX/LNA path (RadioLib's own
+    // switching is bypassed by the raw-SPI receive path).
+    if (rf_rxen != -1) {
+        digitalWrite(rf_rxen, HIGH);
+        digitalWrite(rf_txen, LOW);
+    }
     // ELRS-exact re-arm (SX1280.cpp SetMode RX_CONT): SetRx(periodBase
     // 0x01, count 0xFFFF) -> ~4.1 s window; ELRS re-arms constantly and so
     // do we (main.cpp 2 s no-RxDone watchdog). Skip when already RX so an
