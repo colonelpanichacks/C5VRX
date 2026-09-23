@@ -323,6 +323,28 @@ bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
                     init = cand; got = true;
                 }
             }
+            // multi-UID validation: ALSO seed from the configured phrase UID
+            // and the default-phrase UID (two cheap passes each: derived +
+            // the 64 model-match XOR variants) — covers a neighbor on stock
+            // defaults while the board is configured for a custom phrase.
+            if (!got && ctx->cfg_uid_valid) {
+                for (uint8_t m = 0; m < 64 && !got; m++) {
+                    uint16_t cand = (uint16_t)((((uint16_t)ctx->cfg_uid4 << 8) |
+                                                (uint16_t)(ctx->cfg_uid5 ^ m)) ^ ELRS_OTA_VERSION_ID_3X);
+                    if (is8 ? ota8_crc_ok(data, cand) : ota4_crc_ok(data, cand, 0)) {
+                        init = cand; got = true;
+                    }
+                }
+            }
+            if (!got) {
+                for (uint8_t m = 0; m < 64 && !got; m++) {
+                    uint16_t cand = (uint16_t)((((uint16_t)ELRS_DEFAULT_UID4 << 8) |
+                                                (uint16_t)(ELRS_DEFAULT_UID5 ^ m)) ^ ELRS_OTA_VERSION_ID_3X);
+                    if (is8 ? ota8_crc_ok(data, cand) : ota4_crc_ok(data, cand, 0)) {
+                        init = cand; got = true;
+                    }
+                }
+            }
             if (!got && (is8 ? ota8_crc_ok(data, 0) : ota4_crc_ok(data, 0, 0))) {
                 init = 0; got = true; // bind mode (CRC init 0)
             }

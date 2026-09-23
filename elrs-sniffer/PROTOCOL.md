@@ -85,9 +85,13 @@ emitted per FLRC dwell setup with each config call's RadioLib return code
 success) plus the chip STATUS byte. Any non-zero rc pinpoints the failing
 call.
 
-`sync` — a sync packet decoded (`ok=1` means the ELRS software CRC validated):
+`sync` — a sync packet decoded. `ok=1` ONLY means the ELRS software CRC
+validated (LoRa). FLRC syncs carry no software CRC: they appear with
+`"ok":0,"band":"flrc"` (the radio's seeded 3-byte CRC did the filtering).
+Additive fields `band` (`lora`|`flrc`), `len` (air bytes), `freq` (tuned Hz)
+disambiguate multi-link captures:
 ```json
-{"t":"sync","ok":1,"fhss":42,"nonce":240,"rateIdx":6,"swMode":0,"tlmRatio":2,"uid":"a5b3c2"}
+{"t":"sync","ok":1,"band":"lora","len":8,"freq":2441400000,"fhss":42,"nonce":240,"rateIdx":6,"swMode":0,"tlmRatio":2,"uid":"a5b3c2"}
 ```
 `rateIdx` indexes the ELRS SX128X rate table (0–9: FLRC1000, FLRC500,
 DVDA500, DVDA250, LoRa500, LoRa333-8, LoRa250, LoRa150, LoRa100-8,
@@ -150,7 +154,7 @@ Boot/lifecycle:
   - `oled_driver` (`drv:"sh1106"|"ssd1306"`) — OLED driver toggle.
   - `verbose_on`/`verbose_off` (V command); `parked{step,rate}` /
     `sweep_resume` (R command).
-  - `uid` — bind phrase applied: `{"t":"event","what":"uid","uid":"43 7f ..."}`.
+  - `uid` — bind phrase applied: `{"t":"event","what":"uid","src":"stored|set|default","uid":"43 7f ..."}` (`src` says which phrase produced the UID).
   - `fp` — OSINT fingerprint, first sync of a link:
     `{"t":"event","what":"fp","band":"lora|flrc","uid_tail":"a1b2c3"}`.
   - `flrc_sync` — FLRC sync parsed (see FLRC section).
@@ -165,7 +169,7 @@ Emitted on EVERY state transition and as progress every 16 candidates:
 {"t":"crack","state":"cracking","uid_tail":"61ace1","done":128,"total":256,"valids_best":2}
 {"t":"crack","state":"cracked","uid_tail":"61ace1","done":47,"total":256,"valids_best":5,"uid_full":"5a9b4761ace1"}
 ```
-states: `listening` (FLRC discovery parked / idle), `sync_seen` (first
+states: `listening` (FLRC discovery parked / idle; `tail_src` says whose tail is being chased: `phrase` = configured-phrase guess, `sync` = tail learned from the air, `last-link` = previous link), `sync_seen` (first
 structurally-valid sync; `uid_tail` = leaked UID[3..5]), `identity` (second
 consistent sync adopted), `cracking` (`done`/`total`, `valids_best`),
 `cracked` (+ `uid_full` = phrase-prefix guess + cracked tail — verify the

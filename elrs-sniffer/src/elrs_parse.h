@@ -75,6 +75,10 @@ typedef struct {
 typedef struct {
     bool     crc_init_known;
     uint16_t crc_init;
+    // secondary validation seed: the configured phrase's UID tail, set by
+    // the app after every bind-phrase change (multi-UID sync validation)
+    uint8_t  cfg_uid4, cfg_uid5;
+    bool     cfg_uid_valid;
     bool     uid_known;
     uint8_t  uid3, uid4, uid5;
     uint8_t  switch_mode;       // ELRS_SW_* from sync packet (best guess if none)

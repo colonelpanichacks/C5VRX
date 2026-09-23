@@ -46,6 +46,11 @@
 // Source: OTA.h OTA_Sync_s; OTA.cpp OtaUpdateCrcInitFromUid().
 // ---------------------------------------------------------------------------
 #define ELRS_UID_LEN 6u
+// Default bind phrase ("ExpressLRS") UID tail — used as a secondary CRC-init
+// seed so syncs validate even when the board's configured phrase differs
+// (multi-UID field: neighbors on stock + the operator's custom phrase).
+#define ELRS_DEFAULT_UID4 0xd3
+#define ELRS_DEFAULT_UID5 0x39
 
 // ---------------------------------------------------------------------------
 // Air-rate table, SX128X radio, ELRS 3.x (src/src/common.cpp,

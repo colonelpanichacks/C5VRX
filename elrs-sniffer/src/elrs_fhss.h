@@ -102,11 +102,17 @@ static inline void elrs_nonce_anchor(elrs_nonce_track_t *t, uint8_t nonce,
 
 static inline uint8_t elrs_nonce_expected(const elrs_nonce_track_t *t, uint32_t now_ms)
 {
+    if (t->interval_ms == 0) return 0xFE; // never anchored — see on_track guard
     return (uint8_t)(t->anchor_nonce + (now_ms - t->anchor_ms) / t->interval_ms);
 }
 
-// RX semantics: a sync is on-track iff sync.nonce == expected slot nonce
+// RX semantics: a sync is on-track iff sync.nonce == expected slot nonce.
+// Unanchored (pre-first-sync) tracks are NEVER on-track — without this guard
+// the first sync of a session divides by interval_ms==0 and the CPU panics
+// with IntegerDivideByZero (field-captured: Guru Meditation right after the
+// first "crack identity").
 static inline bool elrs_nonce_on_track(const elrs_nonce_track_t *t, uint32_t now_ms, uint8_t nonce)
 {
+    if (t->interval_ms == 0) return false;
     return nonce == elrs_nonce_expected(t, now_ms);
 }

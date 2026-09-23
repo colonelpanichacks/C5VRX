@@ -467,6 +467,42 @@ int main()
     }
     printf("ok: identity gating (beacon accepts, chaos rejects)\n");
 
+    // 14b) CRASH REGRESSION: an UNANCHORED nonce track must report
+    // off-track (never divide by interval_ms==0 — field: Guru Meditation
+    // IntegerDivideByZero right after the first sync of a session).
+    {
+        elrs_nonce_track_t nt = { 0, 0, 0 }; // all zero, as at boot pre-fix
+        assert(!elrs_nonce_on_track(&nt, 12345, 0x61));
+        assert(!elrs_nonce_on_track(&nt, 12345, 0xFE));
+        elrs_nonce_anchor(&nt, 7, 1000, 4);
+        assert(elrs_nonce_on_track(&nt, 1000 + 10 * 4, 17));
+    }
+    printf("ok: unanchored nonce track safe (crash regression)\n");
+
+    // 14c) MULTI-UID sync validation: a sync built from the DEFAULT phrase
+    // UID validates even when the ctx is configured for a different UID.
+    {
+        elrs_decode_ctx_t ctx;
+        elrs_decode_init(&ctx);
+        ctx.cfg_uid4 = 0x11; ctx.cfg_uid5 = 0x22; ctx.cfg_uid_valid = true;
+        uint8_t pkt[ELRS_OTA4_LEN] = { ELRS_PKT_SYNC, 63, 0, 0x00,
+                                       (uint8_t)(ELRS_DEFAULT_UID4 ^ 0x05), // model-match XOR
+                                       0x00, 0x31 };
+        // NOTE: byte4=UID3 is model-XORed only for UID5; build a plain tail:
+        pkt[4] = 0x2f;                        // UID3 (default uid[3])
+        pkt[5] = ELRS_DEFAULT_UID4;           // UID4
+        pkt[6] = ELRS_DEFAULT_UID5 ^ 0x05;    // UID5 with modelId xor=5
+        uint16_t init = elrs_crc_init_from_uid(ELRS_DEFAULT_UID4, ELRS_DEFAULT_UID5);
+        uint16_t crc = elrs_crc14(pkt, 7, init);
+        pkt[0] |= (uint8_t)((crc >> 8) << 2);
+        pkt[7] = (uint8_t)(crc & 0xFF);
+        elrs_packet_t out;
+        bool ok = elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out);
+        assert(ok && out.cls == ELRS_PKT_CLASS_CRC_OK);
+        assert(ctx.crc_init == init); // validated via the default-UID seed sweep
+    }
+    printf("ok: multi-UID sync validation (default-phrase seed)\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

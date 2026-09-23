@@ -118,7 +118,8 @@ static elrs_identity_t g_id;
 typedef enum { CONN_DISCONNECTED, CONN_TENTATIVE, CONN_CONNECTED } conn_state_t;
 static conn_state_t g_conn = CONN_DISCONNECTED;
 static uint32_t g_valid_since_tentative;
-static elrs_nonce_track_t g_ntrack;
+static elrs_nonce_track_t g_ntrack = { 0, 0, 1 }; // interval_ms=1: belt-and-braces
+                                                  // against div-by-zero pre-anchor
 static uint32_t g_next_hop_ms;   // time-based hop schedule (RX HandleFHSS)
 // sync anchor for position prediction
 static uint8_t g_anchor_idx = 0;
@@ -135,12 +136,13 @@ static void crack_emit(const char *state)
 {
     snprintf(g_crack_state, sizeof(g_crack_state), "%s", state);
     uint8_t t3, t4, t5;
-    if (g_id.count || g_id.known) { t3 = g_id.u3; t4 = g_id.u4; t5 = g_id.u5; }
-    else if (dctx.uid_known) { t3 = dctx.uid3; t4 = dctx.uid4; t5 = dctx.uid5; }
-    else { t3 = g_uid[3]; t4 = g_uid[4]; t5 = g_uid[5]; }
+    const char *tail_src;
+    if (g_id.count || g_id.known) { t3 = g_id.u3; t4 = g_id.u4; t5 = g_id.u5; tail_src = "sync"; }
+    else if (dctx.uid_known) { t3 = dctx.uid3; t4 = dctx.uid4; t5 = dctx.uid5; tail_src = "last-link"; }
+    else { t3 = g_uid[3]; t4 = g_uid[4]; t5 = g_uid[5]; tail_src = "phrase"; }
     Serial.printf("{\"t\":\"crack\",\"state\":\"%s\",\"uid_tail\":\"%02x%02x%02x\","
-                  "\"done\":%u,\"total\":256,\"valids_best\":%lu",
-                  state, t3, t4, t5, g_crack_cand, (unsigned long)g_crack_best);
+                  "\"tail_src\":\"%s\",\"done\":%u,\"total\":256,\"valids_best\":%lu",
+                  state, t3, t4, t5, tail_src, g_crack_cand, (unsigned long)g_crack_best);
     if (strcmp(state, "cracked") == 0) {
         // uid_full = phrase-prefix GUESS (UID[0..1] never broadcast) + the
         // cracked UID2 + the CONSISTENT identity tail — never the phrase tail
@@ -409,9 +411,11 @@ static void goto_rate(uint8_t rate_index, bool iq_inverted)
 static void on_sync(const elrs_packet_t &pkt)
 {
     bool good = pkt.cls == ELRS_PKT_CLASS_CRC_OK;
-    Serial.printf("{\"t\":\"sync\",\"ok\":%u,\"fhss\":%u,\"nonce\":%u,\"rateIdx\":%u,"
+    Serial.printf("{\"t\":\"sync\",\"ok\":%u,\"band\":\"lora\",\"len\":%u,\"freq\":%lu,"
+                  "\"fhss\":%u,\"nonce\":%u,\"rateIdx\":%u,"
                   "\"swMode\":%u,\"tlmRatio\":%u,\"uid\":\"%02x%02x%02x\"}\n",
-                  good ? 1 : 0, pkt.sync.fhss_index, pkt.sync.nonce,
+                  good ? 1 : 0, (unsigned)pkt.len, (unsigned long)uist.freq_hz,
+                  pkt.sync.fhss_index, pkt.sync.nonce,
                   pkt.sync.rate_index, pkt.sync.switch_mode, pkt.sync.tlm_ratio,
                   pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5);
     if (!good) return;
@@ -675,18 +679,25 @@ static void derive_uid_from_phrase(const char *phrase, uint8_t uid[6])
     memcpy(uid, digest, 6);
 }
 
-static void apply_bind_phrase(const char *phrase, bool announce)
+static void apply_bind_phrase(const char *phrase, bool announce, const char *src)
 {
     Preferences pr;
     if (pr.begin(PREF_NAMESPACE, false)) {
-        pr.putString("bind", phrase);
+        if (!pr.putString("bind", phrase)) {
+            Serial.println("{\"t\":\"error\",\"what\":\"bind_persist\",\"detail\":\"NVS putString failed\"}");
+        }
         pr.end();
+    } else {
+        Serial.println("{\"t\":\"error\",\"what\":\"bind_persist\",\"detail\":\"NVS begin failed\"}");
     }
     derive_uid_from_phrase(phrase, g_uid);
     g_radio.setFlrcIdentity(g_uid);
+    dctx.cfg_uid4 = g_uid[4];       // multi-UID sync validation seed
+    dctx.cfg_uid5 = g_uid[5];
+    dctx.cfg_uid_valid = true;
     if (announce) {
-        Serial.printf("{\"t\":\"event\",\"what\":\"uid\",\"uid\":\"%02x %02x %02x %02x %02x %02x\"}\n",
-                      g_uid[0], g_uid[1], g_uid[2], g_uid[3], g_uid[4], g_uid[5]);
+        Serial.printf("{\"t\":\"event\",\"what\":\"uid\",\"src\":\"%s\",\"uid\":\"%02x %02x %02x %02x %02x %02x\"}\n",
+                      src, g_uid[0], g_uid[1], g_uid[2], g_uid[3], g_uid[4], g_uid[5]);
     }
 }
 
@@ -694,11 +705,15 @@ static void load_bind_phrase()
 {
     Preferences pr;
     String s = "ExpressLRS";
+    const char *src = "default";
     if (pr.begin(PREF_NAMESPACE, true)) {
         s = pr.getString("bind", "ExpressLRS");
+        if (s != "ExpressLRS") src = "stored";
         pr.end();
+    } else {
+        src = "default-nvs-unavailable";
     }
-    apply_bind_phrase(s.c_str(), true);
+    apply_bind_phrase(s.c_str(), true, src);
 }
 
 // ---- OLED driver preference ------------------------------------------------
@@ -910,7 +925,7 @@ void loop()
             if (c == '\n' || c == '\r') {
                 u_pending = false;
                 u_buf[u_len] = 0;
-                if (u_len > 0) apply_bind_phrase(u_buf, true);
+                if (u_len > 0) apply_bind_phrase(u_buf, true, "set");
             } else if (u_len < sizeof(u_buf) - 1) {
                 u_buf[u_len++] = (char)c; // phrase may contain spaces
             }
@@ -1125,6 +1140,13 @@ void loop()
                             }
                             emit_fingerprint("flrc");
                             conn_on_sync(pkt);
+                            Serial.printf("{\"t\":\"sync\",\"ok\":0,\"band\":\"flrc\",\"len\":%u,\"freq\":%lu,"
+                                          "\"fhss\":%u,\"nonce\":%u,\"rateIdx\":%u,"
+                                          "\"swMode\":%u,\"tlmRatio\":%u,\"uid\":\"%02x%02x%02x\"}\n",
+                                          (unsigned)pkt.len, (unsigned long)uist.freq_hz,
+                                          pkt.sync.fhss_index, pkt.sync.nonce,
+                                          pkt.sync.rate_index, pkt.sync.switch_mode, pkt.sync.tlm_ratio,
+                                          pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5);
                             if (!g_uid2_known && !g_crack) start_crack(true);
                             last_good_step = step_idx;
                         }
@@ -1138,7 +1160,7 @@ void loop()
                         Serial.printf("{\"t\":\"rawpkt\",\"cls\":%u,\"hex\":\"%s\"}\n",
                                       (unsigned)pkt.cls, hex);
                     }
-                    on_sync(pkt);
+                    if (!flrc_step) on_sync(pkt); // FLRC already handled inline
                     break;
                 case ELRS_PKT_TLM:
                     n_tlm++; dwell_tlm++; on_tlm(pkt); break;
@@ -1206,6 +1228,8 @@ void loop()
             g_uid2_known = false;
             g_fp_emitted = false; // next link gets its own fingerprint
             elrs_identity_reset(&g_id);
+            dctx.uid_known = false;      // stale tails must not seed later
+            dctx.crc_init_known = false; // listening/crack states
             Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
             // re-enter sweep: parked step if set, else last good rate+IQ
             dwell_begin(g_park_step >= 0 ? (uint8_t)g_park_step : last_good_step);
