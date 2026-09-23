@@ -159,6 +159,20 @@ Boot/lifecycle:
   - `uid_cracked` — full UID recovered, hop-following starts:
     `{"t":"event","what":"uid_cracked","uid":".. .. .. .. .. .."}`.
   - `uid2_crack_failed` — all 256 candidates exhausted.
+`crack` — the acquisition/crack state machine (dashboard contract).
+Emitted on EVERY state transition and as progress every 16 candidates:
+```json
+{"t":"crack","state":"cracking","uid_tail":"61ace1","done":128,"total":256,"valids_best":2}
+{"t":"crack","state":"cracked","uid_tail":"61ace1","done":47,"total":256,"valids_best":5,"uid_full":"5a9b4761ace1"}
+```
+states: `listening` (FLRC discovery parked / idle), `sync_seen` (first
+structurally-valid sync; `uid_tail` = leaked UID[3..5]), `identity` (second
+consistent sync adopted), `cracking` (`done`/`total`, `valids_best`),
+`cracked` (+ `uid_full` = phrase-prefix guess + cracked tail — verify the
+tail with phrase_crack), `failed` (256 exhausted → back to listening).
+`stats.crack` mirrors the last state; `stats.mode` is one of
+`sweep|park|follow|discovery`.
+
 - `flrc_discovery` — FLRC unknown-UID discovery state machine:
   `listening` (dwell parked in discovery: no sync-word match, CRC off) →
   `sync_seen` (a sync-structured packet leaked a UID tail) → `cracking`

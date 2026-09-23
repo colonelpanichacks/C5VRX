@@ -113,6 +113,28 @@ static uint8_t g_anchor_idx = 0;
 static uint8_t g_anchor_nonce = 0;
 static uint32_t g_anchor_ms = 0;
 
+// crack state machine (dashboard contract): listening | sync_seen | identity
+// | cracking | cracked | failed. Emitted on every transition + progress.
+static char g_crack_state[12] = "listening";
+static uint32_t g_crack_best;
+static int g_park_step = -1;        // R <step>: park sweep; -1 = auto-sweep
+
+static void crack_emit(const char *state)
+{
+    snprintf(g_crack_state, sizeof(g_crack_state), "%s", state);
+    uint8_t t3 = dctx.uid_known ? dctx.uid3 : (g_disc_count ? g_disc_u3 : g_uid[3]);
+    uint8_t t4 = dctx.uid_known ? dctx.uid4 : (g_disc_count ? g_disc_u4 : g_uid[4]);
+    uint8_t t5 = dctx.uid_known ? dctx.uid5 : (g_disc_count ? g_disc_u5 : g_uid[5]);
+    Serial.printf("{\"t\":\"crack\",\"state\":\"%s\",\"uid_tail\":\"%02x%02x%02x\","
+                  "\"done\":%u,\"total\":256,\"valids_best\":%lu",
+                  state, t3, t4, t5, g_crack_cand, (unsigned long)g_crack_best);
+    if (strcmp(state, "cracked") == 0) {
+        Serial.printf(",\"uid_full\":\"%02x%02x%02x%02x%02x%02x\"",
+                      g_uid[0], g_uid[1], g_uid2, g_uid[3], g_uid[4], g_uid[5]);
+    }
+    Serial.println("}");
+}
+
 static uint32_t mac_seed_with_uid2(uint8_t uid2)
 {
     return ((uint32_t)uid2 << 24) | ((uint32_t)g_uid[3] << 16) |
@@ -125,7 +147,9 @@ static void start_crack(bool flrc)
     g_crack_flrc = flrc;
     g_crack_cand = 0;
     g_crack_score = 0;
+    g_crack_best = 0;
     g_crack_t0 = millis();
+    crack_emit("cracking");
     if (flrc) {
         uint8_t uid[6] = { g_uid[0], g_uid[1], 0, g_uid[3], g_uid[4], g_uid[5] };
         g_radio.setFlrcIdentity(uid);
@@ -157,6 +181,7 @@ static void crack_tick()
     if (millis() - g_crack_t0 < win_ms) return;
 
     uint8_t threshold = g_crack_flrc ? 3 : 2;
+    if (g_crack_score > g_crack_best) g_crack_best = g_crack_score;
     if (g_crack_score >= threshold) {
         g_uid2 = g_crack_cand;
         g_uid2_known = true;
@@ -167,6 +192,7 @@ static void crack_tick()
         g_follow_freq = elrs_fhss_channel_hz(g_seq[g_fhss_idx]);
         g_radio.tune(g_follow_freq);
         uist.freq_hz = g_follow_freq;
+        crack_emit("cracked");
         Serial.printf("{\"t\":\"event\",\"what\":\"uid2_crack\",\"uid2\":%u,\"valids\":%lu}\n",
                       g_uid2, (unsigned long)g_crack_score);
         Serial.printf("{\"t\":\"event\",\"what\":\"uid_cracked\",\"uid\":\"%02x %02x %02x %02x %02x %02x\"}\n",
@@ -184,6 +210,7 @@ static void crack_tick()
     g_crack_cand++;
     if (g_crack_cand == 0) { // exhausted 0..255
         g_crack = false;
+        crack_emit("failed");
         Serial.println("{\"t\":\"event\",\"what\":\"uid2_crack_failed\"}");
         g_radio.tune(ELRS_2G4_SYNC_FREQ_HZ);
         return;
@@ -191,6 +218,7 @@ static void crack_tick()
     g_crack_score = 0;
     g_crack_t0 = millis();
     crack_advance_candidate();
+    if (g_crack_cand % 16 == 0) crack_emit("cracking"); // progress line
 }
 
 static void follow_on_valid_packet()
@@ -258,6 +286,7 @@ static void dwell_begin(uint8_t i)
         g_radio.setFlrcDiscovery(disc);
         if (disc) {
             g_disc_count = 0;
+            crack_emit("listening");
             Serial.printf("{\"t\":\"event\",\"what\":\"flrc_discovery\",\"state\":\"listening\",\"detail\":\"%s\"}\n",
                           s.rate->name);
         }
@@ -434,10 +463,16 @@ static void stats_tick()
     last_rssi = -128.0f; // reset peak-hold for the next window
     window_rssi_max = -128.0f;
 
+    const char *mode = "sweep";
+    if (sweep.steps[step_idx].rate->flrc && g_radio.flrcDiscovery()) mode = "discovery";
+    else if (g_following) mode = "follow";
+    else if (g_park_step >= 0) mode = "park";
+
     Serial.printf("{\"t\":\"stats\",\"ms\":%lu,\"rate\":\"%s\",\"iq\":\"%c\",\"rssi\":%d,"
                   "\"rssi_now\":%d,\"snr10\":%d,\"pps\":%lu,\"rx_per_s\":%lu,"
                   "\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
                   "\"freq\":%lu,\"fhss\":%u,\"sync_only\":%u,"
+                  "\"crack\":\"%s\",\"mode\":\"%s\","
                   "\"rx\":%lu,\"crc_ok\":%lu,"
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},"
                   "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u",
@@ -449,6 +484,7 @@ static void stats_tick()
                   (unsigned long)uist.freq_hz,
                   g_following ? (unsigned)g_fhss_idx : 255,
                   (locked && now - last_rc_ms > 2000) ? 1u : 0u,
+                  g_crack_state, mode,
                   (unsigned long)n_rx, (unsigned long)n_crc_ok,
                   (unsigned long)n_rc, (unsigned long)n_msp,
                   (unsigned long)n_sync, (unsigned long)n_tlm, (unsigned long)n_unk,
@@ -680,7 +716,6 @@ static const radio_pin_set_t *probe_pin_sets(int first_idx, uint32_t timeout_ms,
 static const radio_pin_set_t *g_working_pins = NULL;
 static bool g_force_reprobe = false;
 static bool g_verbose = false;      // V: print every packet as rawpkt (10/s)
-static int g_park_step = -1;        // R <step>: park sweep; -1 = auto-sweep
 
 static void report_radio_fault(const char *detail)
 {
@@ -995,6 +1030,7 @@ void loop()
                                 g_disc_u4 = pkt.sync.uid4;
                                 g_disc_u5 = pkt.sync.uid5;
                                 g_disc_count = 1;
+                                crack_emit("sync_seen");
                                 Serial.printf("{\"t\":\"event\",\"what\":\"flrc_discovery\",\"state\":\"sync_seen\",\"detail\":\"uid %02x%02x%02x\"}\n",
                                               pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5);
                             }
@@ -1009,6 +1045,7 @@ void loop()
                                 g_radio.setFlrcIdentity(g_uid);   // true CRC seed now
                                 g_radio.setFlrcDiscovery(false);  // exact 32-bit sync from here
                                 g_radio.recover(sweep.steps[step_idx], ELRS_2G4_SYNC_FREQ_HZ);
+                                crack_emit("identity");
                                 Serial.printf("{\"t\":\"event\",\"what\":\"flrc_discovery\",\"state\":\"cracking\",\"detail\":\"uid .. %02x %02x %02x\"}\n",
                                               g_uid[3], g_uid[4], g_uid[5]);
                                 emit_fingerprint("flrc");
