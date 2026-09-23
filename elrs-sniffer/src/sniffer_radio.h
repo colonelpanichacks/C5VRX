@@ -76,8 +76,13 @@ public:
     void setFlrcIdentity(const uint8_t uid[6]);
     // (Re)start continuous RX with DIO1 -> RX_DONE only.
     void start_rx();
-    // Called from loop; when a packet demodded, fills buf/len/rssi/snr.
-    bool read_packet(uint8_t *buf, size_t len, float &rssi, float &snr);
+    // Called from loop; when a packet demodded, fills buf/len/rssi/snr and
+    // the IRQ status word captured at RxDone (before readData clears it).
+    bool read_packet(uint8_t *buf, size_t len, float &rssi, float &snr,
+                     uint16_t *irq_out = NULL);
+    // Non-destructive read of the IRQ status register (for error-IRQ
+    // counting between packets; does NOT clear).
+    uint16_t irq_status();
     // Instantaneous RSSI via the SX1280 GET_RSSIINST command (0x1F, per
     // SX1280_Regs.h / datasheet) — unlike the packet-status based getRSSI()
     // this is live energy in any RX state, which is what the sweep

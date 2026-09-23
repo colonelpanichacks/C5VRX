@@ -115,6 +115,14 @@ static uint8_t g_bind_last[4];
 // elrs_sig quality (round 9): per-harvest-pass ELRS-presence signal
 static uint32_t g_sig_frames[2], g_sig_sync[2], g_sig_crc[2]; // [0]=lora [1]=flrc
 static uint32_t g_sig_repeat_tails;
+// round 10: raw RX diagnostics
+static bool g_rxpkt;                 // 'N' raw-export mode (default OFF)
+static uint32_t n_rx_dropped;        // cumulative (stats.rx_dropped)
+static uint32_t g_rxpkt_window_ms;   // rate-cap window
+static uint8_t g_rxpkt_count;
+static uint32_t dwell_demod, dwell_exported, dwell_dropped, dwell_swerr;
+static float dwell_rssi_min;
+static uint16_t g_irq_prev;          // sticky-IRQ diff baseline
 static uint32_t last_pkt_debug_ms;      // crc-ok pkt hex (2/s)
 static uint32_t last_rawpkt_ms;         // sync-classified raw hex (2/s)
 
@@ -464,8 +472,35 @@ static const sniffer_step_t &cur_step()
     return sweep.steps[step_idx];
 }
 
+static void rxdiag_emit(const char *rate_name, bool flrc, bool selftest)
+{
+    // per-dwell RX diagnostics (round 10): demod counts, export/drop,
+    // rssi range, FLRC sync-word-error count (sticky-IRQ diff since the
+    // error bits accumulate until cleared by the readData path)
+    Serial.printf("{\"t\":\"event\",\"what\":\"rxdiag\",\"rate\":\"%s\",\"band\":\"%s\","
+                  "\"demod\":%lu,\"exported\":%lu,\"dropped\":%lu,\"swerr\":%lu,"
+                  "\"rssi_max\":%d,\"rssi_min\":%d%s}\n",
+                  rate_name, flrc ? "flrc" : "lora",
+                  (unsigned long)dwell_demod, (unsigned long)dwell_exported,
+                  (unsigned long)dwell_dropped, (unsigned long)dwell_swerr,
+                  (int)dwell_rssi_max, (int)(dwell_rssi_min == 0.0f ? -128 : dwell_rssi_min),
+                  selftest ? ",\"selftest\":true" : "");
+}
+
+static char g_dwell_name[16];
+static bool g_dwell_flrc;
+static bool g_dwell_reported;
+
 static void dwell_begin(uint8_t i)
 {
+    // report the dwell that just ended (harvest/fastlink always; FLRC sweep
+    // dwells too — that is where "radio deaf" vs "we drop packets" shows)
+    if (!g_dwell_reported && g_dwell_name[0] &&
+        (g_mode != 0 || g_dwell_flrc) &&
+        (dwell_demod > 0 || dwell_swerr > 0))
+        rxdiag_emit(g_dwell_name, g_dwell_flrc, false);
+    g_dwell_reported = false;
+
     const sniffer_step_t *sp;
     if (g_mode == 1) {          // harvest
         g_harvest_idx = i % HARVEST_STEPS;
@@ -491,6 +526,9 @@ static void dwell_begin(uint8_t i)
     dwell_first_pkt_ms = 0;
     dwell_rx = dwell_crc_ok = dwell_rc = dwell_msp = dwell_sync = dwell_tlm = dwell_unk = 0;
     dwell_cand = 0;
+    dwell_demod = dwell_exported = dwell_dropped = dwell_swerr = 0;
+    dwell_rssi_min = 0.0f;
+    g_irq_prev = 0;
     g_int_aborted = false;
     g_int_t0 = g_int_log_ms = millis();
     g_int_rx0 = 0;
@@ -512,6 +550,8 @@ static void dwell_begin(uint8_t i)
         }
     }
     snprintf(uist.rate, sizeof(uist.rate), "%s", s.rate->name);
+    snprintf(g_dwell_name, sizeof(g_dwell_name), "%s", s.rate->name);
+    g_dwell_flrc = s.rate->flrc != 0;
     uist.iq_inverted = s.iq_inverted;
     uist.freq_hz = ELRS_2G4_SYNC_FREQ_HZ;
 }
@@ -541,7 +581,7 @@ static void dwell_advance()
 {
     const sniffer_step_t &s = sweep.steps[step_idx];
     Serial.printf("{\"t\":\"dwell\",\"step\":%u,\"rate\":\"%s\",\"iq\":\"%c\",\"legacy\":%u,"
-                  "\"rssi_max\":%d,\"nf\":%d,\"nf_thr\":%d,\"rx\":%lu,\"crc_ok\":%lu,"
+                  "\"rssi_max\":%d,\"nf\":%d,\"nf_thr\":%d,\"rx\":%lu,\"crc_ok\":%lu,\"rx_dropped\":%lu,"
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu}}\n",
                   step_idx, s.rate->name, s.iq_inverted ? 'i' : 'n',
                   s.legacy_2x ? 1 : 0, (int)dwell_rssi_max,
@@ -793,7 +833,7 @@ static void stats_tick()
                   (unsigned long)(g_sig_crc[0] + g_sig_crc[1]),
                   (unsigned long)g_sig_frames[0], (unsigned long)g_sig_sync[0], (unsigned long)g_sig_crc[0],
                   (unsigned long)g_sig_frames[1], (unsigned long)g_sig_sync[1], (unsigned long)g_sig_crc[1],
-                  (unsigned long)n_rx, (unsigned long)n_crc_ok,
+                  (unsigned long)n_rx, (unsigned long)n_crc_ok, (unsigned long)n_rx_dropped,
                   (unsigned long)n_rc, (unsigned long)n_msp,
                   (unsigned long)n_sync, (unsigned long)n_tlm, (unsigned long)n_unk,
                   (unsigned long)uist.ch_us[0], (unsigned long)uist.ch_us[1],
@@ -1204,6 +1244,31 @@ void setup()
     } else if (oled_ok) {
         snprintf(ready_extra, sizeof(ready_extra), ",\"oled_drv\":\"%s\"",
                  ui_driver_name(ui_get_driver()));
+    }
+    if (radio_ok) {
+        // RX-path self-test (round 10): 200 ms FLRC-discovery window on a
+        // quiet channel (2480.5 MHz, above the ELRS band). Noise produces
+        // RxDone/demods -> proves DIO1 + IRQ + demod path end-to-end at
+        // boot (catches dead-DIO1 style failures immediately).
+        sniffer_step_t st = { &ELRS_RATES_FLRC[0], false, false };
+        g_radio.setFlrcDiscovery(true);
+        g_radio.apply(st, 2480500000u);
+        g_radio.start_rx();
+        dwell_demod = dwell_swerr = dwell_exported = dwell_dropped = 0;
+        g_irq_prev = 0;
+        uint32_t t0 = millis();
+        while (millis() - t0 < 200) {
+            uint8_t b[ELRS_OTA4_LEN];
+            float r, s;
+            uint16_t irqw = 0;
+            if (g_radio.read_packet(b, sizeof(b), r, s, &irqw)) dwell_demod++;
+            uint16_t ni = g_radio.irq_status();
+            if ((ni & (uint16_t)~g_irq_prev) & 0x0200) dwell_swerr++;
+            g_irq_prev = ni;
+            delay(5);
+        }
+        rxdiag_emit("selftest", true, true);
+        g_radio.setFlrcDiscovery(false);
     }
     Serial.printf("{\"t\":\"ready\",\"steps\":%u,\"sync_freq\":%lu,\"radio\":%u,\"oled\":%u%s}\n",
                   sweep.count, (unsigned long)(ELRS_2G4_SYNC_FREQ_HZ / 1000000),

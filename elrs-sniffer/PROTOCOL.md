@@ -40,6 +40,7 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 | `radio` | 0/1 | — | 0 = radio faulted (no SX1280); device alive but deaf. `rssi` is then the last/initial -128 sentinel |
 | `rx`, `crc_ok` | uint | count | cumulative since boot: RxDone demods / ELRS-CRC-validated packets |
 | `types` | object | count | cumulative per-type parses: `rc`, `msp`, `sync`, `tlm`, and `unk` (demodded but failed classification = noise) |
+| `rx_dropped` | uint | count | cumulative rxpkt frames dropped by the 30/s export cap |
 | `sig` | object | — | elrs_sig quality: `q` = `none`/`weak`/`firm`/`strong` (firm = >=3 `crc_pass` in the harvest pass OR >=10 `sync_struct` with >=1 repeated tail; strong = >=10 `crc_pass`; weak = >=3 `sync_struct`), plus `frames`, `sync_struct`, `crc_pass` totals and per-band `lora`/`flrc` `{f,s,c}` sub-objects |
 | `sync_only` | 0/1 | — | locked but no validated RC data for >2 s — a sync-follow lock (TX beaconing, model disarmed/off). Sticks in `ch` are stale; expect no telemetry |
 | `uid` | string, optional | — | `UID[3..5]` as lowercase hex — **link fingerprint, not identity**; absent until a sync is captured |
@@ -233,6 +234,32 @@ sequence-pointer semantics (fhssIndex is a pointer into the 240-entry hop
 sequence, not a channel). `uid45.variant` now spans 3 values (init placement
 / byte order only — the FLRC CRC24 poly is the fixed 0x5D6DCB per the
 SX1280 datasheet).
+
+## Raw RX diagnostics (round 10)
+
+`rxpkt` — EVERY demodulated packet, unfiltered (command `N` toggles, default
+OFF; `V` implies rxpkt during harvest/fastlink only). Max 30/s; overflow is
+counted in `stats.rx_dropped`:
+```json
+{"t":"rxpkt","band":"flrc","rate":"DVDA 500Hz","hex":"...","rssi":-42,"irq":2}
+```
+`rssi` is the per-frame packet-status RSSI read in the RX path; `irq` is the
+IRQ status word captured at RxDone.
+
+`rxdiag` — per-dwell counter line (each harvest/fastlink step end, and FLRC
+sweep dwell ends):
+```json
+{"t":"event","what":"rxdiag","rate":"DVDA 500Hz","band":"flrc","demod":84,
+ "exported":30,"dropped":54,"swerr":0,"rssi_max":-38,"rssi_min":-97}
+```
+`swerr` = SyncWordError IRQ count (sticky-register diff): in EXACT FLRC mode a
+real link with a DIFFERENT UID sync word spikes swerr at its packet cadence —
+an honest real-signal indicator junk cannot fake. At boot, an
+`"selftest":true` rxdiag reports a 200 ms FLRC-discovery window on 2480.5 MHz
+— nonzero `demod` proves the DIO1/IRQ/demod path works end-to-end.
+
+Commands: `N` = rxpkt toggle (`rxpkt_on`/`rxpkt_off` events); `V` = verbose
+(+ rxpkt during harvest only).
 
 ## Find mode (passive bind-phrase/UID discovery)
 

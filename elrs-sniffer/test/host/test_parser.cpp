@@ -905,6 +905,26 @@ int main()
     }
     printf("ok: elrs_sig quality matrix\n");
 
+    // 14n) RXPKT RATE CAP (round 10): sliding 1 s window, max 30 exports,
+    //      overflow dropped (caller counts). Selftest/rxdiag shapes are
+    //      firmware-side; the cap is the host-testable core.
+    {
+        uint32_t win = 1000;
+        uint8_t count = 0;
+        unsigned allowed = 0;
+        for (uint32_t now = 1000; now < 2000; now++) // 1000 frames in 1 s
+            if (elrs_rxcap_allow(now, &win, &count, 30)) allowed++;
+        assert(allowed == 30);
+        // next window resets
+        assert(elrs_rxcap_allow(2000, &win, &count, 30));
+        // burst then quiet: second burst within the same window is dropped
+        count = 0; win = 0;
+        for (uint8_t i = 0; i < 30; i++) assert(elrs_rxcap_allow(500, &win, &count, 30));
+        assert(!elrs_rxcap_allow(501, &win, &count, 30));
+        assert(elrs_rxcap_allow(1500, &win, &count, 30)); // new window
+    }
+    printf("ok: rxpkt rate cap (30/s sliding window)\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

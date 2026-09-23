@@ -211,15 +211,24 @@ bool SnifferRadio::tune(uint32_t freq_hz)
     return radio->setFrequency(freq_hz / 1000000.0) == RADIOLIB_ERR_NONE;
 }
 
-bool SnifferRadio::read_packet(uint8_t *buf, size_t len, float &rssi, float &snr)
+bool SnifferRadio::read_packet(uint8_t *buf, size_t len, float &rssi, float &snr,
+                               uint16_t *irq_out)
 {
     if (!dio1_fired) return false;
     dio1_fired = false;
+    if (irq_out) *irq_out = irq_status(); // IRQ word at RxDone, pre-clear
     int16_t st = radio->readData(buf, len);
-    rssi = radio->getRSSI();
+    rssi = radio->getRSSI(); // per-frame packet-status RSSI (prompt, not the poll)
     snr = radio->getSNR();
     start_rx(); // readData drops to standby; resume continuous RX
     return st == RADIOLIB_ERR_NONE;
+}
+
+uint16_t SnifferRadio::irq_status()
+{
+    uint8_t st[2] = { 0, 0 };
+    if (mod) mod->SPIreadStream(RADIOLIB_SX128X_CMD_GET_IRQ_STATUS, st, 2);
+    return (uint16_t)(st[0] << 8 | st[1]);
 }
 
 int16_t SnifferRadio::rssiInst(float &rssi_dbm)

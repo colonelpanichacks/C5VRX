@@ -229,6 +229,20 @@ static inline const char *elrs_sig_name(elrs_sig_t q)
          : q == ELRS_SIG_WEAK ? "weak" : "none";
 }
 
+// rxpkt export rate cap (round 10): sliding 1 s window, max `max_per_s`
+// exports; returns false when the frame must be dropped (caller counts it).
+static inline bool elrs_rxcap_allow(uint32_t now_ms, uint32_t *window_ms,
+                                    uint8_t *count, uint8_t max_per_s)
+{
+    if (now_ms - *window_ms >= 1000) {
+        *window_ms = now_ms;
+        *count = 0;
+    }
+    if (*count >= max_per_s) return false;
+    (*count)++;
+    return true;
+}
+
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only
 // returns true the moment identity is ACCEPTED (2nd consistent sync)
