@@ -424,6 +424,10 @@ DETECTIONS_HEADER = [
     "skip_dead", "dwell_ms", "lock_type", "end_reason",
     "cfo_ppm", "video_std", "line_us", "uid",
     "geo_lat", "geo_lon",
+    # ELRS intel ladder (2.4 rows only; trailing — old files predate them):
+    # stage = detected|fingerprinted|cracked|decoded, phrase = recovered
+    # bind phrase when the host knows it (crack job or manual apply).
+    "stage", "phrase",
 ]
 # Columns coerced to numbers on read; everything else stays a string (so
 # band "5.8" never becomes float 5.8, iso strings never get mangled).
@@ -646,12 +650,29 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
 
 
+_dets_hdr_ok_for = None          # path whose on-disk header was verified
+
+
 def _det_write_row(row: dict) -> None:
     """Append one row (and the header on first creation). Small and fast:
-    a single ~200-byte append per episode, never on a hot path."""
-    global _dets_total
+    a single ~200-byte append per episode, never on a hot path. When the
+    on-disk header predates trailing columns (checked once per path), it is
+    rewritten in place so exports stay column-aligned."""
+    global _dets_total, _dets_hdr_ok_for
     with _dets_lock:
         new = not DETECTIONS_CSV.exists()
+        if not new and _dets_hdr_ok_for != str(DETECTIONS_CSV):
+            try:
+                with open(DETECTIONS_CSV, newline="") as f:
+                    first = f.readline().rstrip("\r\n").split(",")
+                if first and first[0] == "band" and first != DETECTIONS_HEADER:
+                    body = DETECTIONS_CSV.read_text().splitlines(keepends=True)[1:]
+                    with open(DETECTIONS_CSV, "w", newline="") as f:
+                        f.write(",".join(DETECTIONS_HEADER) + "\r\n")
+                        f.writelines(body)
+            except OSError:
+                pass
+            _dets_hdr_ok_for = str(DETECTIONS_CSV)
         with open(DETECTIONS_CSV, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=DETECTIONS_HEADER)
             if new:
@@ -812,6 +833,29 @@ ELRS_FREQ_MHZ = 2441.4
 ELRS_EP = None                    # open ELRS episode dict, or None
 _elrs_ep_lock = threading.Lock()
 
+# Intel ladder for band-2.4 detection rows: every confirmed ELRS transmission
+# is a DETECTED presence; knowing a UID tail / uid45 seed FINGERPRINTs it; a
+# full or bind-captured UID CRACKs it; a validated lock with decoded
+# telemetry DECODEs it. Episodes carry a "stage" field that only ever
+# upgrades (a stronger event enriches the open row in place).
+ELRS_STAGES = ("detected", "fingerprinted", "cracked", "decoded")
+ELRS_TLM_DECODE = ("gps", "batt", "atti", "fm", "tlm", "linkstats")
+_known_phrase = None             # phrase the host knows for the current link
+
+
+def _stage_bump(ep: dict, stage: str) -> None:
+    """Monotonic stage upgrade on an open episode dict."""
+    if ELRS_STAGES.index(stage) > ELRS_STAGES.index(
+            ep.get("stage") or "detected"):
+        ep["stage"] = stage
+
+
+def _stage_for_uid(uid: str) -> str:
+    """Initial presence stage from the identity the trigger carried."""
+    if uid.startswith("bind:"):
+        return "cracked"         # bind burst leaked UID[2..5]
+    return "fingerprinted" if uid else "detected"
+
 
 def _elrs_ep_open_locked(obj: dict) -> None:
     """Caller holds _elrs_ep_lock."""
@@ -819,10 +863,15 @@ def _elrs_ep_open_locked(obj: dict) -> None:
     rate = str(obj.get("rate") or "-").removeprefix("LoRa ")
     iq = str(obj.get("iq") or "-")
     geo = _geo_current()
+    with ELRS.lock:
+        uid = ELRS.uid
     ELRS_EP = {
         "start": time.time(),
         "channel": f"{rate}/{iq}",
         "peak": None, "min": None, "sum": 0.0, "n": 0,
+        # A validated lock means the link UID is ours (phrase known); the
+        # decoded stage still needs telemetry (bumped in _elrs_ep_tick).
+        "stage": "cracked" if uid else "detected",
         # Browser fix sampled at episode open; "" when absent/stale.
         "geo_lat": "" if geo is None else round(geo[0], 6),
         "geo_lon": "" if geo is None else round(geo[1], 6),
@@ -832,8 +881,12 @@ def _elrs_ep_open_locked(obj: dict) -> None:
 def _elrs_ep_write_locked(ep: dict, reason: str, lock_type: str,
                           uid: str) -> None:
     """Append one band-2.4 row for a closed episode. Caller holds
-    _elrs_ep_lock."""
+    _elrs_ep_lock. The stage column carries the intel ladder the episode
+    reached; the phrase column carries the recovered bind phrase when the
+    host knows it (crack job or manual apply) and the link was cracked."""
     end = time.time()
+    stage = ep.get("stage") or "detected"
+    cracked = ELRS_STAGES.index(stage) >= ELRS_STAGES.index("cracked")
     _det_write_row({
         "band": "2.4",
         "start_iso": _iso(ep["start"]),
@@ -854,6 +907,8 @@ def _elrs_ep_write_locked(ep: dict, reason: str, lock_type: str,
         "uid": uid,
         "geo_lat": ep["geo_lat"],
         "geo_lon": ep["geo_lon"],
+        "stage": stage,
+        "phrase": (ep.get("phrase") or _known_phrase or "") if cracked else "",
     })
 
 
@@ -880,6 +935,20 @@ def _elrs_ep_tick(obj: dict) -> None:
         if t == "unlock":
             _elrs_ep_close_locked("unlock:" + str(obj.get("why") or "?"))
             return
+        # Decoded telemetry while locked lifts the encounter to DECODED.
+        if t in ELRS_TLM_DECODE and ELRS_EP is not None:
+            _stage_bump(ELRS_EP, "decoded")
+        # A successful crack enriches whichever row is open (lock episode
+        # first, else the presence row) instead of starting a duplicate.
+        if t == "crack" and obj.get("state") == "cracked":
+            ep = ELRS_EP if ELRS_EP is not None else PRES_EP
+            if ep is not None:
+                _stage_bump(ep, "cracked")
+                tail = obj.get("uid_tail")
+                # Presence rows carry their own uid; the lock episode reads
+                # ELRS.uid at close.
+                if ep is PRES_EP and not ep.get("uid") and tail:
+                    ep["uid"] = str(tail)
         if t != "stats":
             return
         if obj.get("lock"):
@@ -933,6 +1002,9 @@ def _pres_open_locked(uid: str, rate: str, rssi,
         "start": time.time(),
         "uid": uid or "",
         "lock_type": lock_type,
+        # Intel ladder: the trigger's identity sets the opening stage
+        # (bind capture = cracked, uid45/tail = fingerprinted, else detected).
+        "stage": _stage_for_uid(uid or ""),
         "channel": str(rate or "-"),
         "peak": rssi, "min": rssi,
         "sum": float(rssi) if isinstance(rssi, (int, float)) else 0.0,
@@ -1023,6 +1095,7 @@ def _presence_tick_locked(obj: dict) -> None:
         if PRES_EP is not None:
             if not PRES_EP["uid"]:
                 PRES_EP["uid"] = uid
+            _stage_bump(PRES_EP, "fingerprinted")
             _pres_refresh_locked(None, None, now)
         elif not locked:
             _pres_open_locked(uid, _last_frame.get("rate"),
@@ -1039,6 +1112,7 @@ def _presence_tick_locked(obj: dict) -> None:
         if PRES_EP is not None:
             PRES_EP["uid"] = uid
             PRES_EP["lock_type"] = "elrs-bind"   # upgrade: confirmed bind
+            _stage_bump(PRES_EP, "cracked")      # bind capture = UID[2..5]
             _pres_refresh_locked(obj.get("rate") or _last_frame.get("rate"),
                                  obj.get("rssi"), now)
         elif not locked:
@@ -1549,6 +1623,11 @@ def _crack_worker() -> None:
     with _crack_job_lock:
         _crack_job.update(running=False, done=True, error=error,
                           phrase=phrase)
+    if phrase:
+        # The host now knows the phrase for the current link; closed
+        # detection rows at cracked+ stage carry it (see _elrs_ep_write_locked).
+        global _known_phrase
+        _known_phrase = phrase
 
 
 
@@ -2557,6 +2636,15 @@ PAGE = """<!DOCTYPE html>
   .ltb.manual { color:#31c8ff; border-color:#31c8ff; }
   .ltb.event { color:var(--amb); border-color:var(--amb); }
   .ltb.elrs { color:#31f5ff; border-color:#31f5ff; }
+  /* Intel-ladder stage badges (band-2.4 rows): grey -> amber -> cyan ->
+     green as the row climbs detected/fingerprinted/cracked/decoded. */
+  .stb { padding:0 4px; border-radius:3px; border:1px solid var(--dim);
+         color:var(--dim); font-size:.56rem; letter-spacing:.05em; }
+  .stb.detected { color:var(--dim); border-color:var(--dim); }
+  .stb.fingerprinted { color:var(--amb); border-color:var(--amb); }
+  .stb.cracked { color:#31c8ff; border-color:#31c8ff; }
+  .stb.decoded { color:var(--grn); border-color:var(--grn);
+                 text-shadow:0 0 6px rgba(57,255,106,.6); }
   .bchip.b24 { color:#31f5ff; border-color:#31f5ff; }
   .bchip.b58 { color:var(--grn); border-color:var(--grn); }
   .newmark { color:var(--amb); margin-right:2px; }
@@ -2979,11 +3067,12 @@ function showTab(t) {
     document.getElementById('tab-' + x).classList.toggle('on', x === tabCur));
 }
 const DETCOLS = [
-  ['band', 'RF'],
+  ['band', 'RF'], ['stage', 'STAGE'],
   ['start_iso', 'START'], ['end_iso', 'END'], ['duration_s', 'DUR s'],
   ['channel', 'CH'], ['drone', 'DRONE'], ['geo', 'GEO'], ['subband', 'BAND'],
   ['freq_mhz', 'FREQ'],
   ['cfo_ppm', 'CFO'], ['video_std', 'STD'], ['line_us', 'LINE'], ['uid', 'UID'],
+  ['phrase', 'PHRASE'],
   ['level_peak_db', 'PEAK'], ['level_mean_db', 'MEAN'], ['level_min_db', 'MIN'],
   ['video_sync', 'SYNC'], ['frames_received', 'FRAMES'], ['max_fps', 'MAXFPS'],
   ['lock_type', 'LOCK'], ['end_reason', 'END REASON'],
@@ -3036,16 +3125,45 @@ const sparkSpan = r => {
 /* Row accent class: video-synced episodes green, standalone events amber. */
 const detRowCls = r => r.video_sync === 1 ? 'vs'
                      : r.lock_type === 'event' ? 'ev' : '';
+/* Intel-ladder stage for a band-2.4 row: the CSV column wins; rows that
+   predate it derive from lock_type/uid (lock encounter = decoded, bind
+   capture = cracked, identified presence = fingerprinted, else detected).
+   '' for 5.8 rows (the ladder is ELRS-only). */
+const stageOf = r => {
+  if (r.band !== '2.4') return '';
+  if (r.stage) return r.stage;
+  if (r.lock_type === 'elrs') return 'decoded';
+  if (r.lock_type === 'elrs-bind') return 'cracked';
+  return (r.uid !== undefined && r.uid !== '') ? 'fingerprinted' : 'detected';
+};
+const stageBadge = r => {
+  const s = stageOf(r);
+  return s ? '<span class="stb ' + s + '">' + s.toUpperCase() + '</span>' : '';
+};
+/* UID cell: bind captures only ever leaked UID[2..5] (the row stores the
+   3-byte tail) and uid45 rows only the two seed bytes — mask the unknown
+   leading bytes, never invent a full 6-byte UID. */
+const uidCell = v => {
+  const s = String(v);
+  const m = s.match(/^(bind|uid45):(.+)$/);
+  if (!m) return esc(s);
+  const p = m[2].match(/../g) || [];
+  return '?? '.repeat(6 - p.length) + p.join(' ');
+};
 /* DRONE-ID clustering: ELRS rows fingerprint on the link UID
-   ("elrs:<uid>"); analog rows on line_us rounded to the nearest 0.02 us +
-   "|" + video_std ('' when the firmware left it blank). The line period
+   ("elrs:<uid>", a leading "bind:" provenance prefix stripped so a bind
+   capture and its lock row cluster together); analog rows on line_us
+   rounded to the nearest 0.02 us + "|" + video_std ('' when the firmware
+   left it blank). The line period
    comes from the camera crystal and is stable per device — unlike cfo_ppm,
    which bounces with video content and stays display-only. Rounds via
    integer cents (x100, snap to even) to dodge binary-float ties. Analog
    rows with a blank/non-numeric line_us get no fingerprint, no ID. */
 const droneFp = r => {
   if (r.uid !== undefined && r.uid !== null && r.uid !== '')
-    return 'elrs:' + String(r.uid).toLowerCase();
+    // A bind capture ("bind:<tail>") and the later lock row of the same
+    // link ("<tail>") are one drone — the prefix is provenance, not identity.
+    return 'elrs:' + String(r.uid).toLowerCase().replace(/^bind:/, '');
   if (r.line_us === '' || r.line_us === undefined || r.line_us === null)
     return null;
   const us = Number(r.line_us);
@@ -3100,9 +3218,9 @@ const fmtLine = v => (typeof v === 'number' ? v.toFixed(2) : esc(v)) + 'us';
 /* Header summary strip: "N drones fingerprinted · M encounters ·
    strongest: DRONE-X (peak dB)" — aliased drones show the alias with the
    fingerprint's line period instead ("strongest: MY RIG (63.98us)"), and
-   when both RF bands are present a per-band encounter count is appended
-   ("· 3× 5.8 · 2× ELRS"). Counts only the rows passed in (noise-filtered
-   view). */
+   when both RF bands are present a 5.8 encounter count is appended plus the
+   ELRS intel-ladder counts ("· 3× 5.8 · ELRS: 1 detected · 2 decoded").
+   Counts only the rows passed in (noise-filtered view). */
 function renderDetSum(rows) {
   const seen = {};
   rows.forEach(r => { if (r.drone) seen[r.drone] = 1; });
@@ -3121,11 +3239,22 @@ function renderDetSum(rows) {
                 : ' · strongest: ' + best.id + ' (' + best.peak + 'dB)';
   }
   const n24 = rows.reduce((n, r) => n + (r.band === '2.4' ? 1 : 0), 0);
-  const bands = n24 ? ' · ' + (rows.length - n24) + '× 5.8 · ' + n24 + '× ELRS'
-                    : '';
+  const n58 = rows.length - n24;
+  const bands = n24 && n58 ? ' · ' + n58 + '× 5.8' : '';
+  // ELRS intel ladder: live per-stage counts over the visible 2.4 rows
+  // ("ELRS: 3 detected · 1 cracked · 1 decoded" — zero stages omitted).
+  let elrsSum = '';
+  if (n24) {
+    const counts = { detected: 0, fingerprinted: 0, cracked: 0, decoded: 0 };
+    rows.forEach(r => {
+      if (r.band === '2.4') counts[stageOf(r) || 'detected']++;
+    });
+    elrsSum = ' · ELRS: ' + ['detected', 'fingerprinted', 'cracked', 'decoded']
+      .filter(s => counts[s]).map(s => counts[s] + ' ' + s).join(' · ');
+  }
   document.getElementById('detsum').textContent =
     ids + ' drone' + (ids === 1 ? '' : 's') + ' fingerprinted · ' +
-    enc + ' encounter' + (enc === 1 ? '' : 's') + strong + bands;
+    enc + ' encounter' + (enc === 1 ? '' : 's') + strong + bands + elrsSum;
 }
 /* Inline rename: swap a drone chip for a small input; Enter saves (empty
    clears the alias), Esc cancels. All rows of the fingerprint update
@@ -3217,7 +3346,11 @@ function renderDets(d) {
   });
   renderDetSum(view);
   // Skip columns the CSV lacks entirely (or that are blank on every row).
-  const cols = DETCOLS.filter(c => view.some(r => r[c[0]] !== undefined && r[c[0]] !== ''));
+  // The STAGE column derives for legacy 2.4 rows too, so it shows whenever
+  // the view has any ELRS row.
+  const cols = DETCOLS.filter(c => c[0] === 'stage'
+    ? view.some(r => r.band === '2.4')
+    : view.some(r => r[c[0]] !== undefined && r[c[0]] !== ''));
   if (view.some(r => typeof r.level_peak_db === 'number')) {
     const li = cols.findIndex(c => c[0] === 'level_min_db');
     cols.splice(li >= 0 ? li + 1 : cols.length, 0, ['spark', 'LEVEL']);
@@ -3250,7 +3383,10 @@ function renderDets(d) {
       if (k === 'video_sync')
         return v === 1 ? '<td><span class="vsb y">YES</span></td>'
                        : '<td class="na">--</td>';
+      if (k === 'stage') { const b = stageBadge(r);
+        return b ? '<td>' + b + '</td>' : '<td class="na">--</td>'; }
       if (v === undefined || v === '') return '<td class="na">--</td>';
+      if (k === 'uid') return '<td>' + uidCell(v) + '</td>';
       if (k === 'band')
         return '<td><span class="bchip ' + (v === '2.4' ? 'b24' : 'b58') + '">' +
                esc(v) + '</span></td>';
@@ -3302,6 +3438,11 @@ function renderDetCards(rows, cols, shots) {
     h += '<div class="dcgrid">';
     cols.forEach(c => {
       if (TITLE.indexOf(c[0]) >= 0 || c[0] === 'spark') return;
+      if (c[0] === 'stage') {
+        const b = stageBadge(r);
+        if (b) h += '<span><i>STAGE</i>' + b + '</span>';
+        return;
+      }
       const v = r[c[0]];
       if (v === undefined || v === '') return;
       let val;
@@ -3310,6 +3451,7 @@ function renderDetCards(rows, cols, shots) {
       else if (c[0] === 'cfo_ppm') val = esc(fmtCfo(v));
       else if (c[0] === 'video_std') val = '<span class="stdb">' + esc(v) + '</span>';
       else if (c[0] === 'line_us') val = fmtLine(v);
+      else if (c[0] === 'uid') val = uidCell(v);
       else if (c[0] === 'lock_type') val = '<span class="ltb ' + esc(v) + '">' + esc(v) + '</span>';
       else val = esc(v);
       h += '<span><i>' + c[1] + '</i>' + val + '</span>';
@@ -4689,6 +4831,10 @@ def create_app() -> Flask:
         if ELRS_MGR is None or not ELRS_MGR.send_line("U " + phrase):
             return jsonify({"ok": False,
                             "error": "dongle busy or unavailable"}), 503
+        # Host-side knowledge: the user typed (or the crack job auto-applied)
+        # this phrase for the current link — cracked rows may show it.
+        global _known_phrase
+        _known_phrase = phrase
         return jsonify({"ok": True})
 
     @app.post("/api/elrs/crack")
