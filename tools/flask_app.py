@@ -1990,23 +1990,34 @@ PAGE = """<!DOCTYPE html>
   #ckdone-sub b { font-weight:normal; color:var(--grn); }
   /* Tails-heard + bind-phrase strip: per-tail chips (count, last RSSI,
      validated state) on the left, uid-src hint + phrase apply on the right.
-     FIXED height; the hint is visibility-toggled, chips refill in place, so
-     the strip never reflows the tab. */
-  #etails { flex:0 0 34px; height:34px; display:flex; align-items:center;
+     FIXED height (two chip rows); the hint is visibility-toggled, chips wrap
+     inside their own clipped container, so the strip never reflows the tab
+     and chip content can never paint over the hint/input. */
+  #etails { flex:0 0 52px; height:52px; display:flex; align-items:center;
             gap:8px; flex-wrap:nowrap; overflow:hidden; padding:0 18px;
             box-sizing:border-box; border-bottom:1px solid var(--dim);
             font-size:.58rem; letter-spacing:.08em; white-space:nowrap;
             font-variant-numeric:tabular-nums; }
   #etails .tlbl { flex:0 0 auto; color:var(--dim); letter-spacing:.14em; }
-  #etailchips { flex:1 1 auto; min-width:0; display:flex; gap:6px;
-                align-items:center; overflow:hidden; }
-  .tchip { flex:0 0 auto; padding:1px 6px; border:1px solid var(--dim);
+  /* Chips wrap newest-first (backend sorts by recency); whatever passes two
+     rows is clipped by the fixed strip height = oldest folds away. */
+  #etailchips { flex:1 1 auto; min-width:0; display:flex; flex-wrap:wrap;
+                gap:3px 6px; align-content:center; overflow:hidden; }
+  /* Every badge/sub-label lives INSIDE the chip box: the chip clips, the
+     validated label ellipsizes, so long content truncates instead of
+     spilling over neighboring chips. */
+  .tchip { flex:0 0 auto; display:inline-flex; align-items:center; gap:4px;
+           height:20px; box-sizing:border-box; max-width:210px;
+           overflow:hidden; white-space:nowrap;
+           padding:0 6px; border:1px solid var(--dim);
            border-radius:3px; color:var(--txt); }
   .tchip b { color:var(--grn); font-weight:normal; }
   .tchip.own { border-color:var(--grn);
                box-shadow:0 0 6px rgba(57,255,106,.25); }
-  .tchip .tcnt, .tchip .trssi, .tchip .tband { color:var(--dim); }
-  .tchip .tval { color:#31c8ff; }
+  .tchip .tcnt, .tchip .trssi, .tchip .tband { color:var(--dim);
+           flex:0 0 auto; }
+  .tchip .tval { color:#31c8ff; flex:0 1 auto; min-width:0; max-width:96px;
+           overflow:hidden; text-overflow:ellipsis; }
   .tchip .tval.na { color:var(--dim); }
   #euidhint { flex:0 0 auto; min-width:190px; text-align:right;
               color:var(--amb); visibility:hidden; overflow:hidden;
