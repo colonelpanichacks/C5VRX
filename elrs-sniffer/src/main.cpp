@@ -106,8 +106,8 @@ static bool g_crack_flrc = false;
 static uint8_t g_crack_cand = 0;
 static uint32_t g_crack_t0 = 0;
 static uint32_t g_crack_score = 0;
-// FLRC discovery dedupe: adopt a parsed UID only after 2 consistent syncs
-static uint8_t g_disc_u3, g_disc_u4, g_disc_u5, g_disc_count;
+// Identity gating (field-proven: rejects chance hits + discovery noise)
+static elrs_identity_t g_id;
 // sync anchor for position prediction
 static uint8_t g_anchor_idx = 0;
 static uint8_t g_anchor_nonce = 0;
@@ -122,15 +122,19 @@ static int g_park_step = -1;        // R <step>: park sweep; -1 = auto-sweep
 static void crack_emit(const char *state)
 {
     snprintf(g_crack_state, sizeof(g_crack_state), "%s", state);
-    uint8_t t3 = dctx.uid_known ? dctx.uid3 : (g_disc_count ? g_disc_u3 : g_uid[3]);
-    uint8_t t4 = dctx.uid_known ? dctx.uid4 : (g_disc_count ? g_disc_u4 : g_uid[4]);
-    uint8_t t5 = dctx.uid_known ? dctx.uid5 : (g_disc_count ? g_disc_u5 : g_uid[5]);
+    uint8_t t3, t4, t5;
+    if (g_id.count || g_id.known) { t3 = g_id.u3; t4 = g_id.u4; t5 = g_id.u5; }
+    else if (dctx.uid_known) { t3 = dctx.uid3; t4 = dctx.uid4; t5 = dctx.uid5; }
+    else { t3 = g_uid[3]; t4 = g_uid[4]; t5 = g_uid[5]; }
     Serial.printf("{\"t\":\"crack\",\"state\":\"%s\",\"uid_tail\":\"%02x%02x%02x\","
                   "\"done\":%u,\"total\":256,\"valids_best\":%lu",
                   state, t3, t4, t5, g_crack_cand, (unsigned long)g_crack_best);
     if (strcmp(state, "cracked") == 0) {
-        Serial.printf(",\"uid_full\":\"%02x%02x%02x%02x%02x%02x\"",
-                      g_uid[0], g_uid[1], g_uid2, g_uid[3], g_uid[4], g_uid[5]);
+        // uid_full = phrase-prefix GUESS (UID[0..1] never broadcast) + the
+        // cracked UID2 + the CONSISTENT identity tail — never the phrase tail
+        // when it differs (field bug: phrase tail spliced over a real link).
+        Serial.printf(",\"uid_full\":\"%02x%02x%02x%02x%02x%02x\",\"pfx\":\"guess\"",
+                      g_uid[0], g_uid[1], g_uid2, t3, t4, t5);
     }
     Serial.println("}");
 }
@@ -285,7 +289,7 @@ static void dwell_begin(uint8_t i)
         bool disc = !(g_uid2_known && locked);
         g_radio.setFlrcDiscovery(disc);
         if (disc) {
-            g_disc_count = 0;
+            elrs_identity_reset(&g_id);
             crack_emit("listening");
             Serial.printf("{\"t\":\"event\",\"what\":\"flrc_discovery\",\"state\":\"listening\",\"detail\":\"%s\"}\n",
                           s.rate->name);
@@ -356,6 +360,19 @@ static void on_sync(const elrs_packet_t &pkt)
                   pkt.sync.rate_index, pkt.sync.switch_mode, pkt.sync.tlm_ratio,
                   pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5);
     if (!good) return;
+    // Identity gate: even a CRC-validated sync (a chance 2^-14 hit against
+    // some init) only locks after 2 consecutive same-tail syncs with sane
+    // fields and sane nonce cadence. First sync of a tail = sync_seen only.
+    {
+        bool was_known = g_id.known;
+        uint8_t hop = sweep.steps[step_idx].rate->hop_interval;
+        elrs_identity_consider(&g_id, &pkt.sync, hop);
+        bool tail_match = pkt.sync.uid3 == g_id.u3 && pkt.sync.uid4 == g_id.u4 &&
+                          pkt.sync.uid5 == g_id.u5;
+        if (g_id.count == 1) crack_emit("sync_seen"); // tail changed, rate-limited
+        if (!tail_match || !g_id.known) return;       // no identity -> no lock
+        if (!was_known) crack_emit("identity");
+    }
     last_good_step = step_idx; // sweep re-enters here first after a drop
     emit_fingerprint("lora");
     fhss_anchor(pkt);
@@ -994,8 +1011,17 @@ void loop()
                 if (pkt.cls == ELRS_PKT_CLASS_CRC_OK) {
                     n_crc_ok++; dwell_crc_ok++; window_pkts++;
                     if (locked) lock_total_pkts++;
-                    last_valid_ms = millis();
-                    if (pkt.type == ELRS_PKT_SYNC) last_sync_ms = millis(); // BUG 1 liveness
+                    // rule 5: discovery-mode garbage must not extend a lock's
+                    // liveness; only real (non-discovery) validated packets do
+                    if (!(g_radio.flrcDiscovery() && locked)) last_valid_ms = millis();
+                    if (pkt.type == ELRS_PKT_SYNC) {
+                        // syncs refresh liveness only if they match the identity
+                        if (!g_id.known ||
+                            (pkt.sync.uid3 == g_id.u3 && pkt.sync.uid4 == g_id.u4 &&
+                             pkt.sync.uid5 == g_id.u5)) {
+                            last_sync_ms = millis();
+                        }
+                    }
                     if (pkt.type == ELRS_PKT_RCDATA) last_rc_ms = millis();
                     if (g_crack) g_crack_score++;
                     follow_on_valid_packet();
@@ -1020,52 +1046,39 @@ void loop()
                                       "\"uid_pkt\":\"%02x%02x%02x\",\"uid_phrase\":\"%02x%02x%02x\",\"match\":%u}\n",
                                       pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5,
                                       g_uid[3], g_uid[4], g_uid[5], match ? 1 : 0);
-                        if (g_radio.flrcDiscovery()) {
-                            // discovery: adopt only after 2 consistent syncs
-                            if (pkt.sync.uid3 == g_disc_u3 && pkt.sync.uid4 == g_disc_u4 &&
-                                pkt.sync.uid5 == g_disc_u5) {
-                                g_disc_count++;
-                            } else {
-                                g_disc_u3 = pkt.sync.uid3;
-                                g_disc_u4 = pkt.sync.uid4;
-                                g_disc_u5 = pkt.sync.uid5;
-                                g_disc_count = 1;
-                                crack_emit("sync_seen");
-                                Serial.printf("{\"t\":\"event\",\"what\":\"flrc_discovery\",\"state\":\"sync_seen\",\"detail\":\"uid %02x%02x%02x\"}\n",
-                                              pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5);
-                            }
-                            if (g_disc_count >= 2) {
-                                g_uid[3] = g_disc_u3; g_uid[4] = g_disc_u4; g_uid[5] = g_disc_u5;
-                                dctx.uid3 = g_uid[3];
-                                dctx.uid4 = g_uid[4];
-                                dctx.uid5 = g_uid[5];
-                                dctx.uid_known = true;
-                                dctx.crc_init = elrs_crc_init_from_uid(g_uid[4], g_uid[5]);
-                                dctx.crc_init_known = true;
+                        // Identity gate (same rule as LoRa): 2 consecutive
+                        // same-tail sane syncs required — discovery mode
+                        // admits garbage, and chance hits must not lock.
+                        bool was_known = g_id.known;
+                        uint8_t hop = sweep.steps[step_idx].rate->hop_interval;
+                        elrs_identity_consider(&g_id, &pkt.sync, hop);
+                        bool tail_match = pkt.sync.uid3 == g_id.u3 &&
+                                          pkt.sync.uid4 == g_id.u4 &&
+                                          pkt.sync.uid5 == g_id.u5;
+                        if (g_id.count == 1) crack_emit("sync_seen"); // tail-changed only
+                        if (tail_match && g_id.known) {
+                            if (!was_known) crack_emit("identity");
+                            g_uid[3] = g_id.u3; g_uid[4] = g_id.u4; g_uid[5] = g_id.u5;
+                            dctx.uid3 = g_id.u3;
+                            dctx.uid4 = g_id.u4;
+                            dctx.uid5 = g_id.u5;
+                            dctx.uid_known = true;
+                            dctx.crc_init = elrs_crc_init_from_uid(g_id.u4, g_id.u5);
+                            dctx.crc_init_known = true;
+                            if (g_radio.flrcDiscovery()) {
                                 g_radio.setFlrcIdentity(g_uid);   // true CRC seed now
                                 g_radio.setFlrcDiscovery(false);  // exact 32-bit sync from here
                                 g_radio.recover(sweep.steps[step_idx], ELRS_2G4_SYNC_FREQ_HZ);
-                                crack_emit("identity");
                                 Serial.printf("{\"t\":\"event\",\"what\":\"flrc_discovery\",\"state\":\"cracking\",\"detail\":\"uid .. %02x %02x %02x\"}\n",
-                                              g_uid[3], g_uid[4], g_uid[5]);
-                                emit_fingerprint("flrc");
-                                fhss_anchor(pkt);
-                                start_crack(true);
+                                              g_id.u3, g_id.u4, g_id.u5);
                             }
-                        } else {
-                            dctx.uid3 = g_uid[3];
-                            dctx.uid4 = g_uid[4];
-                            dctx.uid5 = g_uid[5];
-                            dctx.uid_known = true;
-                            dctx.crc_init = elrs_crc_init_from_uid(g_uid[4], g_uid[5]);
-                            dctx.crc_init_known = true;
                             emit_fingerprint("flrc");
                             fhss_anchor(pkt);
                             if (!g_uid2_known && !g_crack) start_crack(true);
+                            if (!locked) Serial.println("{\"t\":\"lock\"}");
+                            locked = true;
+                            last_good_step = step_idx;
                         }
-                        if (!locked) Serial.println("{\"t\":\"lock\"}");
-                        locked = true;
-                        last_good_step = step_idx;
                     }
                     // raw ground-truth: FULL hex of every sync-classified
                     // packet (validated or not), <=2/s — for CRC forensics.
@@ -1118,7 +1131,7 @@ void loop()
             Serial.printf("{\"t\":\"error\",\"what\":\"dwell_timeout\",\"rate\":\"%s\",\"iq\":\"%c\",\"ms\":%lu}\n",
                           cur.rate->name, cur.iq_inverted ? 'i' : 'n',
                           (unsigned long)(millis() - step_entered_ms));
-            g_radio.recover(cur, ELRS_2G4_SYNC_FREQ_HZ);
+            g_radio.recover(sweep.steps[step_idx], ELRS_2G4_SYNC_FREQ_HZ);
             dwell_advance();
         }
         // Persistent lock (BUG 1: sync-only streams stay locked): drop only
@@ -1131,6 +1144,7 @@ void loop()
             g_crack = false;
             g_uid2_known = false;
             g_fp_emitted = false; // next link gets its own fingerprint
+            elrs_identity_reset(&g_id);
             Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
             // re-enter sweep: parked step if set, else last good rate+IQ
             dwell_begin(g_park_step >= 0 ? (uint8_t)g_park_step : last_good_step);

@@ -21,6 +21,57 @@ uint32_t elrs_uid_mac_seed(uint8_t uid2, uint8_t uid3, uint8_t uid4, uint8_t uid
            ((uint32_t)uid4 << 8) | ((uint32_t)uid5 ^ ELRS_OTA_VERSION_ID_3X);
 }
 
+// --- identity gating --------------------------------------------------------
+
+void elrs_identity_reset(elrs_identity_t *id)
+{
+    memset(id, 0, sizeof(*id));
+}
+
+bool elrs_identity_sane(const elrs_sync_info_t *s)
+{
+    return s->rate_index <= 9 &&      // 3.x SX128X table has 10 entries
+           s->tlm_ratio <= 8 &&       // expresslrs_tlm_ratio_e max (1:2)
+           s->fhss_index < 160;       // FHSS_SEQUENCE_LEN for 80ch 2.4G
+}
+
+// returns true exactly when identity is accepted (the 2nd consecutive
+// consistent sync for one tail); also true on subsequent same-tail syncs
+// once known (caller decides what to do with those).
+bool elrs_identity_consider(elrs_identity_t *id, const elrs_sync_info_t *s, uint8_t hop)
+{
+    if (!elrs_identity_sane(s)) return false;
+    if (s->uid3 != id->u3 || s->uid4 != id->u4 || s->uid5 != id->u5) {
+        // new candidate tail: start counting (sync_seen only)
+        id->u3 = s->uid3; id->u4 = s->uid4; id->u5 = s->uid5;
+        id->count = 1;
+        id->last_nonce = s->nonce;
+        id->last_fhss = s->fhss_index;
+        id->known = false;
+        return false;
+    }
+    if (id->known) {
+        id->last_nonce = s->nonce;
+        id->last_fhss = s->fhss_index;
+        return true;
+    }
+    // same tail: cadence check — nonce equal (disconnected) or advanced by a
+    // sane amount since the previous candidate sync; random garbage fails here
+    uint8_t d = (uint8_t)(s->nonce - id->last_nonce);
+    bool cadence_ok = (d == 0) || (d > 0 && d <= 4 * hop + 4);
+    id->last_nonce = s->nonce;
+    id->last_fhss = s->fhss_index;
+    if (!cadence_ok) {
+        id->count = 1; // restart the run with this packet as anchor
+        return false;
+    }
+    if (++id->count >= 2) {
+        id->known = true;
+        return true;
+    }
+    return false;
+}
+
 // --- channel helpers (OTA.cpp PackUInt11ToChannels4x10 / UnpackChannels4x10) ---
 
 void elrs_unpack_4x10(const uint8_t raw[5], uint16_t ch[4])

@@ -417,6 +417,56 @@ int main()
     }
     printf("ok: FHSS golden vector + ELRS unit-test invariants\n");
 
+    // 14) IDENTITY GATING: the field's real beacon pattern (repeated 61ace1
+    //     syncs, nonce advancing, drone OFF) must reach identity at the 2nd
+    //     sync; the live-DVDA chaos (5+ rotating tails, random nonces, bogus
+    //     fields) must never lock; same tail with insane nonce cadence resets.
+    {
+        elrs_identity_t id;
+        elrs_sync_info_t s;
+        // real pattern: repeated tail, nonce +4 between syncs (250Hz-class),
+        // fhss 63, rate 6, tlm 2
+        elrs_identity_reset(&id);
+        for (int i = 0; i < 3; i++) {
+            memset(&s, 0, sizeof(s));
+            s.uid3 = 0x61; s.uid4 = 0xac; s.uid5 = 0xe1;
+            s.nonce = (uint8_t)(4 * i);
+            s.fhss_index = 63; s.rate_index = 6; s.tlm_ratio = 2;
+            bool acc = elrs_identity_consider(&id, &s, 4);
+            assert(acc == (i >= 1)); // accepted on the 2nd consistent sync
+        }
+        assert(id.known);
+        // chaos pattern: rotating tails + random nonces + random fields
+        elrs_identity_reset(&id);
+        const uint8_t tails[5][3] = {{0x99,0x6f,0x28},{0xc2,0x3f,0x97},{0x20,0xd3,0xc5},
+                                     {0x60,0x1d,0xad},{0xe3,0x70,0x63}};
+        srand(999);
+        bool any_accept = false;
+        for (int i = 0; i < 40; i++) {
+            memset(&s, 0, sizeof(s));
+            const uint8_t *t = tails[i % 5];
+            s.uid3 = t[0]; s.uid4 = t[1]; s.uid5 = t[2];
+            s.nonce = rand() & 0xFF;
+            s.fhss_index = rand() % 256; s.rate_index = rand() % 16; s.tlm_ratio = rand() % 16;
+            if (elrs_identity_consider(&id, &s, 4)) any_accept = true;
+        }
+        assert(!any_accept && !id.known);
+        // same tail but insane nonce jump -> restart, never locks
+        elrs_identity_reset(&id);
+        s = (elrs_sync_info_t){ .uid3=0x61,.uid4=0xac,.uid5=0xe1,.nonce=0,
+                                .fhss_index=63,.rate_index=6,.tlm_ratio=2 };
+        elrs_identity_consider(&id, &s, 4);
+        s.nonce = 200; // garbage jump
+        assert(!elrs_identity_consider(&id, &s, 4));
+        assert(!id.known && id.count == 1);
+        // structural sanity: bad rateIdx rejected outright
+        elrs_identity_reset(&id);
+        s = (elrs_sync_info_t){ .uid3=0x61,.uid4=0xac,.uid5=0xe1,.nonce=0,
+                                .fhss_index=63,.rate_index=15,.tlm_ratio=2 };
+        assert(!elrs_identity_consider(&id, &s, 4) && id.count == 0);
+    }
+    printf("ok: identity gating (beacon accepts, chaos rejects)\n");
+
     printf("ALL HOST TESTS PASSED\n");
     return 0;
 }

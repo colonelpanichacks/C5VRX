@@ -106,6 +106,26 @@ uint16_t elrs_crc_init_from_uid(uint8_t uid4, uint8_t uid5);
 // FLRC sync word / FHSS MAC seed (common.cpp uidMacSeedGet). Needs UID[2].
 uint32_t elrs_uid_mac_seed(uint8_t uid2, uint8_t uid3, uint8_t uid4, uint8_t uid5);
 
+// ---------------------------------------------------------------------------
+// Identity gating (field-proven against false syncs): a sync candidate only
+// becomes the link IDENTITY after 2 consecutive sync-structured packets with
+// the SAME UID tail, sane fields (rateIdx <= 9, tlmRatio enum <= 8,
+// fhss < 160), and nonce/fhss advancing per cadence (equal allowed for
+// disconnected beacons). Chance 2^-14 CRC hits and discovery-mode noise show
+// rotating tails / random nonces and never reach 2 consistent hits.
+typedef struct {
+    uint8_t u3, u4, u5;     // candidate tail
+    uint8_t count;          // consecutive consistent syncs for this tail
+    uint8_t last_nonce;
+    uint8_t last_fhss;
+    bool known;             // identity accepted (count reached 2)
+} elrs_identity_t;
+
+void elrs_identity_reset(elrs_identity_t *id);
+bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only
+// returns true the moment identity is ACCEPTED (2nd consistent sync)
+bool elrs_identity_consider(elrs_identity_t *id, const elrs_sync_info_t *s, uint8_t hop);
+
 // --- helpers shared with the host tests ---
 uint32_t elrs_10bit_to_crsf_us(uint16_t v10, bool full_range);
 uint16_t elrs_crsfval_to_us(uint16_t crsf);  // CRSF 11-bit value -> us
