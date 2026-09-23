@@ -36,17 +36,8 @@ void sniffer_sweep_build(sniffer_sweep_t *sw)
 #include <Arduino.h>
 #include <RadioLib.h>
 
-// RadioLib keeps the packet-params writer protected; the sniffer needs exact
-// control (implicit header + fixed length + radio CRC OFF + per-dwell IQ),
-// so widen it (and the packet-type setter) via inheritance. The register
-// tweak uses the Module handle SnifferRadio owns — SX128x::mod is private.
-class SnifferSX1280 : public SX1280 {
-public:
-    using SX1280::SX1280;
-    using SX1280::setPacketParamsLoRa;
-    using SX1280::setPacketParamsGFSK;
-    using SX1280::setPacketType;
-};
+// (SnifferSX1280 lives in sniffer_radio.h — main.cpp needs it for the
+// round-15 stock-RadioLib reference RX baseline.)
 
 const radio_pin_set_t RADIO_PIN_SETS[] = {
     // name            nss sck miso mosi rst dio1 busy rxen txen
@@ -112,7 +103,7 @@ int16_t SnifferRadio::begin(const radio_pin_set_t *ps)
 }
 
 // GET_STATUS chipmode (bits 7:5): 2=STDBY_RC 3=STDBY_XOSC 4=FS 5=RX 6=TX
-static const char *chipmode_name(uint8_t st)
+const char *sniffer_chipmode_name(uint8_t st)
 {
     switch ((st >> 5) & 0x07) {
     case 2: return "stdby_rc";
@@ -225,7 +216,7 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
                   "\"sf\":\"%02x\",\"bw\":\"%02x\",\"cr\":\"%02x\","
                   "\"cm_before\":\"%s\",\"cm_after\":\"%s\",\"raw\":1}\n",
                   r->name, r->sf, r->bw, r->cr,
-                  chipmode_name(st_before), chipmode_name(st_after));
+                  sniffer_chipmode_name(st_before), sniffer_chipmode_name(st_after));
     return true;
 }
 
@@ -249,12 +240,10 @@ void SnifferRadio::start_rx()
         digitalWrite(rf_rxen, HIGH);
         digitalWrite(rf_txen, LOW);
     }
-    // ELRS-exact re-arm (SX1280.cpp SetMode RX_CONT): SetRx(periodBase
-    // 0x01, count 0xFFFF) -> ~4.1 s window; ELRS re-arms constantly and so
-    // do we (main.cpp 2 s no-RxDone watchdog). Skip when already RX so an
-    // ongoing receive is never disturbed.
-    uint8_t st = chipmode_read(mod);
-    if (((st >> 5) & 0x07) == 5) return; // already RX
+    // ELRS RXnb semantics: SetMode(RX_CONT) = SetRx(periodBase 0x01,
+    // count 0xFFFF ~4.1 s), re-armed constantly (main.cpp 2 s watchdog).
+    // Round 15: the skip-if-RX shortcut is REMOVED — it may have mis-fired
+    // and left the chip parked in FS after expiry (a deafness candidate).
     uint8_t rx[3] = { 0x01, 0xFF, 0xFF }; // base 62.5us, count 0xFFFF
     mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_RX, rx, 3);
     uint8_t clr[2] = { 0xFF, 0xFF };
@@ -288,6 +277,17 @@ bool SnifferRadio::read_packet(uint8_t *buf, size_t len, float &rssi, float &snr
     snr = radio->getSNR();
     start_rx(); // readData drops to standby; resume continuous RX
     return st == RADIOLIB_ERR_NONE;
+}
+
+// sync RadioLib's stored LoRa packet params (protected members) so the
+// STOCK startReceive (reference 'T' mode) re-sends OUR config, not begin()'s
+void SnifferSX1280::storeLoRaParams(uint8_t preamble, uint8_t hdr, uint8_t len, uint8_t crc, uint8_t iq)
+{
+    this->preambleLengthLoRa = preamble;
+    this->headerType = hdr;
+    this->payloadLen = len;
+    this->crcLoRa = crc;
+    (void)iq; // invertIQEnabled is private; begin() leaves it STANDARD (0x40)
 }
 
 void SnifferRadio::standby()

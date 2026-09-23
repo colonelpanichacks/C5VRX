@@ -98,6 +98,9 @@ static uint32_t g_fastlink_t0;
 static uint8_t g_harvest_idx; // step within harvest/fastlink
 static uint8_t g_lora_regs_seen[2]; // once-per-rate probe bitmap
 static uint32_t g_last_arm_ms;
+static uint32_t g_rxdone_latched, g_dio_miss; // round 15: live IRQ visibility
+static bool g_dio_seen;
+static uint8_t g_irq_now;
 // sync_frame dedupe ring (per harvest cycle): recent (nonce, fhss)
 static uint8_t g_sf_ring[16][2];
 static uint8_t g_sf_n;
@@ -136,6 +139,7 @@ static float dwell_rssi_max = -128.0f;
 static float window_rssi_max = -128.0f;
 static float rssi_now = -128.0f;
 static uint32_t last_sample_ms;
+static uint32_t last_irq_sample_ms; // round 15: separate from the RSSI sampler's clock
 static uint32_t dwell_len_ms;      // current adaptive dwell length
 static uint32_t dwell_pkts;        // classified packets this dwell
 static uint32_t dwell_first_pkt_ms;
@@ -548,6 +552,9 @@ static void dwell_begin(uint8_t i)
     dwell_rx = dwell_crc_ok = dwell_rc = dwell_msp = dwell_sync = dwell_tlm = dwell_unk = 0;
     dwell_cand = 0;
     dwell_demod = dwell_exported = dwell_dropped = dwell_swerr = 0;
+    g_rxdone_latched = g_dio_miss = 0;
+    g_dio_seen = false;
+    g_irq_now = 0;
     dwell_rssi_min = 0.0f;
     g_irq_prev = 0;
     g_int_aborted = false;
@@ -837,7 +844,8 @@ static void stats_tick()
                   "\"lora\":{\"f\":%lu,\"s\":%lu,\"c\":%lu},\"flrc\":{\"f\":%lu,\"s\":%lu,\"c\":%lu}},"
                   "\"rx\":%lu,\"crc_ok\":%lu,"
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},"
-                  "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u",
+                  "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u,"
+                  "\"irq\":\"%02x\",\"cm\":\"%s\",\"rxdone_latched\":%lu,\"dio_miss\":%lu",
                   (unsigned long)now, uist.rate, uist.iq_inverted ? 'i' : 'n',
                   (int)uist.rssi_dbm, (int)rssi_now, (int)(last_snr * 10),
                   (unsigned long)uist.pps, (unsigned long)rx_per_s,
@@ -861,7 +869,9 @@ static void stats_tick()
                   (unsigned long)n_sync, (unsigned long)n_tlm, (unsigned long)n_unk,
                   (unsigned long)uist.ch_us[0], (unsigned long)uist.ch_us[1],
                   (unsigned long)uist.ch_us[2], (unsigned long)uist.ch_us[3],
-                  uist.armed ? 1 : 0);
+                  uist.armed ? 1 : 0, g_irq_now,
+                  sniffer_chipmode_name(g_radio.status_byte()),
+                  (unsigned long)g_rxdone_latched, (unsigned long)g_dio_miss);
     if (dctx.uid_known) {
         Serial.printf(",\"uid\":\"%02x%02x%02x\"", dctx.uid3, dctx.uid4, dctx.uid5);
     }
@@ -1389,6 +1399,48 @@ static void escan_run(bool peak_mode)
     g_radio.recover(cur_step(), ELRS_2G4_SYNC_FREQ_HZ); // restore the dwell
 }
 
+// Reference RX mode (round 15): the KNOWN-GOOD RadioLib baseline. STOCK
+// calls exactly as the RadioLib SX1280 receive example, so a refpkt flow
+// means our raw byte sequence has a wrong byte (diff), and empty refpkt with
+// a live -19 dBm signal means packet delivery is broken below the API.
+static void ref_run()
+{
+#if PIN_LORA_RXEN != -1
+    pinMode(PIN_LORA_RXEN, OUTPUT);
+    digitalWrite(PIN_LORA_RXEN, HIGH); // FEM to the RX path
+    pinMode(PIN_LORA_TXEN, OUTPUT);
+    digitalWrite(PIN_LORA_TXEN, LOW);
+#endif
+    SnifferSX1280 *r = static_cast<SnifferSX1280 *>(g_radio.radio_ptr());
+    r->begin(2441.4f, 812.5f, 6, 8);   // STOCK RadioLib full init (reference state)
+    r->storeLoRaParams(14, RADIOLIB_SX128X_LORA_HEADER_IMPLICIT, 8, 0,
+                       RADIOLIB_SX128X_LORA_IQ_STANDARD); // so stock startReceive re-sends OUR params
+    r->setFrequency(2441.399841f);
+    SnifferRadio::dio_clear();
+    r->startReceive();                 // STOCK startReceive (the baseline)
+    uint32_t t0 = millis();
+    unsigned n = 0;
+    uint32_t win = 0; uint8_t cnt = 0;
+    while (millis() - t0 < 10000) {
+        if (SnifferRadio::dio_pending()) {
+            SnifferRadio::dio_clear();
+            uint8_t buf[ELRS_OTA4_LEN];
+            if (r->readData(buf, sizeof(buf)) == RADIOLIB_ERR_NONE) {
+                n++;
+                if (elrs_rxcap_allow(millis(), &win, &cnt, 30)) {
+                    char hex[2 * ELRS_OTA4_LEN + 1];
+                    to_hex(buf, sizeof(buf), hex);
+                    Serial.printf("{\"t\":\"event\",\"what\":\"refpkt\",\"hex\":\"%s\",\"rssi\":%d}\n",
+                                  hex, (int)r->getRSSI());
+                }
+            }
+        }
+        delay(1);
+    }
+    Serial.printf("{\"t\":\"event\",\"what\":\"refdone\",\"n\":%u}\n", n);
+    g_radio.recover(cur_step(), ELRS_2G4_SYNC_FREQ_HZ); // restore the dwell
+}
+
 void loop()
 {
     // console commands: P = radio pin re-probe, D = toggle OLED driver,
@@ -1438,6 +1490,10 @@ void loop()
         else if (c == 'V' || c == 'v') {
             g_verbose = !g_verbose;
             Serial.printf("{\"t\":\"event\",\"what\":\"%s\"}\n", g_verbose ? "verbose_on" : "verbose_off");
+        }
+        else if (c == 'T' || c == 't') {
+            Serial.println("{\"t\":\"event\",\"what\":\"ref_start\"}"); // 10 s blocking
+            ref_run();
         }
         else if (c == 'E' || c == 'e') {
             // Energy scan (round 14): park LoRa 250 iq=n on the sync freq,
@@ -1943,15 +1999,24 @@ void loop()
 
     crack_tick();
 
-    // FLRC sync-word-error counting via non-destructive IRQ status diffs
-    // (sticky until the readData path clears them). A real link with a
-    // DIFFERENT sync word spikes swerr at its packet cadence.
-    if (radio_ok && cur_step().rate->flrc && millis() - last_sample_ms >= 50) {
+    // Live IRQ visibility (round 15): non-destructive IRQ poll on ALL
+    // modes. RX_DONE latched + DIO1 never observed this dwell = ISR gap
+    // (chip completes, our path drops). FLRC swerr diff kept for signal
+    // detection.
+    if (radio_ok && millis() - last_irq_sample_ms >= 50) {
         uint16_t now_irq = g_radio.irq_status();
-        uint16_t newly = (uint16_t)(now_irq & (uint16_t)~g_irq_prev);
-        if (newly & 0x0200) dwell_swerr++; // SyncWordError bit 9
-        g_irq_prev = now_irq;
-        last_sample_ms = millis();
+        g_irq_now = (uint8_t)(now_irq & 0xFF);
+        if (SnifferRadio::dio_pending()) g_dio_seen = true;
+        if (elrs_irq_rxdone(now_irq)) {
+            g_rxdone_latched++;
+            if (elrs_dio_miss(now_irq, g_dio_seen)) g_dio_miss++;
+        }
+        if (cur_step().rate->flrc) {
+            uint16_t newly = (uint16_t)(now_irq & (uint16_t)~g_irq_prev);
+            if (newly & 0x0200) dwell_swerr++; // SyncWordError bit 9
+            g_irq_prev = now_irq;
+        }
+        last_irq_sample_ms = millis();
     }
 
     // round 13: FS-expiry safety net — the SetRx window is ~4.1 s; if no

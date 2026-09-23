@@ -1038,6 +1038,17 @@ int main()
     }
     printf("ok: escan sweep math (41 points, spacing, marker)\n");
 
+    // 15r) IRQ predicates (round 15): RX_DONE bit 0x0002 latch + the dio_miss
+    //      ISR-gap detector behind the stats rxdone_latched/dio_miss fields.
+    {
+        assert(elrs_irq_rxdone(0x0002));
+        assert(!elrs_irq_rxdone(0x0200)); // SyncWordError bit, not RxDone
+        assert(elrs_dio_miss(0x0002, false)); // chip completed, DIO1 never seen
+        assert(!elrs_dio_miss(0x0002, true));  // normal path: ISR observed it
+        assert(!elrs_dio_miss(0x0000, false)); // no RxDone at all
+    }
+    printf("ok: irq rxdone latch + dio_miss predicates\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

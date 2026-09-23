@@ -48,6 +48,22 @@ extern const uint8_t RADIO_PIN_SET_DEFAULT; // compile-time pins from board_pins
 #ifdef ARDUINO
 #include <RadioLib.h>
 
+// RadioLib keeps the packet-params writer protected; the sniffer needs exact
+// control (implicit header + fixed length + radio CRC OFF + per-dwell IQ),
+// so widen it (and the packet-type setter) via inheritance. The register
+// tweak uses the Module handle SnifferRadio owns — SX128x::mod is private.
+class SnifferSX1280 : public SX1280 {
+public:
+    using SX1280::SX1280;
+    using SX1280::setPacketParamsLoRa;
+    using SX1280::setPacketParamsGFSK;
+    using SX1280::setPacketType;
+    void storeLoRaParams(uint8_t preamble, uint8_t hdr, uint8_t len, uint8_t crc, uint8_t iq);
+};
+
+// GET_STATUS chipmode (bits 7:5) as a short name, for the 1 Hz stats line.
+const char *sniffer_chipmode_name(uint8_t status);
+
 class SnifferRadio {
 public:
     // SPI + radio init with an explicit pin set; returns the RadioLib
@@ -83,6 +99,12 @@ public:
     bool read_packet(uint8_t *buf, size_t len, float &rssi, float &snr,
                      uint16_t *irq_out = NULL);
     Module *mod_ptr() { return mod; }
+    // GET_STATUS status byte (raw, chipmode in bits 7:5) — the live chipmode
+    // sample behind the stats "cm" field.
+    uint8_t status_byte() { uint8_t st = 0; if (mod) mod->SPIreadStream(RADIOLIB_SX128X_CMD_GET_STATUS, &st, 1); return st; }
+    SX1280 *radio_ptr() { return radio; }
+    static bool dio_pending() { return dio1_fired; }
+    static void dio_clear() { dio1_fired = false; }
     void standby();
     // Non-destructive read of the IRQ status register (for error-IRQ
     // counting between packets; does NOT clear).

@@ -44,6 +44,10 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 | `sig` | object | — | elrs_sig quality: `q` = `none`/`weak`/`firm`/`strong` (firm = >=3 `crc_pass` in the harvest pass OR >=10 `sync_struct` with >=1 repeated tail; strong = >=10 `crc_pass`; weak = >=3 `sync_struct`), plus `frames`, `sync_struct`, `crc_pass` totals and per-band `lora`/`flrc` `{f,s,c}` sub-objects |
 | `sync_only` | 0/1 | — | locked but no validated RC data for >2 s — a sync-follow lock (TX beaconing, model disarmed/off). Sticks in `ch` are stale; expect no telemetry |
 | `uid` | string, optional | — | `UID[3..5]` as lowercase hex — **link fingerprint, not identity**; absent until a sync is captured |
+| `irq` | string | hex | low byte of the SX1280 IRQ status word at the last 50 ms poll (non-destructive read, ALL modes) — round 15 |
+| `cm` | string | — | live GET_STATUS chipmode at the last poll: `stdby_rc`/`stdby_xosc`/`fs`/`rx`/`tx`/`?` — round 15 |
+| `rxdone_latched` | uint | count | per-dwell: 50 ms polls that saw RX_DONE (bit 0x0002) still latched = the chip completed a packet — round 15 |
+| `dio_miss` | uint | count | per-dwell: RX_DONE-latched polls where DIO1 was never observed = chip completes but the ISR path drops packets (ISR-gap detector) — round 15 |
 
 ## Events
 
@@ -280,10 +284,11 @@ TX not reaching our antenna (hardware).
 chipmode decoded (`stdby_rc/stdby_xosc/fs/rx/tx`) BEFORE and AFTER config.
 The SX1280 IGNORES configuration written in RX mode, so every dwell now:
 standby -> packettype -> modparams -> 0x925 -> freq -> packetparams ->
-rx_cont -> setrx (all raw SPI, RadioLib-free), and `start_rx` skips re-arm
-when GET_STATUS already says RX. The ~4.1 s SetRx window is safety-netted by
-a >2 s no-RxDone re-arm. Boot selftest ends in STANDBY (known sweep start)
-and dumps a `lora_regs` fault trail immediately when `lora_demod` is 0.
+rx_cont -> setrx (all raw SPI, RadioLib-free). The ~4.1 s SetRx window is
+safety-netted by a >2 s no-RxDone re-arm. (Round 15 note: the skip-if-RX
+shortcut this paragraph originally described was removed in round 15.) Boot
+selftest ends in STANDBY (known sweep start) and dumps a `lora_regs` fault
+trail immediately when `lora_demod` is 0.
 
 ## Round 11/12 additions
 
@@ -303,6 +308,49 @@ and dumps a `lora_regs` fault trail immediately when `lora_demod` is 0.
   `lora_demod:0` at boot = LoRa RX path fault.
 - `rxdiag` is now emitted for EVERY dwell end (LoRa sweep included).
 - Telemetry/linkstats events only fire from CRC-validated packets.
+
+## Round 15: live IRQ stats, start_rx hardening, reference-RX baseline
+
+Diagnostics only — no sweep-logic behavior changes.
+
+**Live IRQ visibility.** A 50 ms non-destructive IRQ poll now runs on ALL
+modes; the 1 Hz `stats` line gained four fields (see the stats table):
+`irq` (IRQ low byte), `cm` (chipmode), `rxdone_latched`, `dio_miss` (both
+per-dwell). Read together they settle "chip-completes-vs-ISR-dead" in one
+capture: `rxdone_latched` climbing WITH `dio_miss` => the chip completes
+packets but the DIO1/ISR path loses them; `rxdone_latched` zero with hot
+RSSI => the chip never completes (config/deafness); `cm` not `rx` after an
+arm => the SetRx itself is failing.
+
+**start_rx hardening.** The skip-if-RX shortcut is REMOVED — it may have
+mis-fired (GET_STATUS race) and left the chip parked in FS after the ~4.1 s
+SetRx expiry, a deafness candidate. `start_rx` now always issues raw
+`SetRx(0x01,0xFF,0xFF)` + `ClearIrq(0xFFFF)`.
+
+**`T` — 10 s stock-RadioLib reference RX** (BLOCKING by design — diagnostic
+isolation; the dwell is restored via `recover()` on exit). This is the
+KNOWN-GOOD baseline: stock API calls exactly as the RadioLib SX1280 receive
+example, with the FEM antenna switch driven. Exact sequence:
+1. FEM pins: rxen=HIGH, txen=LOW
+2. `begin(2441.4, 812.5, sf 6, cr 8)` — STOCK RadioLib full init
+3. `storeLoRaParams(14, IMPLICIT, len 8, crc off, IQ STANDARD)` — overwrites
+   the stored packet params so the STOCK startReceive re-sends OUR exact
+   params (preamble 14, implicit, fixed 8, radio CRC off)
+4. `setFrequency(2441.399841)`
+5. STOCK `startReceive()` — the baseline
+6. DIO-flag poll -> STOCK `readData` -> `getRSSI`
+
+```json
+{"t":"event","what":"ref_start"}
+{"t":"event","what":"refpkt","hex":"...8 bytes...","rssi":-19}
+{"t":"event","what":"refdone","n":37}
+```
+
+`refpkt` is capped at 30/s; `refdone.n` is the 10 s total. Interpretation:
+**refpkt flowing** => hardware + IRQ delivery are fine and OUR raw byte
+sequence has a wrong byte somewhere (diff the configs); **empty refpkt with
+a live -19..-27 dBm signal** on the sync channel => packet delivery is
+broken BELOW the API (hardware/IRQ), not in the byte sequence.
 
 ## Raw RX diagnostics (round 10)
 

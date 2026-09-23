@@ -312,6 +312,18 @@ static inline bool elrs_escan_params_ok(void)
            elrs_escan_freq_hz(ELRS_ESCAN_POINTS - 1) == 2443400000u;
 }
 
+// round 15: live IRQ visibility predicates. RX_DONE is IRQ bit 1 (0x0002).
+static inline bool elrs_irq_rxdone(uint16_t irq_word)
+{
+    return (irq_word & 0x0002) != 0;
+}
+// ISR-gap detector: the IRQ poll sees RX_DONE latched while DIO1 was never
+// observed this dwell -> the chip completes packets but the ISR path drops them.
+static inline bool elrs_dio_miss(uint16_t irq_word, bool dio_seen)
+{
+    return elrs_irq_rxdone(irq_word) && !dio_seen;
+}
+
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only
 // returns true the moment identity is ACCEPTED (2nd consistent sync)
