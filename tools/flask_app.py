@@ -829,15 +829,10 @@ def _elrs_ep_open_locked(obj: dict) -> None:
     }
 
 
-def _elrs_ep_close_locked(reason: str) -> None:
-    """Caller holds _elrs_ep_lock."""
-    global ELRS_EP
-    ep = ELRS_EP
-    if ep is None:
-        return
-    ELRS_EP = None
-    with ELRS.lock:
-        uid = ELRS.uid
+def _elrs_ep_write_locked(ep: dict, reason: str, lock_type: str,
+                          uid: str) -> None:
+    """Append one band-2.4 row for a closed episode. Caller holds
+    _elrs_ep_lock."""
     end = time.time()
     _det_write_row({
         "band": "2.4",
@@ -853,21 +848,35 @@ def _elrs_ep_close_locked(reason: str) -> None:
         "level_samples": ep["n"],
         "video_sync": "", "frames_received": "", "max_fps": "",
         "skip_dead": "", "dwell_ms": "",
-        "lock_type": "elrs",
+        "lock_type": lock_type,
         "end_reason": reason,
         "cfo_ppm": "", "video_std": "", "line_us": "",
-        "uid": uid or "",
+        "uid": uid,
         "geo_lat": ep["geo_lat"],
         "geo_lon": ep["geo_lon"],
     })
 
 
+def _elrs_ep_close_locked(reason: str) -> None:
+    """Caller holds _elrs_ep_lock."""
+    global ELRS_EP
+    ep = ELRS_EP
+    if ep is None:
+        return
+    ELRS_EP = None
+    with ELRS.lock:
+        uid = ELRS.uid
+    _elrs_ep_write_locked(ep, reason, "elrs", uid or "")
+
+
 def _elrs_ep_tick(obj: dict) -> None:
-    """Track sniffer objects: open an encounter on lock rise, accumulate
-    RSSI while locked, close on lock fall / explicit unlock. Called from
-    ElrsManager right after ELRS.update(obj)."""
+    """Track sniffer objects: presence episodes (sync-frame sightings) first,
+    then the lock-encounter path — open on lock rise, accumulate RSSI while
+    locked, close on lock fall / explicit unlock. Called from ElrsManager
+    right after ELRS.update(obj)."""
     t = obj.get("t")
     with _elrs_ep_lock:
+        _presence_tick_locked(obj)
         if t == "unlock":
             _elrs_ep_close_locked("unlock:" + str(obj.get("why") or "?"))
             return
@@ -891,6 +900,131 @@ def _elrs_ep_end(reason: str) -> None:
     """Lock-taking wrapper for callers outside the tick path."""
     with _elrs_ep_lock:
         _elrs_ep_close_locked(reason)
+        _pres_close_locked(reason)
+
+
+# ----- ELRS presence episodes (round-6 passive discovery) -----
+#
+# Receiving ELRS sync frames is itself a drone-presence indicator, even
+# without a phrase crack or a lock. A presence episode opens on EITHER:
+#   - a uid45 event (the firmware confirmed a FLRC frame's CRC seed — real
+#     ELRS, not junk), or
+#   - >=PRES_MIN_FRAMES LoRa sync_frames sharing one UID tail inside a 30 s
+#     rolling window (self-seed-consistent syncs = real ELRS).
+# Never on: single frames, unconfirmed FLRC sync_frames, or anything while a
+# lock episode could own the sighting (any lock — the lock path covers it).
+# The row is a band 2.4 detection with lock_type "elrs-presence"; it refreshes
+# while frames flow and auto-closes after PRES_SILENCE_S of silence.
+
+PRES_WINDOW_S = 30.0          # rolling window for the same-tail trigger
+PRES_MIN_FRAMES = 3           # same-tail LoRa frames needed inside the window
+PRES_SILENCE_S = 15.0         # frameless stretch that closes an episode
+PRES_EP = None                # open presence episode dict, or None
+_pres_window = []             # [(mono, tail, rssi, rate)] recent sync_frames
+_last_frame = {}              # latest sync_frame's rate/rssi (uid45 context)
+
+
+def _pres_open_locked(uid: str, rate: str, rssi) -> None:
+    """Caller holds _elrs_ep_lock."""
+    global PRES_EP
+    geo = _geo_current()
+    PRES_EP = {
+        "start": time.time(),
+        "uid": uid or "",
+        "channel": str(rate or "-"),
+        "peak": rssi, "min": rssi,
+        "sum": float(rssi) if isinstance(rssi, (int, float)) else 0.0,
+        "n": 1 if isinstance(rssi, (int, float)) else 0,
+        "last": time.monotonic(),
+        "geo_lat": "" if geo is None else round(geo[0], 6),
+        "geo_lon": "" if geo is None else round(geo[1], 6),
+    }
+
+
+def _pres_close_locked(reason: str) -> None:
+    """Caller holds _elrs_ep_lock."""
+    global PRES_EP
+    ep = PRES_EP
+    if ep is None:
+        return
+    PRES_EP = None
+    _elrs_ep_write_locked(ep, reason, "elrs-presence", ep["uid"])
+    _presence_publish_locked()
+
+
+def _pres_refresh_locked(rate, rssi, now: float) -> None:
+    """Caller holds _elrs_ep_lock and PRES_EP is open."""
+    ep = PRES_EP
+    ep["last"] = now
+    if rate:
+        ep["channel"] = str(rate)
+    if isinstance(rssi, (int, float)):
+        ep["peak"] = rssi if ep["peak"] is None else max(ep["peak"], rssi)
+        ep["min"] = rssi if ep["min"] is None else min(ep["min"], rssi)
+        ep["sum"] += rssi
+        ep["n"] += 1
+
+
+def _presence_publish_locked() -> None:
+    """Expose the live presence line to the FIND panel via ELRS.presence.
+    Caller holds _elrs_ep_lock; takes ELRS.lock second (same order as the
+    episode-close path — never the reverse)."""
+    now = time.monotonic()
+    with ELRS.lock:
+        if PRES_EP is None:
+            ELRS.presence = None
+            return
+        f10 = sum(1 for ts, *_ in _pres_window if now - ts < 10.0)
+        ELRS.presence = {"rate": PRES_EP["channel"],
+                         "rssi": PRES_EP["peak"],
+                         "frames_10s": f10, "uid": PRES_EP["uid"]}
+
+
+def _presence_tick_locked(obj: dict) -> None:
+    """Presence triggers + silence close. Caller holds _elrs_ep_lock; runs
+    inside _elrs_ep_tick on every sniffer object (stats lines ~1 Hz keep the
+    silence clock honest even when frames stop)."""
+    global _pres_window
+    now = time.monotonic()
+    t = obj.get("t")
+    # Silence auto-close; stats keep arriving so this fires without frames.
+    if PRES_EP is not None and now - PRES_EP["last"] > PRES_SILENCE_S:
+        _pres_close_locked("signal lost")
+    with ELRS.lock:
+        locked = bool(ELRS.link_lock)
+    if t == "stats" and obj.get("lock"):
+        # The lock episode owns the sighting from here.
+        if PRES_EP is not None:
+            _pres_close_locked("lock acquired")
+        return
+    if t == "sync_frame":
+        rssi = obj.get("rssi")
+        rate = obj.get("rate")
+        _last_frame.update(rate=rate, rssi=rssi)
+        hexs = str(obj.get("hex") or "")
+        tail = (hexs[10:16] if obj.get("band") == "lora" and len(hexs) >= 16
+                else None)
+        _pres_window.append((now, tail, rssi, rate))
+        _pres_window = [w for w in _pres_window if now - w[0] < PRES_WINDOW_S]
+        if PRES_EP is not None:
+            _pres_refresh_locked(rate, rssi, now)
+        elif not locked and tail is not None:
+            same = [w for w in _pres_window if w[1] == tail]
+            if len(same) >= PRES_MIN_FRAMES:
+                _pres_open_locked(tail, rate, rssi)
+        _presence_publish_locked()
+    elif t == "event" and obj.get("what") == "uid45":
+        # Firmware-confirmed FLRC CRC seed: real ELRS, no counting needed.
+        uid = "uid45:" + str(obj.get("uid4") or "??") + str(obj.get("uid5")
+                                                             or "??")
+        if PRES_EP is not None:
+            if not PRES_EP["uid"]:
+                PRES_EP["uid"] = uid
+            _pres_refresh_locked(None, None, now)
+        elif not locked:
+            _pres_open_locked(uid, _last_frame.get("rate"),
+                              _last_frame.get("rssi"))
+        _presence_publish_locked()
 
 
 def parse_line(line: str) -> None:
@@ -1438,6 +1572,7 @@ class ElrsState:
         self.frame_uniq = {"flrc": set(), "lora": set()}  # dedupe by hex (cap 64)
         self.last_frame_ts = None  # monotonic of the latest sync_frame
         self.uid45 = None        # (payload, monotonic) latest uid45 event
+        self.presence = None     # live presence-episode line for the FIND panel
 
     def update(self, obj: dict) -> None:
         now = time.monotonic()
@@ -1593,6 +1728,8 @@ class ElrsState:
             "uid45": (None if uid45 is None else
                       {"age_s": round(now - uid45[1], 1),
                        **{k: v for k, v in uid45[0].items() if k != "t"}}),
+            "presence": (None if self.presence is None
+                         else dict(self.presence)),
             "crackable": (uniq["flrc"] >= 1 or uniq["lora"] >= 1) and
                          not uid_known,
         }
@@ -2206,6 +2343,8 @@ PAGE = """<!DOCTYPE html>
             letter-spacing:.12em;
             animation:ckpulse 1.1s ease-in-out infinite; }
   #efind .esp { flex:1 1 auto; }
+  #efindpres { flex:0 0 auto; min-width:210px; color:var(--grn);
+               overflow:hidden; text-overflow:ellipsis; }
   #efindid { flex:0 1 auto; min-width:0; overflow:hidden;
              text-overflow:ellipsis; color:var(--dim); }
   #efindid.found { color:var(--grn); font-size:.92rem; letter-spacing:.12em;
@@ -2594,6 +2733,7 @@ PAGE = """<!DOCTYPE html>
     <span class="flbl">FIND</span>
     <span id="efindcnt">—</span>
     <span id="efindlive" class="fbadge" style="visibility:hidden">FINDING</span>
+    <span id="efindpres" style="visibility:hidden"></span>
     <span class="esp"></span>
     <span id="efindid">listening for sync frames</span>
     <button id="efindapply" class="tg" style="visibility:hidden"
@@ -3448,6 +3588,14 @@ function updElrsFind(e, set, job) {
     (f && f.uid45) || (e.lock && !e.sync_only)));
   document.getElementById('efindlive').style.visibility =
     on && f && f.live && !uidKnown ? 'visible' : 'hidden';
+  // Live presence episode (sync frames = drone presence, even uncracked).
+  const pres = f && f.presence, presEl = document.getElementById('efindpres');
+  if (on && pres) {
+    presEl.style.visibility = 'visible';
+    presEl.textContent = 'PRESENCE // ' + (pres.rate || '?') + ' · ' +
+      (typeof pres.rssi === 'number' ? pres.rssi : '--') + 'dBm · ' +
+      (pres.frames_10s || 0) + ' frames/10s';
+  } else presEl.style.visibility = 'hidden';
   const idEl = document.getElementById('efindid');
   const applyBtn = document.getElementById('efindapply');
   const crackBtn = document.getElementById('efindcrack');
