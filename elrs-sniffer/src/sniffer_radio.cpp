@@ -82,6 +82,11 @@ int16_t SnifferRadio::begin(const radio_pin_set_t *ps)
     // placeholder params; every dwell reconfigures via apply()
     int16_t st = radio->begin(2441.4, 812.5, 9, 7);
     if (st != RADIOLIB_ERR_NONE) return st;
+    // round 17: RadioLib begin() leaves TX power at its 10 dBm default. The
+    // sniffer is RX-only (the FEM switch pins are never in the TX position),
+    // but cap the PA drive at 3 dBm so a FUTURE TX experiment cannot
+    // overdrive the H658 FEM — LilyGo's guidance is FEM RF input <= 5 dBm.
+    radio->setOutputPower(3);
     // ELRS SX1280.cpp Begin(): register 0x0891 |= 0xC0 (high sensitivity)
     mod->SPIwriteRegister(0x0891, mod->SPIreadRegister(0x0891) | 0xC0);
     if (ps->rxen != -1) {
@@ -127,6 +132,7 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
 {
     const elrs_rate_t *r = step.rate;
     payload_len = r->payload;
+    flrc_mode = r->flrc != 0; // raw packet-status decode picks the byte layout
     // SMOKING-GUN FIX (round 13): the SX1280 IGNORES configuration written
     // while it is in RX — ELRS always SetMode(STDBY_RC) before reconfig
     // (SX1280.cpp L79/L156-188). Without this, every dwell silently ran the
@@ -240,11 +246,18 @@ void SnifferRadio::start_rx()
         digitalWrite(rf_rxen, HIGH);
         digitalWrite(rf_txen, LOW);
     }
-    // ELRS RXnb semantics: SetMode(RX_CONT) = SetRx(periodBase 0x01,
-    // count 0xFFFF ~4.1 s), re-armed constantly (main.cpp 2 s watchdog).
-    // Round 15: the skip-if-RX shortcut is REMOVED — it may have mis-fired
-    // and left the chip parked in FS after expiry (a deafness candidate).
-    uint8_t rx[3] = { 0x01, 0xFF, 0xFF }; // base 62.5us, count 0xFFFF
+    // SetRx(periodBase 0x01, count 0xFFFF) = RX CONTINUOUS. The count is the
+    // datasheet's sentinel, not a duration: SX1280 datasheet Rev 3.2 (SetRx
+    // timeout table) — "periodBaseCount is set 0xFFFF, Rx Continuous mode,
+    // the device remains in Rx mode until the host sends a command to change
+    // the operation mode"; same value as RadioLib RADIOLIB_SX128X_RX_TIMEOUT_INF.
+    // (The old "~4.1 s window" comment was wrong: 0xFFFF never expires.) The
+    // chip never times out, so NO periodic re-arm: the old main.cpp 2 s
+    // re-arm watchdog is REMOVED — it re-issued SetRx + ClearIrq(0xFFFF) on
+    // silence, racing latched RxDone words and churning these FEM pins.
+    // Round 15 note: the skip-if-RX shortcut stays REMOVED.
+    uint8_t rx[3];
+    elrs_setrx_continuous(rx);
     mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_RX, rx, 3);
     uint8_t clr[2] = { 0xFF, 0xFF };
     mod->SPIwriteStream(RADIOLIB_SX128X_CMD_CLEAR_IRQ_STATUS, clr, 2);
@@ -269,14 +282,42 @@ bool SnifferRadio::tune(uint32_t freq_hz)
 bool SnifferRadio::read_packet(uint8_t *buf, size_t len, float &rssi, float &snr,
                                uint16_t *irq_out)
 {
-    if (!dio1_fired) return false;
+    if (!dio1_fired || mod == NULL) return false;
     dio1_fired = false;
-    if (irq_out) *irq_out = irq_status(); // IRQ word at RxDone, pre-clear
-    int16_t st = radio->readData(buf, len);
-    rssi = radio->getRSSI(); // per-frame packet-status RSSI (prompt, not the poll)
-    snr = radio->getSNR();
-    start_rx(); // readData drops to standby; resume continuous RX
-    return st == RADIOLIB_ERR_NONE;
+    uint16_t irq = irq_status(); // IRQ word at RxDone, captured pre-clear
+    if (irq_out) *irq_out = irq;
+    if (!(irq & ELRS_IRQ_RX_DONE)) return false; // spurious DIO1 edge
+    // ---- raw FIFO read (round 17): our code is the ONLY owner of the FEM
+    // switch. The old radio->readData() standby()s the chip on EVERY packet
+    // and drives the RF switch to MODE_IDLE (both FEM pins LOW = antenna
+    // disconnected; verified in RadioLib SX128x.cpp readData -> standby ->
+    // setRfSwitchState(MODE_IDLE)), and start_rx then re-asserted RXEN —
+    // per-packet standby + pin churn = the intermittent reception. This path
+    // NEVER leaves RX: GetRxBufferStatus -> ReadBuffer(rxStartBufferPointer)
+    // -> GetPacketStatus (the same 5 bytes RadioLib's getRSSI/getSNR decode)
+    // -> clear RX_DONE only. The chip stays in continuous Rx throughout, so
+    // NO SetStandby, NO SetRx re-arm, NO pin writes here.
+    uint8_t st[2] = { 0, 0 };
+    mod->SPIreadStream(ELRS_CMD_GET_RX_BUFFER_STATUS, st, 2);
+    uint8_t n = st[0] < len ? st[0] : (uint8_t)len;
+    uint8_t rd[2] = { ELRS_CMD_READ_BUFFER, st[1] };
+    mod->SPIreadStream(rd, 2, buf, n);
+    uint8_t ps[5] = { 0, 0, 0, 0, 0 };
+    mod->SPIreadStream(ELRS_CMD_GET_PACKET_STATUS, ps, 5);
+    if (flrc_mode) {
+        snr = 0.0f;                          // FLRC has no SNR register
+        rssi = elrs_ps_rssi_flrc(ps[1]);     // FLRC: RssiSync = ps[1]
+    } else {
+        snr = elrs_ps_snr_lora(ps[1]);       // LoRa: SnrRaw = ps[1]
+        rssi = elrs_ps_rssi_lora(ps[0], snr); // LoRa: RssiSync = ps[0], SNR-adjusted
+    }
+    // Free the next RxDone. RX_DONE only — unlike RadioLib readData's
+    // clearIrqStatus(ALL) the error flags stay sticky so the 50 ms swerr
+    // diff poll keeps seeing sync-word errors between packets. DIO1 is
+    // configured RX_DONE-only, so no spurious ISR from the sticky bits.
+    uint8_t clr[2] = { (uint8_t)(ELRS_IRQ_RX_DONE >> 8), (uint8_t)(ELRS_IRQ_RX_DONE & 0xFF) };
+    mod->SPIwriteStream(ELRS_CMD_CLEAR_IRQ_STATUS, clr, 2);
+    return true;
 }
 
 // sync RadioLib's stored LoRa packet params (protected members) so the

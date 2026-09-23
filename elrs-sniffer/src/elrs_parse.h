@@ -288,6 +288,9 @@ static inline bool elrs_chipmode_is_rx(uint8_t status_byte)
     return ((status_byte >> 5) & 0x07) == 5;
 }
 // FS-expiry safety net: re-arm only if no RxDone AND no re-arm for >2 s
+// (ROUND 17: retired in firmware — SetRx count 0xFFFF is Rx Continuous and
+// never expires, so there is nothing to re-arm; the helper + tests stay as
+// the pinned predicate contract).
 static inline bool elrs_should_rearm(uint32_t now_ms, uint32_t last_pkt_ms,
                                      uint32_t last_arm_ms)
 {
@@ -385,6 +388,44 @@ static inline bool elrs_escan_parse_arg(const char *arg, uint32_t *center_hz, bo
         }
     }
     return true;
+}
+
+// round 17: raw FIFO read (single owner of the FEM switch). Opcode values
+// are pinned here against the SX1280 datasheet + RadioLib SX128x command
+// set (RADIOLIB_SX128X_CMD_*); the firmware raw path uses THESE names so
+// this host-tested block is authoritative.
+// Read order (read_packet): status -> buffer -> packet-status -> clear.
+#define ELRS_CMD_GET_RX_BUFFER_STATUS 0x17u // -> {payloadLength, rxStartBufferPointer}
+#define ELRS_CMD_READ_BUFFER          0x1Bu // 2nd cmd byte = fifo offset
+#define ELRS_CMD_GET_PACKET_STATUS    0x1Du // -> 5 bytes, decode below
+#define ELRS_CMD_CLEAR_IRQ_STATUS     0x97u // {hi, lo} flag mask
+#define ELRS_IRQ_RX_DONE              0x0002u
+// SetRx(periodBase 0x01, count 0xFFFF): count 0xFFFF is the datasheet's
+// "Rx Continuous mode" sentinel — the chip stays in RX until the host
+// changes mode (SX1280 datasheet Rev 3.2 SetRx timeout table; RadioLib
+// RADIOLIB_SX128X_RX_TIMEOUT_INF). 0x0000 would be single-mode.
+#define ELRS_SETRX_CONT_BASE          0x01u
+#define ELRS_SETRX_CONT_COUNT         0xFFFFu
+static inline void elrs_setrx_continuous(uint8_t out[3])
+{
+    out[0] = ELRS_SETRX_CONT_BASE;
+    out[1] = (uint8_t)(ELRS_SETRX_CONT_COUNT >> 8);
+    out[2] = (uint8_t)(ELRS_SETRX_CONT_COUNT & 0xFF);
+}
+// packet-status decode, exactly RadioLib getRSSI()/getSNR() (SX128x.cpp):
+// LoRa: RssiSync=ps[0], SnrRaw=ps[1] (SNR-adjusted RSSI); FLRC: RssiSync=ps[1].
+static inline float elrs_ps_snr_lora(uint8_t raw)
+{
+    return raw < 128 ? raw / 4.0f : (raw - 256) / 4.0f;
+}
+static inline float elrs_ps_rssi_lora(uint8_t rssi_sync, float snr)
+{
+    float r = -1.0f * rssi_sync / 2.0f;
+    return snr <= 0.0f ? r - snr : r;
+}
+static inline float elrs_ps_rssi_flrc(uint8_t rssi_sync)
+{
+    return -1.0f * rssi_sync / 2.0f;
 }
 
 // round 15: live IRQ visibility predicates. RX_DONE is IRQ bit 1 (0x0002).

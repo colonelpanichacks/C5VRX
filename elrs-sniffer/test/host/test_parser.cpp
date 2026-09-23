@@ -1133,6 +1133,38 @@ int main()
     }
     printf("ok: hotfix index bounds + boot-order table contract\n");
 
+    // 18r) round 17: continuous-RX sentinel + raw FIFO read contract.
+    //      (a) SetRx bytes are periodBase 0x01, count 0xFFFF — the datasheet
+    //      Rx-CONTINUOUS sentinel (never expires), NOT 0x0000 (that is
+    //      single-mode per RadioLib RADIOLIB_SX128X_RX_TIMEOUT_NONE).
+    //      (b) raw-read opcodes match the SX1280 datasheet / RadioLib
+    //      command set, in read order: status -> buffer -> packet-status.
+    //      (c) packet-status decode matches RadioLib getRSSI/getSNR math.
+    {
+        uint8_t rx[3];
+        elrs_setrx_continuous(rx);
+        assert(rx[0] == 0x01 && rx[1] == 0xFF && rx[2] == 0xFF);
+        assert(ELRS_SETRX_CONT_COUNT == 0xFFFFu && ELRS_SETRX_CONT_COUNT != 0x0000u);
+        assert(ELRS_CMD_GET_RX_BUFFER_STATUS == 0x17u);
+        assert(ELRS_CMD_READ_BUFFER == 0x1Bu);
+        assert(ELRS_CMD_GET_PACKET_STATUS == 0x1Du);
+        assert(ELRS_CMD_CLEAR_IRQ_STATUS == 0x97u);
+        assert(ELRS_IRQ_RX_DONE == 0x0002u);
+        // RadioLib-equivalent decode: LoRa SNR signed/4, RSSI -sync/2 with
+        // the SNR correction for snr <= 0; FLRC RSSI from ps[1], SNR 0
+        assert(elrs_ps_snr_lora(0) == 0.0f);
+        assert(elrs_ps_snr_lora(127) == 31.75f);
+        assert(elrs_ps_snr_lora(200) == -14.0f);   // (200-256)/4
+        assert(elrs_ps_rssi_lora(0, 5.0f) == 0.0f);
+        assert(elrs_ps_rssi_lora(128, 5.0f) == -64.0f);   // snr>0: no adjust
+        assert(elrs_ps_rssi_lora(128, -14.0f) == -50.0f); // snr<=0: r-snr
+        assert(elrs_ps_rssi_flrc(100) == -50.0f);
+        // the raw read must target RX_DONE only for the clear (swerr poll
+        // needs error flags sticky between packets)
+        assert((ELRS_IRQ_RX_DONE & 0x0200) == 0); // swerr bit survives the clear
+    }
+    printf("ok: continuous-RX sentinel + raw-read opcodes/decode\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

@@ -123,6 +123,7 @@ private:
     Module *mod = nullptr;
     SX1280 *radio = nullptr;
     uint8_t payload_len = 0;
+    bool flrc_mode = false;               // set by apply(); raw packet-status decode
     int rf_rxen = -1;                     // H658 FEM antenna-switch control
     int rf_txen = -1;
     uint8_t flrc_sw[4] = { 0, 0, 0, 3 };  // uidMacSeedGet (default-phrase UID)

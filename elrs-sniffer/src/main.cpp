@@ -99,7 +99,6 @@ static uint8_t g_mode; // 0 sweep, 1 harvest, 2 fastlink (uid_last retry)
 static uint32_t g_fastlink_t0;
 static uint8_t g_harvest_idx; // step within harvest/fastlink
 static uint8_t g_lora_regs_seen[2]; // once-per-rate probe bitmap
-static uint32_t g_last_arm_ms;
 static uint32_t g_rxdone_latched, g_dio_miss; // round 15: live IRQ visibility
 static bool g_dio_seen;
 static uint8_t g_irq_now;
@@ -494,8 +493,9 @@ static const sniffer_step_t &cur_step()
 static void rxdiag_emit(const char *rate_name, bool flrc, bool selftest)
 {
     // per-dwell RX diagnostics (round 10): demod counts, export/drop,
-    // rssi range, FLRC sync-word-error count (sticky-IRQ diff since the
-    // error bits accumulate until cleared by the readData path)
+    // rssi range, FLRC sync-word-error count (sticky-IRQ diff; round 17:
+    // the raw FIFO read clears RX_DONE only, so the error bits stay latched
+    // all dwell — better visibility than RadioLib readData's clear-all)
     Serial.printf("{\"t\":\"event\",\"what\":\"rxdiag\",\"rate\":\"%s\",\"band\":\"%s\","
                   "\"demod\":%lu,\"exported\":%lu,\"dropped\":%lu,\"swerr\":%lu,"
                   "\"rssi_max\":%d,\"rssi_min\":%d%s}\n",
@@ -2074,13 +2074,12 @@ void loop()
         last_irq_sample_ms = millis();
     }
 
-    // round 13: FS-expiry safety net — the SetRx window is ~4.1 s; if no
-    // RxDone for >2 s, re-arm (exactly like ELRS re-issuing SetRx).
-    if (radio_ok && elrs_should_rearm(millis(), last_pkt_ms, g_last_arm_ms)) {
-        g_last_arm_ms = millis();
-        g_radio.start_rx();
-    }
-
+    // round 17: NO periodic re-arm. SetRx runs with count 0xFFFF = Rx
+    // Continuous (datasheet sentinel; never expires), so there is no window
+    // to re-arm. The old round-13 2 s watchdog re-issued SetRx +
+    // ClearIrq(0xFFFF) on silence — racing latched RxDone words (a packet
+    // completing mid-re-arm lost its IRQ and its DIO1 flag) and churning
+    // the FEM switch pins. Retired with the raw-read switch ownership.
     led_update(locked, uist.pps);
     stats_tick(); // always runs — alive-with-no-radio still emits 1 Hz JSON
 }

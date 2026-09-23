@@ -336,6 +336,48 @@ at the TOP of setup() (before any radio/OLED init) and all reads go through
 a bounds-guarded `dwell_ch_hz(idx)` accessor. Host test 17r pins the
 index/table contract for any boot order.
 
+## Round 17: continuous RX + raw FIFO read (single FEM-switch owner)
+
+Reception worked (validated syncs, 507 pkts/capture) but was intermittent
+with identical setups. Two RX-path defects, both fixed:
+
+**Continuous RX, no re-arm.** `start_rx` sends SetRx(periodBase 0x01,
+count 0xFFFF). The count is the datasheet's sentinel, NOT a duration:
+SX1280 datasheet Rev 3.2 (SetRx timeout table) — "periodBaseCount is set
+0xFFFF, Rx Continuous mode, the device remains in Rx mode until the host
+sends a command to change the operation mode" (same value as RadioLib
+`RADIOLIB_SX128X_RX_TIMEOUT_INF`). The old "~4.1 s window" comment was
+wrong; 0xFFFF never expires, and 0x0000 would be single-mode. The round-13
+2 s re-arm watchdog is REMOVED — with a never-expiring window there is
+nothing to re-arm, and its SetRx + ClearIrq(0xFFFF) raced latched RxDone
+words and churned the FEM pins.
+
+**Raw FIFO read.** `read_packet` no longer calls RadioLib `readData()`
+(which standby()s the chip on EVERY packet and drives the RF switch to
+MODE_IDLE — both FEM pins LOW, antenna disconnected — verified in RadioLib
+SX128x.cpp `readData -> standby -> setRfSwitchState`). The raw path reads
+the FIFO without leaving RX: `GetRxBufferStatus(0x17)` → `ReadBuffer(0x1B,
+rxStartBufferPointer)` → `GetPacketStatus(0x1D)`, decoding RSSI/SNR with
+RadioLib's exact formulas (LoRa: RssiSync=ps[0], SNR-adjusted; FLRC:
+ps[1], SNR 0), then `ClearIrqStatus(0x97)` with **RX_DONE only** — error
+flags stay latched for the swerr diff poll (RadioLib cleared all). Our code
+is now the only owner of the FEM switch pins (written only in `begin()` and
+`start_rx`). The RX loop is: [DIO1 ISR] → raw status/buffer/packet-status
+read → parse → (chip still in continuous RX, antenna still connected) →
+next. Behavioral side effect: frames that fail the FLRC seeded radio CRC
+now flow to the parser as unvalidated instead of being dropped invisible
+(presence metrics gain them).
+
+**TX power safety.** `begin()` caps the PA at `setOutputPower(3)` (RadioLib
+default is 10 dBm). RX-only today, but a future TX experiment stays within
+LilyGo's H658 FEM input limit (<= 5 dBm).
+
+The `T` reference baseline intentionally keeps the STOCK RadioLib
+`startReceive()`/`readData()` path — that is its purpose (known-good
+comparison); it is not part of the sweep RX path. Host test 18r pins the
+SetRx sentinel bytes, the raw-read opcodes/order, and the packet-status
+decode math.
+
 ## Round 13: standby-first dwell config (smoking gun)
 
 `dwell_setup` dbg now reports `{rate,sf,bw,cr,cm_before,cm_after,raw}` —
