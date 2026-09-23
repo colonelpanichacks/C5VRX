@@ -924,13 +924,15 @@ _pres_window = []             # [(mono, tail, rssi, rate)] recent sync_frames
 _last_frame = {}              # latest sync_frame's rate/rssi (uid45 context)
 
 
-def _pres_open_locked(uid: str, rate: str, rssi) -> None:
+def _pres_open_locked(uid: str, rate: str, rssi,
+                      lock_type: str = "elrs-presence") -> None:
     """Caller holds _elrs_ep_lock."""
     global PRES_EP
     geo = _geo_current()
     PRES_EP = {
         "start": time.time(),
         "uid": uid or "",
+        "lock_type": lock_type,
         "channel": str(rate or "-"),
         "peak": rssi, "min": rssi,
         "sum": float(rssi) if isinstance(rssi, (int, float)) else 0.0,
@@ -948,7 +950,8 @@ def _pres_close_locked(reason: str) -> None:
     if ep is None:
         return
     PRES_EP = None
-    _elrs_ep_write_locked(ep, reason, "elrs-presence", ep["uid"])
+    _elrs_ep_write_locked(ep, reason,
+                          ep.get("lock_type") or "elrs-presence", ep["uid"])
     _presence_publish_locked()
 
 
@@ -1024,6 +1027,23 @@ def _presence_tick_locked(obj: dict) -> None:
         elif not locked:
             _pres_open_locked(uid, _last_frame.get("rate"),
                               _last_frame.get("rssi"))
+        _presence_publish_locked()
+    elif (t == "event" and (obj.get("what") == "uid_found" or
+                            (obj.get("what") == "uid" and
+                             obj.get("src") == "bind"))) or \
+            (t == "uid" and obj.get("src") == "bind"):
+        # Bind capture is a confirmed drone transmission (round-7): its own
+        # detection row, lock_type "elrs-bind", when no lock row owns it.
+        hexs = str(obj.get("uid") or "").replace(" ", "")
+        uid = "bind:" + (hexs[-6:] if len(hexs) >= 6 else "?")
+        if PRES_EP is not None:
+            PRES_EP["uid"] = uid
+            PRES_EP["lock_type"] = "elrs-bind"   # upgrade: confirmed bind
+            _pres_refresh_locked(obj.get("rate") or _last_frame.get("rate"),
+                                 obj.get("rssi"), now)
+        elif not locked:
+            _pres_open_locked(uid, obj.get("rate") or _last_frame.get("rate"),
+                              obj.get("rssi"), lock_type="elrs-bind")
         _presence_publish_locked()
 
 
@@ -1573,6 +1593,8 @@ class ElrsState:
         self.last_frame_ts = None  # monotonic of the latest sync_frame
         self.uid45 = None        # (payload, monotonic) latest uid45 event
         self.presence = None     # live presence-episode line for the FIND panel
+        self.bind_uid = None     # (payload, monotonic) latest bind capture
+        self.fastlink = None     # (state, monotonic) latest fastlink event
 
     def update(self, obj: dict) -> None:
         now = time.monotonic()
@@ -1629,17 +1651,28 @@ class ElrsState:
                                     self.rssi_now if self.rssi_now is not None
                                     else self.rssi,
                                     band, validated, now)
-                if t == "event" and obj.get("what") == "uid":
+                if (t == "event" and obj.get("what") == "uid") or t == "uid":
                     # Bind-phrase source: stored|set|default (dashboard hints +
-                    # apply feedback). The phrase-derived tail identifies "our"
-                    # link among heard neighbors before any air traffic.
+                    # apply feedback); round-7 adds src "bind" (auto-adopted
+                    # from a TX bind burst). The phrase-derived/adopted tail
+                    # identifies "our" link among heard neighbors. Accepts both
+                    # the spaced and the contiguous uid hex form.
                     self.uid_src = obj.get("src")
                     self.uid_full = obj.get("uid")
-                    parts = str(obj.get("uid") or "").split()
-                    if len(parts) == 6:
-                        self.uid = "".join(parts[3:])
+                    hexs = str(obj.get("uid") or "").replace(" ", "")
+                    if len(hexs) >= 12:
+                        self.uid = hexs[-6:]
                     if obj.get("src") == "set":
                         self.uid_set_time = now
+                    if obj.get("src") == "bind":
+                        self._bind_capture(obj, now)
+                if t == "event" and obj.get("what") == "uid_found":
+                    # TX bind burst leaked UID[2..5] (round-7). UID[0..1] are
+                    # never broadcast — the UI must render them as "?? ??".
+                    self._bind_capture(obj, now)
+                if t == "event" and obj.get("what") == "fastlink":
+                    # 60 s boot window trying the last-known UID (round-7).
+                    self.fastlink = (obj.get("state"), now)
                 if t == "event" and obj.get("what") == "flrc_sync":
                     # FLRC phrase-check line: uid_pkt is an air-heard tail
                     # (counted even when never adopted); tail_src says how the
@@ -1684,6 +1717,19 @@ class ElrsState:
         if len(self.tails) > 16:
             oldest = min(self.tails, key=lambda k: self.tails[k]["ts"])
             del self.tails[oldest]
+
+    def _bind_capture(self, obj: dict, now: float) -> None:
+        """Caller holds self.lock. A TX bind burst leaked UID[2..5] and the
+        firmware auto-adopts it: the tail becomes our own-uid reference
+        (green ring) and a 'bind'-validated tails chip."""
+        hexs = str(obj.get("uid") or "").replace(" ", "")
+        tail = hexs[-6:] if len(hexs) >= 6 else None
+        self.bind_uid = ({"uid": hexs, "uid_tail": tail,
+                          "rssi": obj.get("rssi"), "freq": obj.get("freq"),
+                          "src": obj.get("src") or "bind"}, now)
+        if tail:
+            self.uid = tail
+            self._note_tail(tail, obj.get("rssi"), None, "bind", now)
 
     def _note_frame(self, obj: dict, now: float) -> None:
         """Caller holds self.lock. sync_frame capture (round-6): counters per
@@ -1730,6 +1776,9 @@ class ElrsState:
                        **{k: v for k, v in uid45[0].items() if k != "t"}}),
             "presence": (None if self.presence is None
                          else dict(self.presence)),
+            "bind": (None if self.bind_uid is None else
+                     {"age_s": round(now - self.bind_uid[1], 1),
+                      **self.bind_uid[0]}),
             "crackable": (uniq["flrc"] >= 1 or uniq["lora"] >= 1) and
                          not uid_known,
         }
@@ -1758,6 +1807,9 @@ class ElrsState:
                 "mode": self.mode,
                 "crack_state": self.crack_state,
                 "sync_only": self.sync_only,
+                "fastlink": bool(self.fastlink
+                                 and self.fastlink[0] == "start"
+                                 and now - self.fastlink[1] < 70),
                 "find": self.find_snapshot(now),
                 "crack": (None if self.crack_ev is None else
                           {"age_s": round(now - self.crack_ev[1], 1),
@@ -2201,14 +2253,15 @@ PAGE = """<!DOCTYPE html>
   /* Event color code: sync/flrc_sync cyan, lock green, unlock/linkstats
      amber, aircraft telemetry white, OSINT events magenta, errors red. */
   .evl.k-sync .etag, .evl.k-flrc_sync .etag,
-  .evl.k-modelId .etag { color:#31c8ff; }
+  .evl.k-modelId .etag, .evl.k-fastlink .etag { color:#31c8ff; }
   .evl.k-sync.flrc .etag { color:#ff3ac8; }  /* structural FLRC sync = OSINT */
   .evl.k-lock .etag { color:var(--grn); }
   .evl.k-unlock .etag, .evl.k-linkstats .etag { color:var(--amb); }
   .evl.k-gps .etag, .evl.k-batt .etag, .evl.k-atti .etag,
   .evl.k-fm .etag { color:var(--txt); }
   .evl.k-fp .etag, .evl.k-uid_cracked .etag, .evl.k-uid2_crack .etag,
-  .evl.k-uid2_crack_failed .etag, .evl.k-crack .etag { color:#ff3ac8; }
+  .evl.k-uid2_crack_failed .etag, .evl.k-crack .etag,
+  .evl.k-uid_found .etag { color:#ff3ac8; }
   .evl.k-error .etag { color:var(--red); }
   .evl .eage { color:var(--dim); margin-left:5px; }
   /* ELRS tab: gauges on top, sparkline middle, intel + log bottom. */
@@ -2245,6 +2298,8 @@ PAGE = """<!DOCTYPE html>
   .ebadge.lock { color:var(--grn); border-color:var(--grn);
                  text-shadow:0 0 6px rgba(57,255,106,.6); }
   .ebadge.sweep { color:var(--amb); border-color:var(--amb); }
+  .ebadge.flink { color:var(--amb); border-color:var(--amb); }
+  #xfastlink { flex:0 0 74px; box-sizing:border-box; text-align:center; }
   .followb { flex:0 0 auto; min-width:196px; box-sizing:border-box;
              display:inline-block; text-align:center;
              padding:0 8px; border-radius:3px; border:1px solid #31c8ff;
@@ -2572,6 +2627,7 @@ PAGE = """<!DOCTYPE html>
     .egauge b { font-size:1.3rem; }
     .etlm { grid-template-columns:repeat(2,1fr); gap:6px; padding:6px 10px; }
     #elinkhdr { gap:8px; padding:0 12px; font-size:.6rem; }
+    #xfastlink { display:none; }
     .followb { min-width:160px; }
     #ecrack { gap:5px; padding:0 12px; font-size:.5rem; }
     #ecrack .ckst { padding:2px 5px; }
@@ -2704,6 +2760,8 @@ PAGE = """<!DOCTYPE html>
     <span id="xedot"></span>
     <span id="xehinfo">--</span>
     <span id="xelockb" class="ebadge">--</span>
+    <span id="xfastlink" class="ebadge flink" style="visibility:hidden"
+          title="boot window: trying the last-known UID first">FASTLINK</span>
     <span class="esp"></span>
     <span id="xeuidwrap"></span>
     <span id="xearm" class="armb" style="visibility:hidden">ARMED</span>
@@ -3346,6 +3404,13 @@ function stickHtml(ch, lock) {
       '%;width:' + w.toFixed(1) + '%"></div></div><b>' + (us || '----') + '</b></div>';
   }).join('');
 }
+/* Bind-captured UIDs: UID[0..1] are never broadcast — render them as
+   literal "?? ??" and only ever show the received bytes 2..5. Never invent
+   the first two bytes. */
+function maskBindUid(uid) {
+  const p = String(uid || '').replace(/\\s+/g, '').match(/../g) || [];
+  return '?? ??' + (p.length > 2 ? ' ' + p.slice(2).join(' ') : '');
+}
 /* Detail text per event type for the ticker/log (the colored tag carries
    the type name). Unknown types degrade to a JSON shrug, per protocol. */
 function fmtEv(ev) {
@@ -3404,7 +3469,13 @@ function fmtEv(ev) {
         case 'uid2_crack': return 'uid2=' + ev.uid2 + ' valids=' + ev.valids;
         case 'uid_cracked': return 'UID=' + (ev.uid || '?');
         case 'uid2_crack_failed': return 'UID[2] candidates exhausted';
-        case 'uid': return 'bind phrase applied';
+        case 'uid': return 'bind phrase applied' +
+                          (ev.src === 'bind' ? ' (bind burst)' : '');
+        case 'uid_found': return 'BIND uid=' + maskBindUid(ev.uid) +
+                          (ev.rssi !== undefined && ev.rssi !== null ?
+                            ' rssi=' + ev.rssi : '') +
+                          (ev.freq ? ' ' + (ev.freq / 1e6).toFixed(1) + 'MHz' : '');
+        case 'fastlink': return 'fastlink ' + (ev.state || '?');
         default: return ev.what || '';
       }
     default: return '';
@@ -3619,6 +3690,17 @@ function updElrsFind(e, set, job) {
     idEl.className = 'err';
     idEl.textContent = 'crack: ' + job.error;
     applyBtn.style.visibility = 'hidden';
+  } else if (f && f.bind && f.bind.uid_tail) {
+    // Round-7 bind capture: UID[2..5] leaked by a TX bind burst. UID[0..1]
+    // are never broadcast -- always mask them. Firmware auto-adopts the UID,
+    // so there is no apply button; once the lock/identity follows we switch
+    // to FOLLOWING.
+    const followed = !!(e.lock && !e.sync_only) || e.crack_state === 'cracked';
+    idEl.className = 'found';
+    idEl.textContent = (followed ? 'FOLLOWING ' : 'UID CAPTURED (bind) ') +
+      maskBindUid(f.bind.uid) +
+      (typeof f.bind.rssi === 'number' ? ' · ' + f.bind.rssi + 'dBm' : '');
+    applyBtn.style.visibility = 'hidden';
   } else if (f && f.uid45) {
     const u = f.uid45;
     idEl.className = '';
@@ -3766,6 +3848,8 @@ function updElrs(e, set) {
   lb.className = 'ebadge ' + (on ? (e.lock ? 'lock' : 'sweep') : 'off');
   document.getElementById('xearm').style.visibility =
     on && e.arm ? 'visible' : 'hidden';
+  document.getElementById('xfastlink').style.visibility =
+    on && e.fastlink ? 'visible' : 'hidden';
   const fp = e.uid ? 'elrs:' + String(e.uid).toLowerCase() : null;
   document.getElementById('xeuidwrap').innerHTML = on && fp ?
     droneChip(fp, 'elrs:' + e.uid) : '';
