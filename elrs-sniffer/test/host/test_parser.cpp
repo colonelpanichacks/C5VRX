@@ -503,6 +503,57 @@ int main()
     }
     printf("ok: multi-UID sync validation (default-phrase seed)\n");
 
+    // 14d) SELF-SEEDED SYNC VALIDATOR: construct real ELRS OTA4 sync frames
+    //     (pick UID, modelId, nonce/fhss/rate; CRC14 per the reference) and
+    //     assert acceptance + true UID5 + modelId recovery, model match ON
+    //     and OFF. Zero prior knowledge — the seed comes from the frame.
+    {
+        // model match ON: modelId=37 -> on-air UID5 = UID5 ^ (~37 & 0x3f)
+        const uint8_t UID3 = 0x61, UID4 = 0xac, UID5 = 0xe1, MODEL = 37;
+        uint8_t pkt[ELRS_OTA4_LEN] = { ELRS_PKT_SYNC, 42, 200, (6 << 4), 0, 0, 0 };
+        pkt[4] = UID3;
+        pkt[5] = UID4;
+        pkt[6] = (uint8_t)(UID5 ^ (~MODEL & 0x3f));
+        uint16_t init = elrs_crc_init_from_uid(UID4, UID5); // seed from TRUE uid
+        uint16_t crc = elrs_crc14(pkt, 7, init);
+        pkt[0] |= (uint8_t)((crc >> 8) << 2);
+        pkt[7] = (uint8_t)(crc & 0xFF);
+        uint16_t got_init; uint8_t got_u5, got_model;
+        assert(elrs_sync_crc_selfseed(pkt, ELRS_OTA4_LEN, &got_init, &got_u5, &got_model));
+        assert(got_init == init);
+        assert(got_u5 == UID5);      // XOR removed
+        assert(got_model == MODEL);  // modelId recovered
+        // and via the full decoder: identity/uid carry the true tail
+        elrs_decode_ctx_t ctx; elrs_decode_init(&ctx);
+        elrs_packet_t out;
+        assert(elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out));
+        assert(out.cls == ELRS_PKT_CLASS_CRC_OK);
+        assert(ctx.uid5 == UID5 && ctx.model_id == MODEL);
+    }
+    {
+        // model match OFF: on-air UID5 = UID5; modelId must report 0xFF
+        const uint8_t UID3 = 0x2f, UID4 = 0xb1, UID5 = 0x39;
+        uint8_t pkt[ELRS_OTA4_LEN] = { ELRS_PKT_SYNC, 7, 3, (9 << 4), 0, 0, 0 };
+        pkt[4] = UID3; pkt[5] = UID4; pkt[6] = UID5;
+        uint16_t init = elrs_crc_init_from_uid(UID4, UID5);
+        uint16_t crc = elrs_crc14(pkt, 7, init);
+        pkt[0] |= (uint8_t)((crc >> 8) << 2);
+        pkt[7] = (uint8_t)(crc & 0xFF);
+        uint16_t got_init; uint8_t got_u5, got_model;
+        assert(elrs_sync_crc_selfseed(pkt, ELRS_OTA4_LEN, &got_init, &got_u5, &got_model));
+        assert(got_u5 == UID5 && got_model == 0xFF);
+        // rateIdx=9 (LoRa50) must NOT be rejected (4-bit link rate, valid)
+        elrs_identity_t id; elrs_identity_reset(&id);
+        elrs_sync_info_t s;
+        memset(&s, 0, sizeof(s));
+        s.uid3 = UID3; s.uid4 = UID4; s.uid5 = UID5; s.rate_index = 9;
+        s.nonce = 1; s.fhss_index = 0; s.tlm_ratio = 2;
+        elrs_identity_consider(&id, &s, 2);
+        s.nonce = 2;
+        assert(elrs_identity_consider(&id, &s, 2)); // accepted, rateIdx 9 sane
+    }
+    printf("ok: self-seeded sync validator (modelId on/off, rateIdx 9)\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

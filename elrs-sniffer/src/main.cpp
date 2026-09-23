@@ -27,6 +27,8 @@
 #define AWAIT_PKT_MS 3000u        // packets-for-this-long-without-sync = patient
 #define AWAIT_LOG_MS 5000u        // awaiting_sync heartbeat interval
 #define DWELL_WATCHDOG_GRACE_MS 2000u // wedged dwell -> restart + advance
+#define TRAP_RSSI_DB -80             // strong-energy-but-zero-decode cut
+
 #define RSSI_SAMPLE_MS 200u        // <=5 Hz live energy sampling
 #define RSSI_MAX_FAILS 3           // consecutive SPI errors -> stop for this dwell
 #define PKT_DEBUG_MIN_MS 500u      // sync-first debug line rate limit (2/s)
@@ -71,6 +73,7 @@ static uint32_t dwell_len_ms;      // current adaptive dwell length
 static uint32_t dwell_pkts;        // classified packets this dwell
 static uint32_t dwell_first_pkt_ms;
 static uint32_t last_await_log_ms;
+static bool g_tried_twin; // current dwell came from an IQ-twin jump
 static uint8_t last_good_step;     // re-enter here after a lock drops
 static bool sampling_enabled;   // per-dwell; cleared after RSSI_MAX_FAILS errors
 static uint8_t sample_fails;
@@ -339,6 +342,7 @@ static void dwell_begin(uint8_t i)
     dwell_rx = dwell_crc_ok = dwell_rc = dwell_msp = dwell_sync = dwell_tlm = dwell_unk = 0;
     sampling_enabled = true;
     sample_fails = 0;
+    g_tried_twin = false;
     if (s.rate->flrc) {
         // BUG 2: FLRC discovery for unknown UID — unless this link is already
         // cracked, dwell in discovery (no sync-word match, CRC off) waiting
@@ -418,6 +422,12 @@ static void on_sync(const elrs_packet_t &pkt)
                   pkt.sync.fhss_index, pkt.sync.nonce,
                   pkt.sync.rate_index, pkt.sync.switch_mode, pkt.sync.tlm_ratio,
                   pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5);
+    if (good && dctx.uid_known && pkt.sync.uid3 == dctx.uid3 &&
+        pkt.sync.uid4 == dctx.uid4) {
+        // recovered ELRS modelId rides on the validated sync (0xFF = off)
+        Serial.printf("{\"t\":\"event\",\"what\":\"modelId\",\"id\":%u}\n",
+                      (unsigned)dctx.model_id);
+    }
     if (!good) return;
     // Identity gate: even a CRC-validated sync (a chance 2^-14 hit against
     // some init) only locks after 2 consecutive same-tail syncs with sane
@@ -433,6 +443,11 @@ static void on_sync(const elrs_packet_t &pkt)
         if (!was_known) crack_emit("identity");
     }
     last_good_step = step_idx; // sweep re-enters here first after a drop
+    if (pkt.sync.rate_index <= 9 &&
+        pkt.sync.rate_index != sweep.steps[step_idx].rate->rate_index) {
+        Serial.printf("{\"t\":\"event\",\"what\":\"rate_hint\",\"rateIdx\":%u,\"dwellIdx\":%u}\n",
+                      pkt.sync.rate_index, sweep.steps[step_idx].rate->rate_index);
+    }
     emit_fingerprint("lora");
     conn_on_sync(pkt);
     if (g_crack && g_crack_flrc) { // strong LoRa lock beats an FLRC crack
@@ -1109,9 +1124,11 @@ void loop()
                                      pkt.sync.uid4 == g_uid[4] &&
                                      pkt.sync.uid5 == g_uid[5];
                         Serial.printf("{\"t\":\"event\",\"what\":\"flrc_sync\","
-                                      "\"uid_pkt\":\"%02x%02x%02x\",\"uid_phrase\":\"%02x%02x%02x\",\"match\":%u}\n",
+                                      "\"uid_pkt\":\"%02x%02x%02x\",\"uid_phrase\":\"%02x%02x%02x\",\"match\":%u,"
+                                      "\"tail_src\":\"%s\"}\n",
                                       pkt.sync.uid3, pkt.sync.uid4, pkt.sync.uid5,
-                                      g_uid[3], g_uid[4], g_uid[5], match ? 1 : 0);
+                                      g_uid[3], g_uid[4], g_uid[5], match ? 1 : 0,
+                                      g_radio.flrcDiscovery() ? "structural" : "syncword+crc24");
                         // Identity gate (same rule as LoRa): 2 consecutive
                         // same-tail sane syncs required — discovery mode
                         // admits garbage, and chance hits must not lock.
@@ -1174,18 +1191,44 @@ void loop()
 
         const sniffer_step_t &cur = sweep.steps[step_idx];
         if (!locked) {
-            // adaptive dwell: extend only when packets actually demodulated
-            // since dwell start — pure RSSI leakage (strong FLRC seen by
-            // wrong-mode LoRa dwells) gets NO extension, so wrong modes stay
-            // cheap (2 s). FLRC discovery extends only on CLASSIFIED packets
-            // (no-sync/CRC-off demods plenty of junk bursts).
+            // Adaptive dwell, IQ-trap safe: extension requires VALIDATED or
+            // SYNC-classified packets (junk rc/msp never extends — the field
+            // trap was strong RSSI + rx junk extending a dead dwell to 24 s).
+            // FLRC discovery extends only on classified SYNCES (its no-sync /
+            // CRC-off mode floods junk 'msp' demods). A hot-but-dead dwell
+            // (rssi > TRAP_RSSI_DB, zero validated/sync) jumps straight to
+            // the TWIN IQ step of the same rate — the highest-value next
+            // step, since ~half of all bound links run inverted IQ.
             if (millis() - step_entered_ms > dwell_len_ms) {
-                bool active = cur.rate->flrc ? (dwell_pkts > 0) : (dwell_rx > 0);
-                if (active && dwell_len_ms < DWELL_MAX_MS) {
+                bool any_valid = cur.rate->flrc
+                                     ? (dwell_sync > 0)
+                                     : (dwell_crc_ok > 0 || dwell_sync > 0);
+                bool hot_dead = dwell_rssi_max > TRAP_RSSI_DB && !any_valid;
+                if (any_valid && dwell_len_ms < DWELL_MAX_MS) {
                     dwell_len_ms += DWELL_CHUNK_MS;
                     Serial.printf("{\"t\":\"dwell_ext\",\"rate\":\"%s\",\"iq\":\"%c\",\"rssi_max\":%d,\"dwell_ms\":%u}\n",
                                   cur.rate->name, cur.iq_inverted ? 'i' : 'n',
                                   (int)dwell_rssi_max, dwell_len_ms);
+                } else if (hot_dead && !g_tried_twin && g_park_step < 0) {
+                    int twin = -1;
+                    for (uint8_t i = 0; i < sweep.count; i++) {
+                        const sniffer_step_t &s = sweep.steps[i];
+                        if (s.rate == cur.rate && s.legacy_2x == cur.legacy_2x &&
+                            s.iq_inverted != cur.iq_inverted) { twin = i; break; }
+                    }
+                    if (twin >= 0) {
+                        Serial.printf("{\"t\":\"dwell\",\"step\":%d,\"rate\":\"%s\",\"iq\":\"%c\",\"legacy\":%u,\"rssi_max\":%d,\"rx\":%lu,\"crc_ok\":%lu,\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},\"jump\":\"iq-twin\"}\n",
+                                      step_idx, cur.rate->name, cur.iq_inverted ? 'i' : 'n',
+                                      cur.legacy_2x ? 1 : 0, (int)dwell_rssi_max,
+                                      (unsigned long)dwell_rx, (unsigned long)dwell_crc_ok,
+                                      (unsigned long)dwell_rc, (unsigned long)dwell_msp,
+                                      (unsigned long)dwell_sync, (unsigned long)dwell_tlm,
+                                      (unsigned long)dwell_unk);
+                        dwell_begin((uint8_t)twin);
+                        g_tried_twin = true;
+                    } else if (g_park_step < 0) {
+                        dwell_advance();
+                    }
                 } else if (g_park_step < 0) {
                     dwell_advance(); // parked (R <step>): stay seated
                 }

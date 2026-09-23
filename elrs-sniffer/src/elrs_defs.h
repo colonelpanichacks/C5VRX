@@ -46,6 +46,10 @@
 // Source: OTA.h OTA_Sync_s; OTA.cpp OtaUpdateCrcInitFromUid().
 // ---------------------------------------------------------------------------
 #define ELRS_UID_LEN 6u
+// Model-match XOR mask for sync UID5 (OTA.h MODELMATCH_MASK): with model
+// match on, sync.UID5 on air = UID[5] ^ (~modelId & 0x3f) -> 64 candidates.
+#define ELRS_MODELMATCH_MASK 0x3F
+
 // Default bind phrase ("ExpressLRS") UID tail — used as a secondary CRC-init
 // seed so syncs validate even when the board's configured phrase differs
 // (multi-UID field: neighbors on stock + the operator's custom phrase).

@@ -79,6 +79,7 @@ typedef struct {
     // the app after every bind-phrase change (multi-UID sync validation)
     uint8_t  cfg_uid4, cfg_uid5;
     bool     cfg_uid_valid;
+    uint8_t  model_id;      // recovered ELRS modelId (0xFF = model match off/none)
     bool     uid_known;
     uint8_t  uid3, uid4, uid5;
     uint8_t  switch_mode;       // ELRS_SW_* from sync packet (best guess if none)
@@ -124,6 +125,20 @@ typedef struct {
     uint8_t last_fhss;
     bool known;             // identity accepted (count reached 2)
 } elrs_identity_t;
+
+// PRIMARY LoRa sync validator, zero prior knowledge (ELRS 3.6.4 facts):
+// OTA4 sync [0]=type|crcHigh [1]=fhss [2]=nonce [3]=sw|tlm|rate [4..6]=UID3..5
+// (UID5 XORed (~modelId & 0x3f) when model match is on) [7]=crcLow. CRC14
+// poly 0x2E57, init = ((UID4<<8)|UID5) ^ 3 over bytes 0..6, inCRC =
+// (byte0>>2)<<8 | byte7. The seed is self-derivable: read b5/b6 as candidate
+// UID4/UID5, compute the seed FROM THE FRAME, validate; then sweep modelId
+// 0..63 (UID5' = UID5 ^ (~m & 0x3f), recompute seed+CRC) to recover the true
+// UID5 + modelId. Works for OTA8 (CRC16) identically (same init formula).
+// Returns true on acceptance; fills init_out, uid5_true_out, and
+// model_id_out (0xFF = no model-match XOR needed/disabled).
+bool elrs_sync_crc_selfseed(const uint8_t *data, size_t len,
+                            uint16_t *init_out, uint8_t *uid5_true_out,
+                            uint8_t *model_id_out);
 
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only

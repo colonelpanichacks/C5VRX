@@ -280,6 +280,38 @@ void elrs_decode_tlm_fragment(elrs_decode_ctx_t *ctx, uint8_t package_index,
     }
 }
 
+bool elrs_sync_crc_selfseed(const uint8_t *data, size_t len,
+                            uint16_t *init_out, uint8_t *uid5_true_out,
+                            uint8_t *model_id_out)
+{
+    const bool is8 = (len == ELRS_OTA8_LEN);
+    const uint8_t pkt_uid4 = data[5];
+    const uint8_t pkt_uid5 = data[6];
+
+    // pass 1: seed derived from the frame's own bytes (model match OFF)
+    uint16_t init = elrs_crc_init_from_uid(pkt_uid4, pkt_uid5);
+    if (is8 ? ota8_crc_ok(data, init) : ota4_crc_ok(data, init, 0)) {
+        *init_out = init;
+        *uid5_true_out = pkt_uid5;
+        *model_id_out = 0xFF;
+        return true;
+    }
+    // pass 2: modelId sweep 0..63 — UID5' = UID5 ^ (~m & 0x3f), recompute
+    // seed+CRC; a hit recovers the true UID5 and the modelId
+    for (uint8_t m = 0; m < 64; m++) {
+        uint8_t uid5_true = (uint8_t)(pkt_uid5 ^ (uint8_t)(~m & ELRS_MODELMATCH_MASK));
+        uint16_t cand = elrs_crc_init_from_uid(pkt_uid4, uid5_true);
+        if (cand == init) continue;
+        if (is8 ? ota8_crc_ok(data, cand) : ota4_crc_ok(data, cand, 0)) {
+            *init_out = cand;
+            *uid5_true_out = uid5_true;
+            *model_id_out = m;
+            return true;
+        }
+    }
+    return false;
+}
+
 // --- main entry ---
 
 bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
@@ -310,24 +342,19 @@ bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
         uint16_t derived = elrs_crc_init_from_uid(data[5], data[6]);
         uint16_t init = 0;
         bool got = false;
+        uint8_t uid5_true = data[6];
+        uint8_t model_id = 0xFF;
         if (ctx->crc_init_known &&
             (is8 ? ota8_crc_ok(data, ctx->crc_init) : ota4_crc_ok(data, ctx->crc_init, 0))) {
             init = ctx->crc_init; got = true;
-        } else if (is8 ? ota8_crc_ok(data, derived) : ota4_crc_ok(data, derived, 0)) {
-            init = derived; got = true;
+        } else if (elrs_sync_crc_selfseed(data, len, &init, &uid5_true, &model_id)) {
+            got = true; // PRIMARY: zero-prior-knowledge self-seeded validation
         } else {
-            for (uint8_t m = 0; m < 64 && !got; m++) {
-                uint16_t cand = (uint16_t)((((uint16_t)data[5] << 8) | (uint16_t)(data[6] ^ m)) ^ ELRS_OTA_VERSION_ID_3X);
-                if (cand == derived) continue;
-                if (is8 ? ota8_crc_ok(data, cand) : ota4_crc_ok(data, cand, 0)) {
-                    init = cand; got = true;
-                }
-            }
-            // multi-UID validation: ALSO seed from the configured phrase UID
-            // and the default-phrase UID (two cheap passes each: derived +
-            // the 64 model-match XOR variants) — covers a neighbor on stock
-            // defaults while the board is configured for a custom phrase.
-            if (!got && ctx->cfg_uid_valid) {
+            // multi-UID fast paths: seed from the configured phrase UID and
+            // the default-phrase UID (derived + 64 model-match variants
+            // each) — covers neighbors while the board is configured for a
+            // custom phrase.
+            if (ctx->cfg_uid_valid) {
                 for (uint8_t m = 0; m < 64 && !got; m++) {
                     uint16_t cand = (uint16_t)((((uint16_t)ctx->cfg_uid4 << 8) |
                                                 (uint16_t)(ctx->cfg_uid5 ^ m)) ^ ELRS_OTA_VERSION_ID_3X);
@@ -357,7 +384,8 @@ bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
         if (got && !ctx->uid_known) {
             ctx->uid3 = data[4];
             ctx->uid4 = data[5];
-            ctx->uid5 = (uint8_t)((init ^ ELRS_OTA_VERSION_ID_3X) & 0xFF); // recovered TRUE UID[5]
+            ctx->uid5 = uid5_true; // TRUE UID[5] (model-match XOR removed)
+            ctx->model_id = model_id; // 0xFF = model match off/none
             ctx->uid_known = true;
         }
     } else if (ctx->crc_init_known) {

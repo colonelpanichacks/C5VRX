@@ -54,6 +54,10 @@ are patient:
 {"t":"dwell","step":0,"rate":"LoRa 250Hz","iq":"n","legacy":0,"rssi_max":-71,
  "rx":14,"crc_ok":11,"types":{"rc":11,"msp":0,"sync":0,"tlm":0,"unk":3}}
 {"t":"dwell_ext","rate":"LoRa 250Hz","iq":"n","rssi_max":-69,"dwell_ms":4000}
+
+A dwell line may carry `"jump":"iq-twin"` — the dwell was hot-but-dead
+(strong RSSI, zero validated/sync packets) and the sweep jumped straight
+to the other IQ polarity of the same rate instead of advancing.
 {"t":"event","what":"awaiting_sync","rate":"LoRa 250Hz","iq":"n"}
 ```
 `rx` = raw RxDone in the dwell; `crc_ok` = ELRS-CRC-validated; `types`
