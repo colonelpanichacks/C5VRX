@@ -45,7 +45,9 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -1299,6 +1301,102 @@ ELRS_TLM_TYPES = ("gps", "batt", "atti", "fm", "tlm", "linkstats", "sync")
 ELRS_WRITE_MIN_INTERVAL_S = 0.5  # console command rate limit (U/R/P/D/V)
 ELRS_PHRASE_MAX = 64             # bind-phrase input cap
 
+# Host-side bind-phrase cracking (round-6 passive discovery): captured
+# sync_frame packets are appended to a temp JSONL as they arrive; the CRACK
+# button (POST /api/elrs/crack) runs elrs-sniffer/tools/phrase_crack.py
+# against it. Lazy by design — nothing cracks without a user click.
+SYNC_FRAMES_JSONL = Path(tempfile.gettempdir()) / "c5vrx_sync_frames.jsonl"
+SYNC_FRAMES_MAX_BYTES = 4 * 1024 * 1024   # fold oldest beyond this
+PHRASE_CRACK = (Path(__file__).resolve().parent.parent
+                / "elrs-sniffer" / "tools" / "phrase_crack.py")
+CRACK_TIMEOUT_S = 180
+_frames_log_lock = threading.Lock()
+
+
+def _frames_log(obj: dict) -> None:
+    """Append one captured sync_frame to the cracker JSONL (never on a hot
+    path: firmware throttles these to ~4/s)."""
+    line = {k: v for k, v in obj.items() if k != "t"}
+    with _frames_log_lock:
+        try:
+            with open(SYNC_FRAMES_JSONL, "a") as f:
+                f.write(json.dumps(line) + "\n")
+            if SYNC_FRAMES_JSONL.stat().st_size > SYNC_FRAMES_MAX_BYTES:
+                lines = SYNC_FRAMES_JSONL.read_text().splitlines()[-2000:]
+                SYNC_FRAMES_JSONL.write_text("\n".join(lines) + "\n")
+        except OSError:
+            pass
+
+
+def _crack_parse_phrase(line: str):
+    """Tolerant success parser for phrase_crack output: the classic
+    'uid <- '<phrase>' (tag)' MATCHES line, a round-6 JSON line, or a plain
+    'phrase: <x>' line."""
+    s = line.strip()
+    if s.startswith("{"):
+        try:
+            p = json.loads(s).get("phrase")
+            if isinstance(p, str) and p:
+                return p
+        except ValueError:
+            pass
+    m = re.search(r"<-\s+'([^']+)'", s) or re.search(r'<-\s+"([^"]+)"', s)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?i)\bphrase[:=]\s+(.+)$", s)
+    if m:
+        return m.group(1).strip().strip("'\"")
+    return None
+
+
+_crack_job_lock = threading.Lock()
+_crack_job = {"running": False, "done": False, "error": None, "phrase": None,
+              "lines": [], "started": None}
+
+
+def _crack_worker() -> None:
+    lines, phrase, error = [], None, None
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(PHRASE_CRACK), "--frames",
+             str(SYNC_FRAMES_JSONL)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            bufsize=1)
+    except OSError as exc:
+        proc, error = None, str(exc)
+    if proc is not None:
+        # Hard timeout via kill timer: the blocking readline below wakes on
+        # EOF when the timer kills the process, so a hung cracker cannot
+        # pin the job forever.
+        timed_out = []
+        timer = threading.Timer(CRACK_TIMEOUT_S,
+                                lambda: (timed_out.append(1), proc.kill()))
+        timer.start()
+        try:
+            for raw in proc.stdout or ():
+                line = raw.rstrip()
+                with _crack_job_lock:
+                    _crack_job["lines"].append(line)
+                    del _crack_job["lines"][:-120]
+                lines = _crack_job["lines"]
+                p = _crack_parse_phrase(line)
+                if p:
+                    phrase = p
+            proc.wait()
+        finally:
+            timer.cancel()
+        if timed_out:
+            error = "timeout after %ds" % CRACK_TIMEOUT_S
+        elif phrase is None and proc.returncode:
+            error = "cracker exit %d (no match)" % proc.returncode
+        elif phrase is None and not any("MATCH" in l or "match" in l
+                                        for l in lines):
+            error = "no match"
+    with _crack_job_lock:
+        _crack_job.update(running=False, done=True, error=error,
+                          phrase=phrase)
+
+
 
 class ElrsState:
     """Latest ELRS link state + telemetry, mutated only by ElrsManager."""
@@ -1334,6 +1432,12 @@ class ElrsState:
         self.uid_set_time = None  # monotonic of the last src=="set" uid event
         self.last_sync = None    # (payload, monotonic) latest t=="sync" line
         self.tails = {}          # uid tail hex -> {count, rssi, band, validated, ts}
+        self.sync_only = 0       # stats.sync_only: lock held by syncs only
+        self.frame_counts = {"flrc": 0, "lora": 0}  # sync_frame totals per band
+        self.frame_rates = {}    # sync_frame rate string -> count (cap 16)
+        self.frame_uniq = {"flrc": set(), "lora": set()}  # dedupe by hex (cap 64)
+        self.last_frame_ts = None  # monotonic of the latest sync_frame
+        self.uid45 = None        # (payload, monotonic) latest uid45 event
 
     def update(self, obj: dict) -> None:
         now = time.monotonic()
@@ -1362,6 +1466,7 @@ class ElrsState:
                 # event line still leaves the panel stateable from stats alone.
                 self.crack_state = obj.get("crack", self.crack_state)
                 self.mode = obj.get("mode", self.mode)
+                self.sync_only = obj.get("sync_only", self.sync_only)
                 ch = obj.get("ch")
                 if isinstance(ch, list) and len(ch) == 4:
                     self.ch = [int(c) for c in ch]
@@ -1408,6 +1513,12 @@ class ElrsState:
                                     self.rssi_now if self.rssi_now is not None
                                     else self.rssi,
                                     "flrc", obj.get("tail_src"), now)
+                if t == "event" and obj.get("what") == "uid45":
+                    # Partial UID fingerprint from a FLRC frame's CRC seed
+                    # (round-6 passive discovery; fields may evolve).
+                    self.uid45 = (obj, now)
+                if t == "sync_frame":
+                    self._note_frame(obj, now)
                 if t in ELRS_TLM_TYPES:
                     self.tlm[t] = (obj, now)
                     if t == "sync" and obj.get("uid"):
@@ -1439,6 +1550,53 @@ class ElrsState:
             oldest = min(self.tails, key=lambda k: self.tails[k]["ts"])
             del self.tails[oldest]
 
+    def _note_frame(self, obj: dict, now: float) -> None:
+        """Caller holds self.lock. sync_frame capture (round-6): counters per
+        band/rate, unique-hex dedupe for crackability, JSONL capture for the
+        host cracker, and — for LoRa — the real UID tail out of bytes 5..7 of
+        the sync packet (self-seed validation makes it trustworthy: ✓crc)."""
+        band = obj.get("band")
+        hexs = str(obj.get("hex") or "")
+        self.last_frame_ts = now
+        if band in self.frame_counts:
+            self.frame_counts[band] += 1
+        rate = obj.get("rate")
+        if rate:
+            r = str(rate)
+            self.frame_rates[r] = self.frame_rates.get(r, 0) + 1
+            if len(self.frame_rates) > 16:
+                self.frame_rates.pop(next(iter(self.frame_rates)))
+        if band in self.frame_uniq and hexs:
+            self.frame_uniq[band].add(hexs)
+            if len(self.frame_uniq[band]) > 64:
+                self.frame_uniq[band].pop()
+        if band == "lora" and len(hexs) >= 16:
+            self._note_tail(hexs[10:16], obj.get("rssi"), "lora", "crc", now)
+        _frames_log(obj)
+
+    def find_snapshot(self, now: float) -> dict:
+        """Caller holds self.lock. FIND-panel state: frame counters, the
+        latest uid45 partial, and whether the host cracker has material."""
+        uid45 = self.uid45
+        uid_known = (self.crack_state == "cracked" or uid45 is not None
+                     or bool(self.link_lock and not self.sync_only))
+        uniq = {b: len(s) for b, s in self.frame_uniq.items()}
+        return {
+            "frames": dict(self.frame_counts),
+            "unique": uniq,
+            "rates": dict(sorted(self.frame_rates.items(),
+                                 key=lambda kv: -kv[1])[:4]),
+            "live": (self.last_frame_ts is not None
+                     and now - self.last_frame_ts < 3.0),
+            "frame_age_s": (None if self.last_frame_ts is None
+                            else round(now - self.last_frame_ts, 1)),
+            "uid45": (None if uid45 is None else
+                      {"age_s": round(now - uid45[1], 1),
+                       **{k: v for k, v in uid45[0].items() if k != "t"}}),
+            "crackable": (uniq["flrc"] >= 1 or uniq["lora"] >= 1) and
+                         not uid_known,
+        }
+
     def snapshot(self) -> dict:
         now = time.monotonic()
         with self.lock:
@@ -1462,6 +1620,8 @@ class ElrsState:
                 "fhss": self.fhss,
                 "mode": self.mode,
                 "crack_state": self.crack_state,
+                "sync_only": self.sync_only,
+                "find": self.find_snapshot(now),
                 "crack": (None if self.crack_ev is None else
                           {"age_s": round(now - self.crack_ev[1], 1),
                            **{k: v for k, v in self.crack_ev[0].items()
@@ -2028,6 +2188,34 @@ PAGE = """<!DOCTYPE html>
              border:1px solid var(--dim); border-radius:3px; padding:2px 6px; }
   #ephrase:focus { border-color:var(--grn); outline:none; }
   #ephrasebtn { flex:0 0 auto; height:22px; font-size:.56rem; padding:0 10px; }
+  .tg:disabled { opacity:.4; cursor:default; }
+  /* FIND panel: passive bind-phrase/UID discovery (round-6 sync_frame /
+     uid45). Frame counters + live indicator left; recovered identity /
+     cracker result right; lazy CRACK + APPLY actions. FIXED height,
+     visibility-toggled conditionals — the strip never reflows. */
+  #efind { flex:0 0 52px; height:52px; display:flex; align-items:center;
+           gap:10px; flex-wrap:nowrap; overflow:hidden; padding:0 18px;
+           box-sizing:border-box; border-bottom:1px solid var(--dim);
+           font-size:.6rem; letter-spacing:.08em; white-space:nowrap;
+           font-variant-numeric:tabular-nums; }
+  #efind .flbl { flex:0 0 auto; color:var(--dim); letter-spacing:.14em; }
+  #efindcnt { flex:0 0 auto; min-width:120px; color:var(--txt); }
+  #efindcnt b { color:var(--grn); font-weight:normal; }
+  .fbadge { flex:0 0 auto; padding:0 8px; border:1px solid var(--amb);
+            border-radius:3px; color:var(--amb); font-size:.54rem;
+            letter-spacing:.12em;
+            animation:ckpulse 1.1s ease-in-out infinite; }
+  #efind .esp { flex:1 1 auto; }
+  #efindid { flex:0 1 auto; min-width:0; overflow:hidden;
+             text-overflow:ellipsis; color:var(--dim); }
+  #efindid.found { color:var(--grn); font-size:.92rem; letter-spacing:.12em;
+                   text-shadow:0 0 8px rgba(57,255,106,.6); }
+  #efindid.err { color:var(--amb); }
+  #efind .tg { flex:0 0 auto; height:24px; font-size:.56rem;
+               padding:0 12px; }
+  #efindcrack:not(:disabled) { color:var(--amb); border-color:var(--amb); }
+  #efindapply { color:var(--grn); border-color:var(--grn); }
+  .tchip.partial { border-style:dashed; color:var(--amb); }
   .staletag { position:absolute; top:-7px; right:0; font-size:.5rem;
               letter-spacing:.14em; color:var(--amb); border:1px solid var(--amb);
               border-radius:3px; padding:0 4px; background:var(--panel); }
@@ -2255,6 +2443,10 @@ PAGE = """<!DOCTYPE html>
     #etails .tlbl { display:none; }
     #euidhint { min-width:110px; }
     #ephrase { flex:1 1 90px; width:90px; min-width:0; }
+    #efind { gap:6px; padding:0 12px; font-size:.52rem; }
+    #efind .flbl { display:none; }
+    #efindcnt { min-width:84px; }
+    #efindid.found { font-size:.66rem; }
     .ebot { flex:0 0 220px; flex-direction:column; overflow:auto; }
     #gtitle, #fstitle { font-size:.58rem; }
     #gcur b { font-size:1.1rem; }
@@ -2397,6 +2589,17 @@ PAGE = """<!DOCTYPE html>
            spellcheck="false" autocomplete="off">
     <button id="ephrasebtn" class="tg"
             title="send 'U &lt;phrase&gt;' to the sniffer dongle (persisted in its flash; it answers with a uid event)">APPLY</button>
+  </div>
+  <div id="efind">
+    <span class="flbl">FIND</span>
+    <span id="efindcnt">—</span>
+    <span id="efindlive" class="fbadge" style="visibility:hidden">FINDING</span>
+    <span class="esp"></span>
+    <span id="efindid">listening for sync frames</span>
+    <button id="efindapply" class="tg" style="visibility:hidden"
+            title="re-apply the recovered phrase to the dongle (U command)">APPLY</button>
+    <button id="efindcrack" class="tg" disabled
+            title="run the host cracker (phrase_crack.py) on the captured sync frames — only ever runs when you click">CRACK</button>
   </div>
   <div class="etop">
     <div class="egauge"><span class="ek">RSSI</span><b id="xerssi">--</b><span class="eu">dBm</span><i class="gsub" id="xerssinow"></i></div>
@@ -3083,6 +3286,11 @@ const evLine = (ev, stamp) =>
   esc(fmtEv(ev)) +
   (ev.age_s !== undefined ? '<span class="eage">' + ev.age_s.toFixed(0) + 's</span>' : '') +
   '</div>';
+/* lq junk guard: ELRS LQ is per-cent (0..100); corrupt packets can yield
+   garbage, and a sync-only lock has no validated data behind it — display
+   '—' instead of junk (defensive; the firmware clamps too). */
+const lqSane = (v, syncOnly) =>
+  typeof v === 'number' && isFinite(v) && v >= 0 && v <= 100 && !syncOnly;
 /* Latest intel items for the LIVE-tab card, preference-ordered:
    GPS -> batt -> fm -> atti -> linkstats (model-reported uplink). */
 function intelItems(e) {
@@ -3096,8 +3304,9 @@ function intelItems(e) {
   if (t.atti) out.push('ATTI p' + (t.atti.p / 10000 * 57.3).toFixed(0) +
     ' r' + (t.atti.r / 10000 * 57.3).toFixed(0) +
     ' y' + (t.atti.y / 10000 * 57.3).toFixed(0));
-  if (t.linkstats) out.push('UPLINK lq=' + t.linkstats.lq + ' rssi2=' +
-    t.linkstats.rssi2 + ' snr=' + t.linkstats.snr);
+  if (t.linkstats && lqSane(Number(t.linkstats.lq), e && e.sync_only))
+    out.push('UPLINK lq=' + t.linkstats.lq + ' rssi2=' +
+      t.linkstats.rssi2 + ' snr=' + t.linkstats.snr);
   const ci = crackInfo(e, true), cl = ci && crackLine(ci);
   if (cl) out.unshift(cl);
   return out;
@@ -3188,7 +3397,15 @@ function updElrsCrack(e, on, set) {
    the default-phrase nag. */
 function updElrsTails(e, on) {
   const tails = on && e && Array.isArray(e.tails) ? e.tails : [];
-  document.getElementById('etailchips').innerHTML = tails.map(t =>
+  // FLRC uid45 partial fingerprint (round-6) rides the strip as a dashed chip.
+  const u45 = on && e && e.find && e.find.uid45;
+  const partial = u45 ?
+    '<span class="tchip partial" title="partial UID from FLRC CRC seed: uid4=' +
+    esc(u45.uid4 || '?') + ' uid5=' + esc(u45.uid5 || '?') +
+    (u45.model_id !== undefined && u45.model_id !== null ?
+      ' model ' + esc(u45.model_id) : '') +
+    '">uid45·partial</span>' : '';
+  document.getElementById('etailchips').innerHTML = partial + tails.map(t =>
     '<span class="tchip' + (t.own ? ' own' : '') + '"' +
     (t.own ? ' title="your bind phrase UID tail"' : '') + '>' +
     '<b>' + esc(t.tail) + '</b>' +
@@ -3212,6 +3429,63 @@ function updElrsTails(e, on) {
     hint.className = '';
     hint.style.visibility = 'visible';
   } else hint.style.visibility = 'hidden';
+}
+/* FIND panel (round-6 passive discovery): sync_frame counters per band, a
+   live FINDING badge while frames flow with no UID known, the recovered
+   identity (uid45 partial / cracker phrase), and the lazy host-cracker kick
+   with auto-apply on success. All conditional bits are visibility-toggled;
+   unknown/missing round-6 fields degrade to the idle line. */
+let crackJobApplied = null;              // job.started token already applied
+let foundPhrase = null;                  // last cracker hit (manual re-apply)
+function updElrsFind(e, set, job) {
+  const on = !!(e && e.connected);
+  const f = (on && e && e.find) || null;
+  const fc = (f && f.frames) || {};
+  document.getElementById('efindcnt').innerHTML = on ?
+    'FLRC <b>' + (fc.flrc || 0) + '</b> · LORA <b>' + (fc.lora || 0) + '</b>'
+    : '—';
+  const uidKnown = !!(on && e && (e.crack_state === 'cracked' ||
+    (f && f.uid45) || (e.lock && !e.sync_only)));
+  document.getElementById('efindlive').style.visibility =
+    on && f && f.live && !uidKnown ? 'visible' : 'hidden';
+  const idEl = document.getElementById('efindid');
+  const applyBtn = document.getElementById('efindapply');
+  const crackBtn = document.getElementById('efindcrack');
+  job = job || null;
+  if (job && job.done && job.phrase) {
+    foundPhrase = job.phrase;
+    idEl.className = 'found';
+    idEl.textContent = 'PHRASE FOUND: ' + job.phrase;
+    applyBtn.style.visibility = 'visible';
+    if (crackJobApplied !== job.started) {   // auto-apply once per job
+      crackJobApplied = job.started;
+      postPhrase(job.phrase).then(r =>
+        toast(r.ok ? 'phrase auto-applied — waiting for dongle confirm'
+                   : 'auto-apply failed: ' + (r.error || '?')));
+    }
+  } else if (job && job.running) {
+    idEl.className = '';
+    idEl.textContent = 'CRACKING… ' + ((job.lines || []).slice(-1)[0] || '');
+    applyBtn.style.visibility = 'hidden';
+  } else if (job && job.done && job.error) {
+    idEl.className = 'err';
+    idEl.textContent = 'crack: ' + job.error;
+    applyBtn.style.visibility = 'hidden';
+  } else if (f && f.uid45) {
+    const u = f.uid45;
+    idEl.className = '';
+    idEl.textContent = 'UID ??:??:??:' + (u.uid4 || '??') + ':' +
+      (u.uid5 || '??') +
+      (u.model_id !== undefined && u.model_id !== null && u.model_id !== 255 ?
+        ' · model ' + u.model_id : '') +
+      (e.rate && e.rate !== '-' ? ' · ' + e.rate : '');
+    applyBtn.style.visibility = 'hidden';
+  } else {
+    idEl.className = '';
+    idEl.textContent = on ? 'listening for sync frames' : '—';
+    applyBtn.style.visibility = 'hidden';
+  }
+  crackBtn.disabled = !(on && f && f.crackable && !(job && job.running));
 }
 let elrsHist = [];                     // {t, rssi, lq} per poll, 60 s window
 let elogSeen = 0;                      // last event seq in the tab log
@@ -3286,7 +3560,8 @@ function updElrsTlm(e, on) {
     '', t.atti && t.atti.age_s);
   etCard('etfm', 'FLIGHT MODE', t.fm ? '<b>' + esc(t.fm.m) + '</b>' : na,
     '', t.fm && t.fm.age_s);
-  etCard('etls', 'LINKSTATS // MODEL', t.linkstats ?
+  etCard('etls', 'LINKSTATS // MODEL',
+    t.linkstats && lqSane(Number(t.linkstats.lq), e && e.sync_only) ?
     'lq <b>' + esc(t.linkstats.lq) + '</b> · rssi <b>' +
     esc(t.linkstats.rssi1) + '/' + esc(t.linkstats.rssi2) + '</b> · snr <b>' +
     esc(t.linkstats.snr) + '</b>' : na,
@@ -3313,8 +3588,11 @@ function updElrs(e, set) {
   chip.className = on ? (e.lock ? 'lock' : 'sweep') : 'off';
   const numv = v => (typeof v === 'number' && isFinite(v)) ? v : null;
   const rssi = on ? numv(e.rssi) : null;
+  // Big LQ numbers obey the junk guard: valid only on a data-validated lock
+  // (not sync-only) and within 0..100; otherwise '—'.
+  const lqOk = !!(on && e.lock && lqSane(numv(e.lq), e.sync_only));
   set('erssi', on ? (rssi === null ? '--' : rssi) : '--');
-  set('elq', on ? numv(e.lq) ?? '--' : '--');
+  set('elq', lqOk ? numv(e.lq) : '--');
   set('erate', on ? (e.rate || '--') + ' · iq ' + (e.iq || '-') + ' · ' +
         (e.pps || 0) + ' pps · SNR ' + (numv(e.snr) === null ? '--' : e.snr) + ' dB'
                   : 'no dongle');
@@ -3352,7 +3630,7 @@ function updElrs(e, set) {
   // Tab gauges (+ secondary lines: rssi_now, raw rx/s) + sticks.
   set('xerssi', on ? (rssi === null ? '--' : rssi) : '--');
   set('xerssinow', on ? 'now ' + (numv(e.rssi_now) === null ? '--' : e.rssi_now) : '');
-  set('xelq', on ? numv(e.lq) ?? '--' : '--');
+  set('xelq', lqOk ? numv(e.lq) : '--');
   set('xesnr', on ? (numv(e.snr) === null ? '--' : e.snr) : '--');
   set('xepps', on ? (e.pps || 0) : '--');
   set('xerx', on && numv(e.rx_per_s) !== null ? e.rx_per_s + ' rx/s raw' : '');
@@ -3447,23 +3725,41 @@ document.getElementById('etgps').addEventListener('click', e => {
   }));
 /* Bind-phrase apply: POST the phrase, the dongle's confirming uid event
    (src:"set") shows up as panel feedback via the state poll. */
+async function postPhrase(phrase) {
+  try {
+    return await (await fetch('/api/elrs/phrase', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phrase })
+    })).json();
+  } catch (e) { return { ok: false, error: 'request failed' }; }
+}
 async function applyPhrase() {
   const inp = document.getElementById('ephrase');
   const phrase = (inp.value || '').trim();
   if (!phrase) { toast('enter a bind phrase'); return; }
-  try {
-    const r = await (await fetch('/api/elrs/phrase', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phrase })
-    })).json();
-    toast(r.ok ? 'phrase sent — waiting for dongle confirm'
-               : 'phrase failed: ' + (r.error || '?'));
-    if (r.ok) inp.value = '';
-  } catch (e) { toast('phrase failed'); }
+  const r = await postPhrase(phrase);
+  toast(r.ok ? 'phrase sent — waiting for dongle confirm'
+             : 'phrase failed: ' + (r.error || '?'));
+  if (r.ok) inp.value = '';
 }
 document.getElementById('ephrasebtn').addEventListener('click', applyPhrase);
 document.getElementById('ephrase').addEventListener('keydown', e => {
   if (e.key === 'Enter') applyPhrase();
+});
+/* FIND panel actions: lazy host-cracker kick + manual re-apply of the last
+   recovered phrase. */
+document.getElementById('efindcrack').addEventListener('click', async () => {
+  try {
+    const r = await (await fetch('/api/elrs/crack', { method: 'POST' })).json();
+    toast(r.ok ? 'cracker started — watch the FIND panel'
+               : 'crack: ' + (r.error || '?'));
+  } catch (e) { toast('crack failed'); }
+});
+document.getElementById('efindapply').addEventListener('click', async () => {
+  if (!foundPhrase) { toast('no recovered phrase'); return; }
+  const r = await postPhrase(foundPhrase);
+  toast(r.ok ? 'phrase applied — waiting for dongle confirm'
+             : 'apply failed: ' + (r.error || '?'));
 });
 
 async function poll() {
@@ -3552,6 +3848,7 @@ async function poll() {
   wfNew = (s.spectrum || []).filter(e => e && e.freq_mhz >= 5560 && e.freq_mhz <= 6000)
                             .sort((a, b) => a.freq_mhz - b.freq_mhz);
   updElrs(s.elrs, set);
+  updElrsFind(s.elrs, set, s.crack_job);
   if (!s.connected) toast('SERIAL DISCONNECTED');
 }
 
@@ -4109,6 +4406,9 @@ def create_app() -> Flask:
             }
         body["fps"] = round(STATE.fps(), 2)
         body["elrs"] = ELRS.snapshot()   # own lock; independent of STATE
+        with _crack_job_lock:
+            body["crack_job"] = {**_crack_job,
+                                 "lines": _crack_job["lines"][-6:]}
         body["arbiter"] = ARBITER.snapshot()   # port classification debug
         return jsonify(body)
 
@@ -4157,6 +4457,23 @@ def create_app() -> Flask:
         if ELRS_MGR is None or not ELRS_MGR.send_line("U " + phrase):
             return jsonify({"ok": False,
                             "error": "dongle busy or unavailable"}), 503
+        return jsonify({"ok": True})
+
+    @app.post("/api/elrs/crack")
+    def api_elrs_crack():
+        """Kick the host cracker (phrase_crack.py --frames) on the captured
+        sync_frame JSONL. Lazy: only ever runs on this explicit user action.
+        Progress/result stream into the crack_job block of /api/state."""
+        with _crack_job_lock:
+            if _crack_job["running"]:
+                return jsonify({"ok": False, "error": "already running"}), 409
+            find = ELRS.find_snapshot(time.monotonic())
+            if not find["crackable"]:
+                return jsonify({"ok": False,
+                                "error": "no unique frames captured yet"}), 400
+            _crack_job.update(running=True, done=False, error=None,
+                              phrase=None, lines=[], started=time.time())
+        threading.Thread(target=_crack_worker, daemon=True).start()
         return jsonify({"ok": True})
 
     @app.post("/api/shot")
