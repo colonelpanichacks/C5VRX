@@ -151,10 +151,14 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
                       (int)rc_fq, (int)rc_mp, (int)rc_pp, (int)rc_sw, (int)rc_crc, st);
         return rc_fq == 0 && rc_mp == 0 && rc_pp == 0 && rc_sw == 0 && rc_crc == 0;
     }
-    // LoRa branch: individual setters write the SetModulationParams pieces;
-    // packet params (implicit header, fixed length, CRC OFF, IQ) go out in
-    // one explicit call — exactly the ELRS air config from SX1280.cpp
-    // SetPacketParamsLoRa. ELRS InvertIQ==true is register 0x00 (INVERTED).
+    // LoRa branch: packet type FIRST — an FLRC dwell leaves the chip in FLRC
+    // mode, and the modulation params below are only valid in LoRa mode
+    // (REGRESSION: without this, the first FLRC dwell silenced every later
+    // LoRa dwell: rx=0 on all rates, RSSIINST still reporting). Then the
+    // individual setters write the SetModulationParams pieces; packet params
+    // (implicit header, fixed length, CRC OFF, IQ) go out in one explicit
+    // call — exactly the ELRS air config from SX1280.cpp SetPacketParamsLoRa.
+    static_cast<SnifferSX1280 *>(radio)->setPacketType(RADIOLIB_SX128X_PACKET_TYPE_LORA);
     radio->setBandwidth(r->bw == 0x18 ? 812.5f : r->bw == 0x26 ? 406.25f : 203.125f);
     radio->setSpreadingFactor(r->sf >> 4);         // 0x50->5 .. 0x90->9
     radio->setCodingRate(r->cr, true);             // LI variants, raw values match
@@ -164,6 +168,11 @@ bool SnifferRadio::apply(const sniffer_step_t &step, uint32_t freq_hz)
         r->preamble, RADIOLIB_SX128X_LORA_HEADER_IMPLICIT, payload_len,
         0x00, step.iq_inverted ? RADIOLIB_SX128X_LORA_IQ_INVERTED
                                : RADIOLIB_SX128X_LORA_IQ_STANDARD);
+    uint8_t pt = 0, st = 0;
+    mod->SPIreadStream(RADIOLIB_SX128X_CMD_GET_PACKET_TYPE, &pt, 1);
+    mod->SPIreadStream(RADIOLIB_SX128X_CMD_GET_STATUS, &st, 1);
+    Serial.printf("{\"t\":\"dbg\",\"what\":\"dwell_setup\",\"rate\":\"%s\",\"pt\":%u,\"status\":%u}\n",
+                  r->name, pt & 0x03, st);
     return true;
 }
 
