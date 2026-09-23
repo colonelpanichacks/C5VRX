@@ -140,6 +140,31 @@ bool elrs_sync_crc_selfseed(const uint8_t *data, size_t len,
                             uint16_t *init_out, uint8_t *uid5_true_out,
                             uint8_t *model_id_out);
 
+// FLRC-discovery noise gate (field: CRC-off/no-sync discovery false-demods
+// ~570 junk frames/s on pure noise; every junk frame looked like a "sync").
+// Per dwell: running noise floor (starts -120, tracks the min), a frame is
+// accepted only at rssi >= floor+12 dB AND >= -100 dBm absolute; a sync
+// EVENT fires only after 2 consecutive accepted same-tail frames that pass
+// the structural sanity (via elrs_identity_sane). One-off frames count
+// silently. Emissions for the same tail coalesce to 1 per 2 s.
+#define ELRS_DISC_NF_START -120.0f
+#define ELRS_DISC_NF_MARGIN 12.0f
+#define ELRS_DISC_ABS_FLOOR -100.0f
+#define ELRS_DISC_EMIT_MIN_MS 2000u
+
+typedef struct {
+    float nf;                 // running noise floor (min of observed rssi)
+    uint8_t u3, u4, u5;       // current candidate tail
+    uint8_t count;            // consecutive accepted same-tail sane frames
+    uint32_t last_emit_ms;    // throttle memory
+    uint8_t last_emit_u3, last_emit_u4, last_emit_u5;
+} elrs_disc_gate_t;
+
+void elrs_disc_reset(elrs_disc_gate_t *g);
+// returns true exactly when a flrc_sync event should be emitted
+bool elrs_disc_frame(elrs_disc_gate_t *g, const elrs_sync_info_t *s,
+                     float rssi_dbm, uint32_t now_ms);
+
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only
 // returns true the moment identity is ACCEPTED (2nd consistent sync)

@@ -21,6 +21,41 @@ uint32_t elrs_uid_mac_seed(uint8_t uid2, uint8_t uid3, uint8_t uid4, uint8_t uid
            ((uint32_t)uid4 << 8) | ((uint32_t)uid5 ^ ELRS_OTA_VERSION_ID_3X);
 }
 
+// --- FLRC-discovery noise gate ----------------------------------------------
+
+void elrs_disc_reset(elrs_disc_gate_t *g)
+{
+    memset(g, 0, sizeof(*g));
+    g->nf = ELRS_DISC_NF_START;
+}
+
+bool elrs_disc_frame(elrs_disc_gate_t *g, const elrs_sync_info_t *s,
+                     float rssi_dbm, uint32_t now_ms)
+{
+    // noise floor always tracks the weakest thing seen this dwell
+    if (rssi_dbm < g->nf) g->nf = rssi_dbm;
+    // RSSI gate: above the (adaptive) floor by a margin AND an absolute
+    // floor so a distant real TX at ~-100 still passes while -128 junk dies
+    if (rssi_dbm < g->nf + ELRS_DISC_NF_MARGIN) return false;
+    if (rssi_dbm < ELRS_DISC_ABS_FLOOR) return false;
+    // structural sanity (rateIdx<=9, tlmRatio<=8, fhss<160) BEFORE counting
+    if (!elrs_identity_sane(s)) return false;
+    // consecutive-same-tail counting
+    if (s->uid3 != g->u3 || s->uid4 != g->u4 || s->uid5 != g->u5) {
+        g->u3 = s->uid3; g->u4 = s->uid4; g->u5 = s->uid5;
+        g->count = 1;
+        return false; // one-off frames: counted silently, no event
+    }
+    if (++g->count < 2) return false;
+    // pair complete -> throttle: same tail coalesces to 1 emit per 2 s
+    bool same_tail = g->u3 == g->last_emit_u3 && g->u4 == g->last_emit_u4 &&
+                     g->u5 == g->last_emit_u5;
+    if (same_tail && now_ms - g->last_emit_ms < ELRS_DISC_EMIT_MIN_MS) return false;
+    g->last_emit_ms = now_ms;
+    g->last_emit_u3 = g->u3; g->last_emit_u4 = g->u4; g->last_emit_u5 = g->u5;
+    return true;
+}
+
 // --- identity gating --------------------------------------------------------
 
 void elrs_identity_reset(elrs_identity_t *id)

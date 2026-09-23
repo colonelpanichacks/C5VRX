@@ -55,7 +55,13 @@ are patient:
  "rx":14,"crc_ok":11,"types":{"rc":11,"msp":0,"sync":0,"tlm":0,"unk":3}}
 {"t":"dwell_ext","rate":"LoRa 250Hz","iq":"n","rssi_max":-69,"dwell_ms":4000}
 
-A dwell line may carry `"jump":"iq-twin"` — the dwell was hot-but-dead
+Dwell lines carry `nf` (discovery noise floor dBm, running min) and
+`nf_thr` (`nf` + 12 dB - the frame-acceptance threshold). `crc_ok`
+stays 0 in discovery mode (radio CRC disabled there; the counter is
+gated in software). `sync_seen` crack events coalesce per tail
+(1 per 2 s) and crack events are globally capped at ~5/s.
+
+A dwell line may carry `"jump":"iq-twin" — the dwell was hot-but-dead
 (strong RSSI, zero validated/sync packets) and the sweep jumped straight
 to the other IQ polarity of the same rate instead of advancing.
 {"t":"event","what":"awaiting_sync","rate":"LoRa 250Hz","iq":"n"}
@@ -161,7 +167,13 @@ Boot/lifecycle:
   - `uid` — bind phrase applied: `{"t":"event","what":"uid","src":"stored|set|default","uid":"43 7f ..."}` (`src` says which phrase produced the UID).
   - `fp` — OSINT fingerprint, first sync of a link:
     `{"t":"event","what":"fp","band":"lora|flrc","uid_tail":"a1b2c3"}`.
-  - `flrc_sync` — FLRC sync parsed (see FLRC section).
+  - `flrc_sync` — FLRC sync parsed. `tail_src`: `structural` = classified
+    in discovery mode — emitted ONLY after 2 consecutive accepted same-tail
+    frames (RSSI-gated against the dwell's running noise floor: +12 dB
+    margin, -100 dBm absolute floor; one-off frames counted silently) — a
+    sighting, not a confirmation; `syncword+crc24` = demodulated under the
+    exact UID-derived 32-bit sync word with the seeded radio CRC
+    (confirmed).
   - `uid2_crack` — per UID[2] candidate with any score:
     `{"t":"event","what":"uid2_crack","uid2":47,"valids":5}`.
   - `uid_cracked` — full UID recovered, hop-following starts:

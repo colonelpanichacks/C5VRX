@@ -554,6 +554,54 @@ int main()
     }
     printf("ok: self-seeded sync validator (modelId on/off, rateIdx 9)\n");
 
+    // 14e) DISCOVERY NOISE GATE (round-3 acceptance):
+    //   (a) junk at RSSI -128 never produces an event
+    //   (b) same-tail pair at -60 with sane rateIdx -> exactly one event
+    //   (c) a single above-threshold frame -> no event
+    //   (d) same-tail emissions coalesce to 1 per 2 s
+    {
+        elrs_disc_gate_t g;
+        elrs_sync_info_t s;
+        memset(&s, 0, sizeof(s));
+        s.uid3 = 0xf8; s.uid4 = 0x42; s.uid5 = 0x8d;
+        s.rate_index = 4; s.tlm_ratio = 2; s.fhss_index = 10;
+
+        // (a) pure-noise junk at -128, random tails, forever
+        elrs_disc_reset(&g);
+        for (int i = 0; i < 500; i++) {
+            s.uid3 = rand() & 0xFF; s.uid4 = rand() & 0xFF; s.uid5 = rand() & 0xFF;
+            s.nonce = rand() & 0xFF; s.fhss_index = rand() % 200; s.rate_index = rand() % 16;
+            assert(!elrs_disc_frame(&g, &s, -127.5f - (rand() % 5), 1000 + i));
+        }
+        assert(g.nf <= -127.0f); // floor tracked the noise
+
+        // (b)+(c): one strong frame -> silent; the matching second -> one event
+        elrs_disc_reset(&g);
+        s.uid3 = 0xbe; s.uid4 = 0x07; s.uid5 = 0x83;
+        s.rate_index = 6; s.tlm_ratio = 2; s.fhss_index = 42; s.nonce = 1;
+        assert(!elrs_disc_frame(&g, &s, -60.0f, 2000)); // single: no event (c)
+        s.nonce = 2;
+        assert(elrs_disc_frame(&g, &s, -58.0f, 2100));  // pair: ONE event (b)
+        s.nonce = 3;
+        assert(!elrs_disc_frame(&g, &s, -59.0f, 2200)); // throttle: same tail <2s (d)
+
+        // (d) after 2 s the same tail may emit again
+        assert(elrs_disc_frame(&g, &s, -59.0f, 2100 + 2000));
+
+        // tail change resets the consecutive count even when strong; a new
+        // tail is NOT throttled by a different tail's emission
+        elrs_disc_reset(&g);
+        s.uid3 = 0xaa; s.nonce = 1;
+        assert(!elrs_disc_frame(&g, &s, -60, 5000));
+        s.uid3 = 0xbb; s.nonce = 1;
+        assert(!elrs_disc_frame(&g, &s, -60, 5100)); // new tail: count restarts
+        s.nonce = 2;
+        assert(elrs_disc_frame(&g, &s, -60, 5200));  // 2nd of new tail -> emit
+        s.nonce = 3;
+        assert(!elrs_disc_frame(&g, &s, -60, 6000)); // same tail <2s: coalesced
+    }
+    printf("ok: discovery noise gate (a-d)\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.
