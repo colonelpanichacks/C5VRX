@@ -1296,6 +1296,8 @@ class SerialManager(threading.Thread):
 
 ELRS_MAX_EVENTS = 8           # last_events ring exposed via /api/state
 ELRS_TLM_TYPES = ("gps", "batt", "atti", "fm", "tlm", "linkstats", "sync")
+ELRS_WRITE_MIN_INTERVAL_S = 0.5  # console command rate limit (U/R/P/D/V)
+ELRS_PHRASE_MAX = 64             # bind-phrase input cap
 
 
 class ElrsState:
@@ -1327,6 +1329,11 @@ class ElrsState:
         self.crack_state = None  # stats.crack mirror (keep-last)
         self.mode = None         # stats.mode: sweep|park|follow|discovery
         self.crack_ev = None     # (payload, monotonic) latest t=="crack" line
+        self.uid_src = None      # uid event src: stored|set|default(-nvs-unavailable)
+        self.uid_full = None     # spaced full UID from uid events
+        self.uid_set_time = None  # monotonic of the last src=="set" uid event
+        self.last_sync = None    # (payload, monotonic) latest t=="sync" line
+        self.tails = {}          # uid tail hex -> {count, rssi, band, validated, ts}
 
     def update(self, obj: dict) -> None:
         now = time.monotonic()
@@ -1364,6 +1371,43 @@ class ElrsState:
                     # Keep-last full crack payload (state/uid_tail/done/
                     # valids_best[/uid_full]) — survives the events ring.
                     self.crack_ev = (obj, now)
+                if t == "sync":
+                    # Keep-last sync (band/len/freq + forward-compatible
+                    # validated/model_id/tail_src pass through verbatim), and
+                    # count the heard tail. FLRC syncs arrive ok:0 — that is
+                    # NORMAL (structural validation, no ELRS CRC), never a
+                    # failure; only a LoRa ok:0 means a CRC miss.
+                    self.last_sync = (obj, now)
+                    band = obj.get("band")
+                    validated = obj.get("validated")
+                    if validated is None:
+                        if obj.get("ok"):
+                            validated = "crc"
+                        elif band == "flrc":
+                            validated = "structural"
+                    self._note_tail(obj.get("uid"),
+                                    self.rssi_now if self.rssi_now is not None
+                                    else self.rssi,
+                                    band, validated, now)
+                if t == "event" and obj.get("what") == "uid":
+                    # Bind-phrase source: stored|set|default (dashboard hints +
+                    # apply feedback). The phrase-derived tail identifies "our"
+                    # link among heard neighbors before any air traffic.
+                    self.uid_src = obj.get("src")
+                    self.uid_full = obj.get("uid")
+                    parts = str(obj.get("uid") or "").split()
+                    if len(parts) == 6:
+                        self.uid = "".join(parts[3:])
+                    if obj.get("src") == "set":
+                        self.uid_set_time = now
+                if t == "event" and obj.get("what") == "flrc_sync":
+                    # FLRC phrase-check line: uid_pkt is an air-heard tail
+                    # (counted even when never adopted); tail_src says how the
+                    # hearing was validated (structural | syncword+crc24).
+                    self._note_tail(obj.get("uid_pkt"),
+                                    self.rssi_now if self.rssi_now is not None
+                                    else self.rssi,
+                                    "flrc", obj.get("tail_src"), now)
                 if t in ELRS_TLM_TYPES:
                     self.tlm[t] = (obj, now)
                     if t == "sync" and obj.get("uid"):
@@ -1372,6 +1416,28 @@ class ElrsState:
                     self.event_seq += 1
                     self.events.append((now, self.event_seq, obj))
                     del self.events[:-ELRS_MAX_EVENTS]
+
+    def _note_tail(self, tail, rssi, band, validated, now: float) -> None:
+        """Caller holds self.lock. One entry per heard UID tail (the
+        link-identity bytes every sync leaks), capped at 16 by recency."""
+        if not tail or not isinstance(tail, str):
+            return
+        ent = self.tails.get(tail)
+        if ent is None:
+            ent = {"count": 0, "rssi": None, "band": None,
+                   "validated": None, "ts": 0.0}
+            self.tails[tail] = ent
+        ent["count"] += 1
+        if isinstance(rssi, (int, float)):
+            ent["rssi"] = rssi
+        if band:
+            ent["band"] = band
+        if validated:
+            ent["validated"] = validated
+        ent["ts"] = now
+        if len(self.tails) > 16:
+            oldest = min(self.tails, key=lambda k: self.tails[k]["ts"])
+            del self.tails[oldest]
 
     def snapshot(self) -> dict:
         now = time.monotonic()
@@ -1400,6 +1466,22 @@ class ElrsState:
                           {"age_s": round(now - self.crack_ev[1], 1),
                            **{k: v for k, v in self.crack_ev[0].items()
                               if k != "t"}}),
+                "uid_src": self.uid_src,
+                "uid_full": self.uid_full,
+                "uid_set_age_s": (None if self.uid_set_time is None
+                                  else round(now - self.uid_set_time, 1)),
+                "last_sync": (None if self.last_sync is None else
+                              {"age_s": round(now - self.last_sync[1], 1),
+                               **{k: v for k, v in self.last_sync[0].items()
+                                  if k != "t"}}),
+                "tails": [{"tail": tail, "count": e["count"],
+                           "rssi": e["rssi"], "band": e["band"],
+                           "validated": e["validated"],
+                           "own": tail == self.uid,
+                           "age_s": round(now - e["ts"], 1)}
+                          for tail, e in sorted(
+                              self.tails.items(),
+                              key=lambda kv: -kv[1]["ts"])[:8]],
                 "stats_age_s": (None if self.stats_time is None
                                 else round(now - self.stats_time, 1)),
                 "tlm": {k: {"age_s": round(now - ts, 1),
@@ -1421,6 +1503,26 @@ class ElrsManager(threading.Thread):
         super().__init__(daemon=True)
         self.ser = None
         self.stop_event = threading.Event()
+        self.write_lock = threading.Lock()
+        self._last_write = 0.0
+
+    def send_line(self, line: str) -> bool:
+        """Console command line (U <phrase>, R [step], P, D, V) to the
+        sniffer dongle, rate-limited against itself; the reader thread keeps
+        owning reads. Mirrors SerialManager._write's failure shape."""
+        with self.write_lock:
+            now = time.monotonic()
+            if now - self._last_write < ELRS_WRITE_MIN_INTERVAL_S:
+                return False
+            try:
+                if self.ser is None:
+                    return False
+                self.ser.write(line.encode("ascii", "ignore") + b"\n")
+                self.ser.flush()
+            except (serial.SerialException, OSError):
+                return False
+            self._last_write = now
+            return True
 
     def run(self) -> None:
         backoff = 0.5
@@ -1801,7 +1903,9 @@ PAGE = """<!DOCTYPE html>
   .evl .etag { display:inline-block; min-width:34px; margin-right:5px; }
   /* Event color code: sync/flrc_sync cyan, lock green, unlock/linkstats
      amber, aircraft telemetry white, OSINT events magenta, errors red. */
-  .evl.k-sync .etag, .evl.k-flrc_sync .etag { color:#31c8ff; }
+  .evl.k-sync .etag, .evl.k-flrc_sync .etag,
+  .evl.k-modelId .etag { color:#31c8ff; }
+  .evl.k-sync.flrc .etag { color:#ff3ac8; }  /* structural FLRC sync = OSINT */
   .evl.k-lock .etag { color:var(--grn); }
   .evl.k-unlock .etag, .evl.k-linkstats .etag { color:var(--amb); }
   .evl.k-gps .etag, .evl.k-batt .etag, .evl.k-atti .etag,
@@ -1884,6 +1988,35 @@ PAGE = """<!DOCTYPE html>
            border-radius:2px; overflow:hidden; }
   #ckfill { display:block; height:100%; width:0%; background:var(--grn); }
   #ckdone-sub b { font-weight:normal; color:var(--grn); }
+  /* Tails-heard + bind-phrase strip: per-tail chips (count, last RSSI,
+     validated state) on the left, uid-src hint + phrase apply on the right.
+     FIXED height; the hint is visibility-toggled, chips refill in place, so
+     the strip never reflows the tab. */
+  #etails { flex:0 0 34px; height:34px; display:flex; align-items:center;
+            gap:8px; flex-wrap:nowrap; overflow:hidden; padding:0 18px;
+            box-sizing:border-box; border-bottom:1px solid var(--dim);
+            font-size:.58rem; letter-spacing:.08em; white-space:nowrap;
+            font-variant-numeric:tabular-nums; }
+  #etails .tlbl { flex:0 0 auto; color:var(--dim); letter-spacing:.14em; }
+  #etailchips { flex:1 1 auto; min-width:0; display:flex; gap:6px;
+                align-items:center; overflow:hidden; }
+  .tchip { flex:0 0 auto; padding:1px 6px; border:1px solid var(--dim);
+           border-radius:3px; color:var(--txt); }
+  .tchip b { color:var(--grn); font-weight:normal; }
+  .tchip.own { border-color:var(--grn);
+               box-shadow:0 0 6px rgba(57,255,106,.25); }
+  .tchip .tcnt, .tchip .trssi, .tchip .tband { color:var(--dim); }
+  .tchip .tval { color:#31c8ff; }
+  .tchip .tval.na { color:var(--dim); }
+  #euidhint { flex:0 0 auto; min-width:190px; text-align:right;
+              color:var(--amb); visibility:hidden; overflow:hidden;
+              text-overflow:ellipsis; }
+  #euidhint.ok { color:var(--grn); }
+  #ephrase { flex:0 0 170px; width:170px; font:inherit; font-size:.6rem;
+             letter-spacing:.06em; background:var(--panel); color:var(--txt);
+             border:1px solid var(--dim); border-radius:3px; padding:2px 6px; }
+  #ephrase:focus { border-color:var(--grn); outline:none; }
+  #ephrasebtn { flex:0 0 auto; height:22px; font-size:.56rem; padding:0 10px; }
   .staletag { position:absolute; top:-7px; right:0; font-size:.5rem;
               letter-spacing:.14em; color:var(--amb); border:1px solid var(--amb);
               border-radius:3px; padding:0 4px; background:var(--panel); }
@@ -2107,6 +2240,10 @@ PAGE = """<!DOCTYPE html>
     #cks-sweep { width:64px; } #cks-sync { width:84px; }
     #cks-ident { width:72px; } #cks-crack { width:140px; }
     #cks-done { width:160px; }
+    #etails { gap:6px; padding:0 12px; font-size:.5rem; }
+    #etails .tlbl { display:none; }
+    #euidhint { min-width:110px; }
+    #ephrase { flex:1 1 90px; width:90px; min-width:0; }
     .ebot { flex:0 0 220px; flex-direction:column; overflow:auto; }
     #gtitle, #fstitle { font-size:.58rem; }
     #gcur b { font-size:1.1rem; }
@@ -2240,6 +2377,15 @@ PAGE = """<!DOCTYPE html>
     <span class="ckst" id="cks-crack"><b>CRACKING</b><i id="ckprog"></i><span class="ckbar"><span id="ckfill"></span></span></span>
     <span class="ckarr">&#8250;</span>
     <span class="ckst" id="cks-done"><b id="ckdone-lbl">CRACKED</b><i id="ckdone-sub"></i></span>
+  </div>
+  <div id="etails">
+    <span class="tlbl">TAILS</span>
+    <span id="etailchips"></span>
+    <span id="euidhint"></span>
+    <input id="ephrase" maxlength="64" placeholder="bind phrase"
+           spellcheck="false" autocomplete="off">
+    <button id="ephrasebtn" class="tg"
+            title="send 'U &lt;phrase&gt;' to the sniffer dongle (persisted in its flash; it answers with a uid event)">APPLY</button>
   </div>
   <div class="etop">
     <div class="egauge"><span class="ek">RSSI</span><b id="xerssi">--</b><span class="eu">dBm</span><i class="gsub" id="xerssinow"></i></div>
@@ -2850,8 +2996,20 @@ function stickHtml(ch, lock) {
    the type name). Unknown types degrade to a JSON shrug, per protocol. */
 function fmtEv(ev) {
   switch (ev.t) {
-    case 'sync': return 'uid=' + (ev.uid || '?') + ' rateIdx=' + ev.rateIdx +
-                        (ev.ok ? '' : ' (crc fail)');
+    case 'sync': {
+      // FLRC syncs are validated STRUCTURALLY (no ELRS CRC): ok:0 is the
+      // normal case and must never read as a failure. Round-2 fields
+      // (validated/model_id/tail_src) pass through when present.
+      const flrc = ev.band === 'flrc';
+      let s = 'uid=' + (ev.uid || '?') + ' rateIdx=' + ev.rateIdx;
+      if (ev.freq) s += ' ' + (ev.freq / 1e6).toFixed(1) + 'MHz';
+      if (ev.validated) s += ' ✓' + ev.validated;
+      if (ev.model_id !== undefined && ev.model_id !== null)
+        s += ' model' + ev.model_id;
+      if (flrc) s += ' structural';
+      else if (!ev.ok) s += ' (crc fail)';
+      return s;
+    }
     case 'lock': return 'link captured';
     case 'unlock': return ev.why || '';
     case 'linkstats': return 'lq=' + ev.lq + ' rssi=' + ev.rssi1 + '/' +
@@ -2873,7 +3031,8 @@ function fmtEv(ev) {
     case 'error': return (ev.what || '?') + ' ' + (ev.detail || '');
     case 'probe': return (ev.set || ev.info || '') + (ev.ok ? ' ok' : '');
     case 'crack':
-      return ev.state + (ev.uid_tail ? ' tail=' + ev.uid_tail : '') +
+      return ev.state + (ev.uid_tail ? ' tail=' + ev.uid_tail +
+        (ev.tail_src ? '(' + ev.tail_src + ')' : '') : '') +
         (ev.state === 'cracking' ? ' ' + (ev.done || 0) + '/' + (ev.total || 256) +
          ' best=' + (ev.valids_best || 0) : '') +
         (ev.uid_full ? ' uid=' + ev.uid_full : '') +
@@ -2884,7 +3043,10 @@ function fmtEv(ev) {
                           (ev.uid_tail || '?');
         case 'flrc_sync': return 'uid_pkt=' + (ev.uid_pkt || '?') +
                           ' phrase=' + (ev.uid_phrase || '?') +
-                          (ev.match ? ' MATCH' : ' no-match');
+                          (ev.match ? ' MATCH' : ' no-match') +
+                          (ev.tail_src ? ' ' + ev.tail_src : '');
+        case 'modelId': return 'recovered ELRS modelId=' +
+                          (ev.id !== undefined ? ev.id : '?');
         case 'uid2_crack': return 'uid2=' + ev.uid2 + ' valids=' + ev.valids;
         case 'uid_cracked': return 'UID=' + (ev.uid || '?');
         case 'uid2_crack_failed': return 'UID[2] candidates exhausted';
@@ -2897,10 +3059,16 @@ function fmtEv(ev) {
 /* Class key for color-coding: t="event" lines classify by their `what`
    (fp/uid_cracked/uid2_crack/flrc_sync + t=crack are the OSINT events -> magenta). */
 const evKey = ev => ev.t === 'event' ? (ev.what || 'event') : (ev.t || '?');
+/* Sync lines carry their band in the tag (SYNC·LORA cyan vs SYNC·FLRC
+   magenta) so the two validation paths read distinctly at a glance. */
+const evTag = ev => ev.t === 'sync'
+  ? 'SYNC·' + (ev.band === 'flrc' ? 'FLRC' : 'LORA')
+  : evKey(ev).toUpperCase();
 const evLine = (ev, stamp) =>
-  '<div class="evl k-' + esc(evKey(ev)) + '">' +
+  '<div class="evl k-' + esc(evKey(ev)) +
+  (ev.t === 'sync' && ev.band === 'flrc' ? ' flrc' : '') + '">' +
   (stamp ? '<span class="ets">' + esc(stamp) + '</span>' : '') +
-  '<span class="etag">' + esc(evKey(ev).toUpperCase()) + '</span>' +
+  '<span class="etag">' + esc(evTag(ev)) + '</span>' +
   esc(fmtEv(ev)) +
   (ev.age_s !== undefined ? '<span class="eage">' + ev.age_s.toFixed(0) + 's</span>' : '') +
   '</div>';
@@ -2969,7 +3137,13 @@ function updElrsCrack(e, on, set) {
       document.getElementById(id).className = cls;
     });
   set('cksweep-sub', mode || '');
-  set('cktail', idx >= 1 && ck.uid_tail ? 'tail ' + ck.uid_tail : '');
+  // SYNC chip sub: tail + last sync's band, ✓ when the firmware reports a
+  // validation path (round-2 `validated` field, or the derived crc/structural).
+  const ls = on && e && e.last_sync ? e.last_sync : null;
+  set('cktail', idx >= 1 && ck.uid_tail ?
+    'tail ' + ck.uid_tail +
+    (ls && ls.band ? ' · ' + String(ls.band).toUpperCase() : '') +
+    (ls && (ls.validated || ls.band === 'flrc' || ls.ok) ? ' ✓' : '') : '');
   set('ckident-sub', st === 'identity' ? '2nd sync ok' : '');
   // LoRa lock that never entered the pipeline: CRACKING goes dim "N/A".
   const loraNa = ci && ci.lora && (!st || st === 'listening');
@@ -2995,6 +3169,38 @@ function updElrsCrack(e, on, set) {
     ds.innerHTML = esc(uf.slice(0, uf.length - tail.length)) +
                    '<b>' + esc(tail) + '</b>';
   } else ds.textContent = st === 'failed' ? 'auto-retry' : '';
+}
+/* Tails-heard strip: one chip per unique UID tail heard on syncs (count,
+   last RSSI, band, validated state); the phrase-derived tail is ringed as
+   "own" so the user can tell their link from neighbors at a glance. The
+   hint slot reports uid-src: recent "phrase set" apply feedback wins over
+   the default-phrase nag. */
+function updElrsTails(e, on) {
+  const tails = on && e && Array.isArray(e.tails) ? e.tails : [];
+  document.getElementById('etailchips').innerHTML = tails.map(t =>
+    '<span class="tchip' + (t.own ? ' own' : '') + '"' +
+    (t.own ? ' title="your bind phrase UID tail"' : '') + '>' +
+    '<b>' + esc(t.tail) + '</b>' +
+    '<span class="tcnt"> ×' + t.count + '</span> ' +
+    '<span class="trssi">' +
+      (typeof t.rssi === 'number' ? t.rssi : '--') + 'dBm</span> ' +
+    (t.band ? '<span class="tband">' + esc(String(t.band).toUpperCase()) +
+              '</span> ' : '') +
+    (t.validated ? '<span class="tval">✓' + esc(t.validated) + '</span>'
+                 : '<span class="tval na">—</span>') +
+    '</span>').join('');
+  const hint = document.getElementById('euidhint');
+  const src = on && e ? e.uid_src : null;
+  const setAge = on && e ? e.uid_set_age_s : null;
+  if (src === 'set' && typeof setAge === 'number' && setAge < 15) {
+    hint.textContent = 'phrase set ✓ tail ' + (e.uid || '?');
+    hint.className = 'ok';
+    hint.style.visibility = 'visible';
+  } else if (src && String(src).startsWith('default')) {
+    hint.textContent = 'default bind phrase — set yours';
+    hint.className = '';
+    hint.style.visibility = 'visible';
+  } else hint.style.visibility = 'hidden';
 }
 let elrsHist = [];                     // {t, rssi, lq} per poll, 60 s window
 let elogSeen = 0;                      // last event seq in the tab log
@@ -3145,6 +3351,7 @@ function updElrs(e, set) {
     on && (!e.lock || allZero) ? 'visible' : 'hidden';
   updElrsTlm(e, on);
   updElrsCrack(e, on, set);
+  updElrsTails(e, on);
   // Scrolling event log: append only events newer than the last seen seq.
   (on ? e.last_events || [] : []).forEach(ev => {
     if (ev.seq > elogSeen) {
@@ -3227,6 +3434,26 @@ document.getElementById('etgps').addEventListener('click', e => {
       if (chip) droneRename(chip);
     }
   }));
+/* Bind-phrase apply: POST the phrase, the dongle's confirming uid event
+   (src:"set") shows up as panel feedback via the state poll. */
+async function applyPhrase() {
+  const inp = document.getElementById('ephrase');
+  const phrase = (inp.value || '').trim();
+  if (!phrase) { toast('enter a bind phrase'); return; }
+  try {
+    const r = await (await fetch('/api/elrs/phrase', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phrase })
+    })).json();
+    toast(r.ok ? 'phrase sent — waiting for dongle confirm'
+               : 'phrase failed: ' + (r.error || '?'));
+    if (r.ok) inp.value = '';
+  } catch (e) { toast('phrase failed'); }
+}
+document.getElementById('ephrasebtn').addEventListener('click', applyPhrase);
+document.getElementById('ephrase').addEventListener('keydown', e => {
+  if (e.key === 'Enter') applyPhrase();
+});
 
 async function poll() {
   let s;
@@ -3906,6 +4133,21 @@ def create_app() -> Flask:
             STATE.locked = False  # a retune always drops the carrier first
         return jsonify({"ok": True, "index": idx, "channel": name})
 
+    @app.post("/api/elrs/phrase")
+    def api_elrs_phrase():
+        """Set the ELRS bind phrase on the sniffer dongle (console 'U
+        <phrase>'; firmware persists it to NVS and answers with a uid event,
+        src:"set" — the panel picks that up as apply feedback)."""
+        body = request.get_json(force=True, silent=True) or {}
+        phrase = str(body.get("phrase") or "").strip()
+        if not phrase or len(phrase) > ELRS_PHRASE_MAX or \
+                not all(32 <= ord(c) < 127 for c in phrase):
+            return jsonify({"ok": False, "error": "bad phrase"}), 400
+        if ELRS_MGR is None or not ELRS_MGR.send_line("U " + phrase):
+            return jsonify({"ok": False,
+                            "error": "dongle busy or unavailable"}), 503
+        return jsonify({"ok": True})
+
     @app.post("/api/shot")
     def api_shot():
         global _last_shot_mono
@@ -3983,10 +4225,11 @@ def create_app() -> Flask:
 
 
 SERIAL = None
+ELRS_MGR = None
 
 
 def main() -> None:
-    global SERIAL
+    global SERIAL, ELRS_MGR
     ap = argparse.ArgumentParser(description="C5VRX-3 foxhunt HUD")
     ap.add_argument("serial_port", nargs="?", default="/dev/cu.usbmodem312301")
     ap.add_argument("--baud", type=int, default=115200)
@@ -4000,6 +4243,7 @@ def main() -> None:
     # Second reader: the shared arbiter classifies usbmodem ports by
     # evidence, so both readers always land on their own device.
     elrs_mgr = ElrsManager()
+    ELRS_MGR = elrs_mgr
     elrs_mgr.start()
     app = create_app()
     try:
