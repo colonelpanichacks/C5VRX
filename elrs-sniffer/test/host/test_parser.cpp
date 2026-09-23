@@ -11,6 +11,7 @@
 #include "elrs_fhss.h"
 #include "sniffer_radio.h"
 #include "elrs_crc24flrc.h"
+#include "elrs_crc24flrc.h"
 
 // ---- independent CRC formulation: verbatim port of the ELRS 3.6.4 table
 // implementation (src/lib/CRC/crc.cpp Crc2Byte), kept structurally different
@@ -356,13 +357,26 @@ int main()
     }
     printf("ok: bind-phrase UID + FLRC identity vector\n");
 
+    // 11b) CR AUDIT: ELRS 3.6.4 SX1280_Regs.h names LI_4_8 = 0x07 (there is
+    //      no LI_4_7 in the 3.x header); the 3.x rate rows must carry 0x07.
+    {
+        for (uint8_t i = 0; i < ELRS_RATES_3X_COUNT; i++) {
+            if (ELRS_RATES_3X[i].rate_index == 4) continue; // 500Hz uses LI_4_6 (0x06)
+            assert(ELRS_RATES_3X[i].cr == 0x07);
+        }
+        assert(ELRS_RATES_3X[0].cr == 0x06); // LoRa 500Hz LI 4/6
+        assert(ELRS_RATES_FLRC_COUNT == 4);  // FLRC 500Hz added (rate idx1)
+        assert(ELRS_RATES_FLRC[1].rate_index == 1 && ELRS_RATES_FLRC[1].interval_us == 2000);
+    }
+    printf("ok: CR 0x07 audit + FLRC 500Hz row\n");
+
     // 12) FLRC setup bytes vs ELRS SX1280.cpp register writes (the values the
     //     firmware's FLRC branch programs — guard against regressions):
     //     SetModulationParamsFLRC {0x86 (BR0.65/BW0.6), 0x00 (CR 1/2),
     //     0x10 (BT 1.0)}; SetPacketParamsFLRC preamble field ((32/4)-1)<<4;
     //     sync word reg 0x9CF; FLRC CRC seed reg 0x9C8 (SX1280_Regs.h).
     {
-        assert(ELRS_RATES_FLRC_COUNT == 3);
+        assert(ELRS_RATES_FLRC_COUNT == 4);
         const elrs_rate_t *f = &ELRS_RATES_FLRC[0];
         assert(f->flrc && f->bw == 0x86 && f->cr == 0x00 && f->sf == 0x10);
         assert(f->preamble == 32 && f->payload == 8);
@@ -396,7 +410,11 @@ int main()
         uint8_t seq[FHSS_SEQ_COUNT], seq2[FHSS_SEQ_COUNT];
         elrs_fhss_build(0x01020304, seq);
         for (int i = 0; i < 40; i++) assert(seq[i] == golden[i]);
+        assert(FHSS_SEQ_COUNT == 240); // (256/80)*80 per the reference
         assert(seq[80] == 0x29 && seq[81] == 0x0f && seq[82] == 0x23 && seq[83] == 0x33);
+        // sync channel sits exactly at the block starts {0, 80, 160}
+        for (uint8_t p = 0; p < FHSS_SEQ_COUNT; p++)
+            assert((seq[p] == FHSS_SYNC_INDEX) == (p % FHSS_FREQ_COUNT == 0));
         for (uint8_t b = 0; b < FHSS_SEQ_COUNT / FHSS_FREQ_COUNT; b++) {
             assert(seq[b * FHSS_FREQ_COUNT] == FHSS_SYNC_INDEX); // sync at block start
             bool seen[FHSS_FREQ_COUNT] = { false };
@@ -412,10 +430,19 @@ int main()
         assert(elrs_fhss_advance(10, 0, 4) == 10);
         assert(elrs_fhss_advance(10, 4, 4) == 11);
         assert(elrs_fhss_advance(10, 3, 4) == 10);
-        assert(elrs_fhss_advance(159, 4, 4) == 0);
-        // channels: 2400.4 MHz + ch * 1 MHz
-        assert(elrs_fhss_channel_hz(0) == 2400400000u);
-        assert(elrs_fhss_channel_hz(41) == 2441400000u);
+        assert(elrs_fhss_advance(239, 4, 4) == 0);
+        // register-unit frequency plan: idx41 == 2441399841 (exact)
+        assert(elrs_fhss_channel_hz(0) == 2400399932u);
+        assert(elrs_fhss_channel_hz(41) == 2441399841u);
+        assert(elrs_fhss_channel_hz(79) == 2479399688u);
+        assert(ELRS_2G4_SYNC_FREQ_HZ == 2441399841u);
+        // FIND gate: sequence-pointer semantics (round 8)
+        assert(elrs_sync_on_sync_channel(0, seq, true));
+        assert(elrs_sync_on_sync_channel(80, seq, true));
+        assert(!elrs_sync_on_sync_channel(1, seq, true));
+        assert(!elrs_sync_on_sync_channel(240, seq, true)); // out of range
+        assert(elrs_sync_on_sync_channel(0, NULL, false));   // unknown seq: block starts
+        assert(!elrs_sync_on_sync_channel(3, NULL, false));
     }
     printf("ok: FHSS golden vector + ELRS unit-test invariants\n");
 
@@ -675,20 +702,19 @@ int main()
             assert(sw.steps[i].iq_inverted == false);
             assert(sw.steps[i + 1].iq_inverted == true);
         }
-        assert(sw.steps[8].rate->flrc == 1); // first FLRC after the LoRa first pass
+        assert(sw.steps[8].rate->flrc == 1 && sw.steps[11].rate->flrc == 1); // FLRC x4
+        assert(strcmp(sw.steps[9].rate->name, "FLRC 500Hz") == 0);
         assert(sw.steps[8].iq_inverted == false); // FLRC: IQ n/a, single polarity
     }
     printf("ok: sweep order LoRa-first (d)\n");
 
-    // 14h) FLRC CRC24 seed mechanism (round-6): golden round-trip with the
-    //     best-guess variant (UNVERIFIED against silicon — see
-    //     elrs_crc24flrc.h; tools/flrc_crc_probe.py confirms the live
-    //     variant from a known-phrase capture) + brute recovery of the seed
-    //     (= UID[4],UID[5] ^ 3) from a captured frame.
+    // 14h) FLRC CRC24 seed mechanism (round 8): FIXED poly 0x5D6DCB per the
+    //     SX1280 datasheet (Table 14-40); variants cover only init placement /
+    //     byte order. Construct -> brute 2^16 -> seed recovered.
     {
         const uint8_t UID4 = 0x61, UID5 = 0xce;
         uint16_t seed = elrs_crc_init_from_uid(UID4, UID5);
-        uint8_t payload[5] = { 0x2a, 0x41, 0x07, 0x64, 0x10 }; // sync-shaped-ish
+        uint8_t payload[5] = { 0x2A, 0x41, 0x07, 0x64, 0x10 };
         uint8_t frame[8];
         memcpy(frame, payload, 5);
         uint32_t crc = elrs_crc24flrc_calc(0, seed, frame, 5);
@@ -699,12 +725,13 @@ int main()
         assert(got_seed == seed && got_variant == 0);
         uint16_t raw = (uint16_t)(got_seed ^ ELRS_OTA_VERSION_ID_3X);
         assert((uint8_t)(raw >> 8) == UID4 && (uint8_t)(raw & 0xFF) == UID5);
-        // wrong seed / corrupted frame rejected
         assert(!elrs_crc24flrc_check(0, seed ^ 1, frame, 8));
         frame[3] ^= 0x01;
         assert(!elrs_crc24flrc_check(0, seed, frame, 8));
+        assert(ELRS_CRC24FLRC_VARIANTS == 3);
+        assert(ELRS_CRC24FLRC_POLY == 0x5D6DCB);
     }
-    printf("ok: FLRC CRC24 seed mechanism (golden, variant-pending silicon check)\n");
+    printf("ok: FLRC CRC24 poly 0x5D6DCB construct+brute\n");
 
     // 14i) UID[2] TRACKERS: real LCG sequence, true uid2 survives, others die
     {
@@ -766,6 +793,35 @@ int main()
         assert(false_pos == 0); // 2^-22 per frame: expected 0
     }
     printf("ok: bind harvest parser (layout + junk rejection)\n");
+
+    // 14k) SWITCH DECODE ENDPOINTS (audit 7): SWITCH3b table + N_to_CRSF
+    //     endpoints 191/1792 with round-to-nearest (crsf_protocol.h).
+    {
+        elrs_decode_ctx_t ctx;
+        elrs_decode_init(&ctx);
+        ctx.switch_mode = ELRS_SW_HYBRID8;
+        // hybrid8 switches byte: swidx 0 -> AUX2 = 3-bit value 3
+        uint8_t pkt[ELRS_OTA4_LEN] = { ELRS_PKT_RCDATA, 0, 0, 0, 0, 0, 0, 0 };
+        pkt[6] = (uint8_t)((0 << 1) | (3 << 4) | (0 << 7)); // ch4=0, switches=0x18<<... build: switches byte = swidx<<4 | value<<1? layout: switches:7 | ch4:1 -> sw field = byte>>1
+        // simpler: switches byte value = (swidx<<4 | v<<1)? per decoder: swidx=(b>>4)&7? -- our decoder: sw = data[6]>>1; swidx=(sw>>3)&7... replicate decoder wiring:
+        // sw = byte>>1; swidx=(sw & 0b111000)>>3 = bits[6:4] of byte; value = sw&7 = bits[3:1]
+        pkt[6] = (0 << 1) | (0 << 4) | (3 << 1 + 0); // recompute below instead
+        // direct: byte = ch4 | (swidx<<4) | (value<<1)
+        pkt[6] = (uint8_t)((0 << 0) | (0 << 4) | (5 << 1)); // swidx 0, value 5 -> AUX2=1792
+        elrs_packet_t out;
+        elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out);
+        assert(out.rc.has_ch[5] && out.rc.ch[5] == 1792);
+        pkt[6] = (uint8_t)((6 << 1)); // swidx 0, value 6 -> 992
+        elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out);
+        assert(out.rc.ch[5] == 992);
+        pkt[6] = (uint8_t)((0 << 1)); // value 0 -> 191
+        elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out);
+        assert(out.rc.ch[5] == 191);
+        pkt[6] = (uint8_t)((3 << 1)); // value 3 -> 3*240+391 = 1111
+        elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out);
+        assert(out.rc.ch[5] == 1111);
+    }
+    printf("ok: switch decode endpoints (reference tables)\n");
 
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,

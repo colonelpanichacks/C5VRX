@@ -73,13 +73,14 @@ static uint32_t g_int_t0, g_int_rx0, g_int_log_ms;
 // IQ). Sync-shaped frames are exported as sync_frame events (throttled);
 // LoRa frames validate via the self-seeded CRC14 (direct lock possible);
 // FLRC frames feed the uid45 seed brute (2^16 x 4 CRC24 variants).
-#define HARVEST_STEPS 7
+#define HARVEST_STEPS 8
 #define HARVEST_DWELL_MS 750u
 #define FASTLINK_MS 60000u
 static const sniffer_step_t g_harvest_steps[HARVEST_STEPS] = {
     { &ELRS_RATES_FLRC[0], false, false },  // FLRC 1000Hz (discovery)
-    { &ELRS_RATES_FLRC[1], false, false },  // DVDA 500
-    { &ELRS_RATES_FLRC[2], false, false },  // DVDA 250
+    { &ELRS_RATES_FLRC[1], false, false },  // FLRC 500Hz (discovery)
+    { &ELRS_RATES_FLRC[2], false, false },  // DVDA 500
+    { &ELRS_RATES_FLRC[3], false, false },  // DVDA 250
     { &ELRS_RATES_3X[2], false, false },    // LoRa 250 n
     { &ELRS_RATES_3X[2], true, false },     // LoRa 250 i
     { &ELRS_RATES_3X[0], false, false },    // LoRa 500 n
@@ -1385,7 +1386,9 @@ void loop()
                     n_sync++; dwell_sync++;
                     // ---- FIND MODE: sync-shaped frame on the sync channel ----
                     if (g_mode != 0 && !locked &&
-                        pkt.sync.fhss_index == FHSS_SYNC_INDEX &&
+                        elrs_sync_on_sync_channel(pkt.sync.fhss_index,
+                                                  g_uid2_known ? g_seq : NULL,
+                                                  g_uid2_known) &&
                         pkt.sync.rate_index <= 9) {
                         // dedupe by (nonce, fhss) within the harvest cycle
                         bool seen = false;

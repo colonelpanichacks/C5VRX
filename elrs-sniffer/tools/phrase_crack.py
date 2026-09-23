@@ -90,11 +90,11 @@ def lora_sync_ok(frame, uid):
 
 def crc24flrc(seed, data, variant):
     if variant == 1:
-        st, poly = 0xFF0000 | seed, 0xFFFF00
+        st, poly = 0xFF0000 | seed, 0x5D6DCB
     elif variant == 3:
-        st, poly = (seed << 8) & 0xFFFFFF, 0x00FFFF
+        st, poly = (seed << 8) & 0xFFFFFF, 0x5D6DCB
     else:
-        st, poly = (seed << 8) & 0xFFFFFF, 0xFFFF00
+        st, poly = (seed << 8) & 0xFFFFFF, 0x5D6DCB
     for b in data:
         st ^= b << 16
         for _ in range(8):
@@ -109,7 +109,7 @@ def flrc_frame_ok(frame, uid):
     calc = crc24flrc(seed, frame[:-3], 0)
     got_be = (frame[-3] << 16) | (frame[-2] << 8) | frame[-1]
     got_le = (frame[-1] << 16) | (frame[-2] << 8) | frame[-3]
-    for v in range(4):
+    for v in range(3):
         c = crc24flrc(seed, frame[:-3], v)
         if c in (got_be, got_le):
             return True

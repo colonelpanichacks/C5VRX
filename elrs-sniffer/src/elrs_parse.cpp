@@ -106,7 +106,7 @@ bool elrs_identity_sane(const elrs_sync_info_t *s)
 {
     return s->rate_index <= 9 &&      // 3.x SX128X table has 10 entries
            s->tlm_ratio <= 8 &&       // expresslrs_tlm_ratio_e max (1:2)
-           s->fhss_index < 160;       // FHSS_SEQUENCE_LEN for 80ch 2.4G
+           s->fhss_index < 240;       // FHSS_SEQUENCE_LEN (256/80)*80
 }
 
 // returns true exactly when identity is accepted (the 2nd consecutive
@@ -175,6 +175,22 @@ static uint16_t elrs_10bit_to_crsf(uint16_t v10, bool full_range)
         return crsf > CRSF_VAL_MAX ? CRSF_VAL_MAX : crsf;
     }
     return (uint16_t)(CRSF_VAL_MIN + ((uint32_t)v10 * (CRSF_VAL_MAX - CRSF_VAL_MIN)) / 1023);
+}
+
+// Reference switch decoders (CRSF spec / crsf_protocol.h):
+// SWITCH3b_to_CRSF: 0->191, 1..4 -> v*240+391, 5->1792, 6/7->992
+static uint16_t switch3b_to_crsf(uint8_t v)
+{
+    if (v == 0) return 191;
+    if (v == 5) return 1792;
+    if (v >= 6) return 992;
+    return (uint16_t)(v * 240 + 391);
+}
+// N_to_CRSF with endpoints CHANNEL_VALUE_1000/2000 = 191/1792, round-to-nearest
+static uint16_t n_to_crsf(uint16_t v, uint16_t n)
+{
+    if (n < 2) n = 2;
+    return (uint16_t)(191 + (v * 1601u + (n - 1) / 2) / (n - 1));
 }
 
 // CRSF 11-bit value -> servo pulse microseconds (172 -> 988us, 1811 -> 2012us)
@@ -358,6 +374,7 @@ bool elrs_bind_parse(const uint8_t *data, size_t len, uint8_t uid2_5[4])
 {
     if (len != ELRS_OTA4_LEN) return false;
     if ((data[0] & 0x03) != ELRS_PKT_MSP) return false;
+    if ((data[1] & 0x7F) > 1) return false; // rx_main expects the first package(s)
     if (data[2] != ELRS_MSP_BIND) return false;
     if (!ota4_crc_ok(data, 0, 0)) return false; // bind mode: CRC init 0
     memcpy(uid2_5, &data[3], 4);
@@ -527,19 +544,19 @@ bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
                 uint8_t sw = data[6] >> 1; // byte is switches:7 | ch4:1
                 out->rc.telemetry_status = (sw >> 6) & 1;
                 uint8_t swidx = (sw >> 3) & 0x07;
-                if (swidx >= 6) { // "index 6" encodes AUX8 hi-res, low bit is data
+                if (swidx >= 6) { // "index 6" encodes AUX8 hi-res (16-pos)
                     out->rc.has_ch[11] = true;
-                    out->rc.ch[11] = (uint16_t)(CRSF_VAL_MIN + (uint32_t)(sw & 0x0F) * (CRSF_VAL_MAX - CRSF_VAL_MIN) / 15);
+                    out->rc.ch[11] = n_to_crsf(sw & 0x0F, 16);
                 } else {
                     out->rc.has_ch[5 + swidx] = true;
-                    out->rc.ch[5 + swidx] = (uint16_t)(CRSF_VAL_MIN + (uint32_t)(sw & 0x07) * (CRSF_VAL_MAX - CRSF_VAL_MIN) / 7);
+                    out->rc.ch[5 + swidx] = switch3b_to_crsf(sw & 0x07);
                 }
             } else {
                 // wide: 6/7-bit round-robin value; the AUX slot is implied by
                 // the nonce (TODO without per-packet nonce tracking we park
                 // the value on AUX2 and flag it as unslotted)
                 out->rc.has_ch[5] = true;
-                out->rc.ch[5] = (uint16_t)(CRSF_VAL_MIN + (uint32_t)((data[6] >> 1) & 0x7F) * (CRSF_VAL_MAX - CRSF_VAL_MIN) / 127);
+                out->rc.ch[5] = n_to_crsf((data[6] >> 1) & 0x7F, 127); // wide: 7-bit, 127 bins
             }
         }
         if (!crc_ok) {

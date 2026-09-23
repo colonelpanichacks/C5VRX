@@ -21,9 +21,11 @@
 
 #define FHSS_FREQ_COUNT 80u
 #define FHSS_SYNC_INDEX 41u
-#define FHSS_SEQ_COUNT 160u               // (256 / 80) * 80
-#define FHSS_BASE_HZ    2400400000u
-#define FHSS_STEP_HZ    1000000u
+#define FHSS_SEQ_COUNT 240u               // (256 / 80) * 80 (ELRS FHSS.cpp:86)
+// Register-unit frequency plan (ELRS FREQ_HZ_TO_REG_VAL, FREQ_STEP = 52e6/2^18):
+// spread = (stop_reg - start_reg) * 256 / 79; freq(idx)_reg = start + idx*spread/256
+#define FHSS_START_REG 12100970u          // FREQ_HZ_TO_REG_VAL(2400400000)
+#define FHSS_SPREAD_REG 1290554u          // (stop-start)*256/79
 
 typedef struct { uint32_t s; } elrs_rng_t;
 
@@ -58,9 +60,25 @@ static inline void elrs_fhss_build(uint32_t mac_seed, uint8_t seq[FHSS_SEQ_COUNT
     }
 }
 
+static inline uint32_t elrs_fhss_channel_reg(uint8_t ch)
+{
+    return FHSS_START_REG + (uint32_t)ch * FHSS_SPREAD_REG / 256u;
+}
 static inline uint32_t elrs_fhss_channel_hz(uint8_t ch)
 {
-    return FHSS_BASE_HZ + (uint32_t)ch * FHSS_STEP_HZ;
+    return (uint32_t)(((uint64_t)elrs_fhss_channel_reg(ch) * 52000000u) >> 18);
+}
+#define ELRS_2G4_SYNC_FREQ_HZ_DRV elrs_fhss_channel_hz(FHSS_SYNC_INDEX) // 2441399841
+
+// FIND-gate helper (round 8): fhssIndex is the SEQUENCE POINTER, not the
+// channel — a sync frame was sent ON the sync channel iff seq[pointer]==41,
+// which for any UID happens exactly at the block starts (p % 80 == 0).
+static inline bool elrs_sync_on_sync_channel(uint8_t fhss_ptr,
+                                             const uint8_t *seq, bool seq_known)
+{
+    if (fhss_ptr >= FHSS_SEQ_COUNT) return false;
+    if (seq_known) return seq[fhss_ptr] == FHSS_SYNC_INDEX;
+    return (fhss_ptr % FHSS_FREQ_COUNT) == 0;
 }
 
 // TX position advances one sequence entry per hopInterval packets

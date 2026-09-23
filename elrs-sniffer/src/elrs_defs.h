@@ -91,11 +91,11 @@ typedef struct {
 static const elrs_rate_t ELRS_RATES_3X[] = {
     // name           bw     sf     cr     pre  interval  len  hop  idx
     { "LoRa 500Hz",   0x18,  0x50,  0x06,  12,   2000,     8,   4,   4 , 0, 2500, 2500 },
-    { "LoRa 333Hz8",  0x18,  0x50,  0x08,  12,   3003,    13,   4,   5 , 0, 2500, 2500 },
-    { "LoRa 250Hz",   0x18,  0x60,  0x08,  14,   4000,     8,   4,   6 , 0, 3000, 2500 },
-    { "LoRa 150Hz",   0x18,  0x70,  0x08,  12,   6666,     8,   4,   7 , 0, 3500, 2500 },
-    { "LoRa 100Hz8",  0x18,  0x70,  0x08,  12,  10000,    13,   4,   8 , 0, 3500, 2500 },
-    { "LoRa 50Hz",    0x18,  0x80,  0x08,  12,  20000,     8,   2,   9 , 0, 4000, 2500 },
+    { "LoRa 333Hz8",  0x18,  0x50,  0x07,  12,   3003,    13,   4,   5 , 0, 2500, 2500 },
+    { "LoRa 250Hz",   0x18,  0x60,  0x07,  14,   4000,     8,   4,   6 , 0, 3000, 2500 },
+    { "LoRa 150Hz",   0x18,  0x70,  0x07,  12,   6666,     8,   4,   7 , 0, 3500, 2500 },
+    { "LoRa 100Hz8",  0x18,  0x70,  0x07,  12,  10000,    13,   4,   8 , 0, 3500, 2500 },
+    { "LoRa 50Hz",    0x18,  0x80,  0x07,  12,  20000,     8,   2,   9 , 0, 4000, 2500 },
 };
 #define ELRS_RATES_3X_COUNT (sizeof(ELRS_RATES_3X) / sizeof(ELRS_RATES_3X[0]))
 
@@ -121,6 +121,7 @@ static const elrs_rate_t ELRS_RATES_2X[] = {
 static const elrs_rate_t ELRS_RATES_FLRC[] = {
     // name            flrc-bw flrc-bt flrc-cr pre  interval  len  hop  idx  flrc
     { "FLRC 1000Hz",   0x86,   0x10,   0x00,  32,   1000,     8,   2,   0,  1 , 2500, 2500 },
+    { "FLRC 500Hz",    0x86,   0x10,   0x00,  32,   2000,     8,   2,   1,  1 , 2500, 2500 },
     { "DVDA 500Hz",    0x86,   0x10,   0x00,  32,   1000,     8,   2,   2,  1 , 2500, 2500 },
     { "DVDA 250Hz",    0x86,   0x10,   0x00,  32,   1000,     8,   2,   3,  1 , 2500, 2500 },
 };
@@ -143,7 +144,10 @@ static const elrs_rate_t ELRS_RATES_FLRC[] = {
 #define ELRS_2G4_FREQ_COUNT      80u
 #define ELRS_2G4_FREQ_SPACING_HZ 1000000u
 #define ELRS_2G4_SYNC_INDEX      41u
-#define ELRS_2G4_SYNC_FREQ_HZ    (ELRS_2G4_FREQ_START_HZ + ELRS_2G4_SYNC_INDEX * ELRS_2G4_FREQ_SPACING_HZ)
+// Exact register-unit value (round-8 freq plan): 2441399841 Hz. The
+// audit's 2441.502 MHz does not follow from ELRS 3.6.4's documented
+// freq_start (2400.4 MHz); idx41 lands here per the reference formula.
+#define ELRS_2G4_SYNC_FREQ_HZ    2441399841u
 
 // ---------------------------------------------------------------------------
 // InvertIQ rule (src/src/rx_main.cpp SetRFLinkRate):

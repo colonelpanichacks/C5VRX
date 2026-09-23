@@ -225,6 +225,14 @@ hop-following runs in both cases (syncs re-anchor the sequence).
   `stats` for ~1.5 s (splash); while parked, dwell extensions still apply
   and the unlock path re-enters at the parked step.
 
+Round-8 audit notes (values changed, fields unchanged): the tuned sync
+frequency is now the exact register-unit value **2441399841 Hz** (all `freq`
+fields); FLRC now includes the 500 Hz rate; `sync_frame` gating uses the
+sequence-pointer semantics (fhssIndex is a pointer into the 240-entry hop
+sequence, not a channel). `uid45.variant` now spans 3 values (init placement
+/ byte order only — the FLRC CRC24 poly is the fixed 0x5D6DCB per the
+SX1280 datasheet).
+
 ## Find mode (passive bind-phrase/UID discovery)
 
 `sync_frame` — a sync-shaped frame captured while parked on the sync

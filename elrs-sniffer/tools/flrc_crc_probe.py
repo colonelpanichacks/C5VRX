@@ -23,11 +23,11 @@ POLY = {"0": 0xFFFF00, "1": 0xFFFF00, "2": 0xFFFF00, "3": 0x00FFFF}
 
 def crc24(seed, data, variant):
     if variant == 1:
-        st, poly = 0xFF0000 | seed, 0xFFFF00
+        st, poly = 0xFF0000 | seed, 0x5D6DCB
     elif variant == 3:
-        st, poly = (seed << 8) & 0xFFFFFF, 0x00FFFF
+        st, poly = (seed << 8) & 0xFFFFFF, 0x5D6DCB
     else:
-        st, poly = (seed << 8) & 0xFFFFFF, 0xFFFF00
+        st, poly = (seed << 8) & 0xFFFFFF, 0x5D6DCB
     for b in data:
         st ^= b << 16
         for _ in range(8):
@@ -64,7 +64,7 @@ def main():
         total += 1
         got_be = (frame[-3] << 16) | (frame[-2] << 8) | frame[-1]
         got_le = (frame[-1] << 16) | (frame[-2] << 8) | frame[-3]
-        for v in range(4):
+        for v in range(3):
             if crc24(seed, frame[:-3], v) in (got_be, got_le):
                 hits[v] += 1
     print("%d FLRC frames checked" % total)
