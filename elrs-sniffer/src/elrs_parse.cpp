@@ -354,6 +354,16 @@ void elrs_decode_tlm_fragment(elrs_decode_ctx_t *ctx, uint8_t package_index,
     }
 }
 
+bool elrs_bind_parse(const uint8_t *data, size_t len, uint8_t uid2_5[4])
+{
+    if (len != ELRS_OTA4_LEN) return false;
+    if ((data[0] & 0x03) != ELRS_PKT_MSP) return false;
+    if (data[2] != ELRS_MSP_BIND) return false;
+    if (!ota4_crc_ok(data, 0, 0)) return false; // bind mode: CRC init 0
+    memcpy(uid2_5, &data[3], 4);
+    return true;
+}
+
 bool elrs_sync_crc_selfseed(const uint8_t *data, size_t len,
                             uint16_t *init_out, uint8_t *uid5_true_out,
                             uint8_t *model_id_out)

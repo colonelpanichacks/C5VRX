@@ -732,6 +732,41 @@ int main()
     }
     printf("ok: UID2 trackers (real sequence vectors)\n");
 
+    // 14j) BIND HARVEST (round 7): MSP_ELRS_BIND=0x09 layout from tx_main
+    //     SendUIDOverMSP: OTA4 MSP, payload [0x09, UID2..5], CRC14 init 0.
+    {
+        const uint8_t U2 = 0x5a, U3 = 0x61, U4 = 0xac, U5 = 0xe1;
+        uint8_t pkt[ELRS_OTA4_LEN] = { ELRS_PKT_MSP, 0x00, ELRS_MSP_BIND, U2, U3, U4, U5, 0 };
+        uint16_t crc = elrs_crc14(pkt, 7, 0); // bind mode: init 0
+        pkt[0] |= (uint8_t)((crc >> 8) << 2);
+        pkt[7] = (uint8_t)(crc & 0xFF);
+        uint8_t u[4];
+        assert(elrs_bind_parse(pkt, ELRS_OTA4_LEN, u));
+        assert(u[0] == U2 && u[1] == U3 && u[2] == U4 && u[3] == U5);
+        // junk: wrong type, wrong marker, wrong CRC, wrong length -> reject
+        uint8_t junk[ELRS_OTA4_LEN];
+        memcpy(junk, pkt, sizeof(junk));
+        junk[0] = (junk[0] & 0xFC) | ELRS_PKT_RCDATA;
+        assert(!elrs_bind_parse(junk, ELRS_OTA4_LEN, u));
+        memcpy(junk, pkt, sizeof(junk));
+        junk[2] = 0x0A;
+        assert(!elrs_bind_parse(junk, ELRS_OTA4_LEN, u));
+        memcpy(junk, pkt, sizeof(junk));
+        junk[5] ^= 0x10; // corrupt UID[3]
+        assert(!elrs_bind_parse(junk, ELRS_OTA4_LEN, u));
+        assert(!elrs_bind_parse(pkt, ELRS_OTA8_LEN, u));
+        // chance frame: random bytes essentially never pass (init 0 + marker)
+        srand(777);
+        unsigned false_pos = 0;
+        for (int i = 0; i < 20000; i++) {
+            for (int j = 0; j < ELRS_OTA4_LEN; j++) junk[j] = rand() & 0xFF;
+            junk[0] = (junk[0] & 0xFC) | ELRS_PKT_MSP;
+            if (elrs_bind_parse(junk, ELRS_OTA4_LEN, u)) false_pos++;
+        }
+        assert(false_pos == 0); // 2^-22 per frame: expected 0
+    }
+    printf("ok: bind harvest parser (layout + junk rejection)\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

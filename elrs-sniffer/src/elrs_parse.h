@@ -200,6 +200,16 @@ static inline bool elrs_lastlink_fresh(bool uid_known, uint32_t demote_ms,
     return uid_known && (now_ms - demote_ms <= ELRS_LASTLINK_DECAY_MS);
 }
 
+// ELRS bind-mode broadcast (tx_main.cpp 3.6.4 SendUIDOverMSP + EnterBinding-
+// Mode): a TX in bind mode sends, on the sync channel, LoRa 50Hz, INVERTED
+// IQ, CRC init 0, locked nonce: OTA4 MSP packets whose 5-byte payload is
+// [MSP_ELRS_BIND=0x09, UID[2], UID[3], UID[4], UID[5]]. That is the one
+// place ELRS ever broadcasts UID[2..5] in plaintext — the reliable passive
+// UID source. Layout (8 bytes): [0]=type 0b01|crcHi6 [1]=pkgIdx:7|tlm:1
+// [2]=0x09 [3..6]=UID2..5 [7]=crcLo; CRC14 poly 0x2E57 init 0 over 0..6.
+#define ELRS_MSP_BIND 0x09
+bool elrs_bind_parse(const uint8_t *data, size_t len, uint8_t uid2_5[4]);
+
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only
 // returns true the moment identity is ACCEPTED (2nd consistent sync)

@@ -246,8 +246,22 @@ tools/flrc_crc_probe.py confirms the variant against a known-phrase capture,
 treat uid45 as strong-but-unconfirmed. Phrase check offline:
 `python3 tools/phrase_crack.py <uid_tail> --frames capture.jsonl`.
 
-`harvest` — `{"t":"event","what":"harvest","state":"start"}` marks each
-find-mode cycle (6 dwells x ~750 ms on the sync frequency).
+`harvest` — `{"t":"event","what":"harvest","state":"start","freq":2441400000}`
+marks each find-mode cycle (7 dwells x ~750 ms PARKED ON THE SYNC FREQUENCY
+2441.4 MHz — the `freq` field is logged once per cycle so it can be verified
+against the expected 2441.5 MHz class allocation).
+
+`uid_found` — ELRS bind mode broadcasts the UID in plaintext
+(`MSP_ELRS_BIND=0x09, UID[2..5]` on the sync channel, LoRa 50Hz, inverted IQ,
+CRC init 0); the sniffer adopts it immediately:
+```json
+{"t":"event","what":"uid_found","uid":"?? ?? 5a 61 ac e1","src":"bind","freq":2441400000,"rssi":-42}
+```
+UID[0..1] are never broadcast ("??"). Adoption also emits the standard `uid`
+event with `"src":"bind"`, persists the UID as `uidlast`, and starts
+following. On boot with a stored `uidlast`, a 60 s `fastlink` window
+(`{"t":"event","what":"fastlink","state":"start"|"end"}`) retries exact
+follow on the four main LoRa rates before falling back to the full sweep.
 
 `uid_cracked` may now carry `"via":"uid2-trackers"` and `uid2_alt`: the
 FHSS sequence cannot distinguish UID[2] bit 7 (mod 2^31 drops it), so the

