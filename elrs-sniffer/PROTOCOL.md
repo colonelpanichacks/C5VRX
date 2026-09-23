@@ -40,6 +40,7 @@ use host reception time for graphs, `ms` only for intra-device ordering.
 | `radio` | 0/1 | — | 0 = radio faulted (no SX1280); device alive but deaf. `rssi` is then the last/initial -128 sentinel |
 | `rx`, `crc_ok` | uint | count | cumulative since boot: RxDone demods / ELRS-CRC-validated packets |
 | `types` | object | count | cumulative per-type parses: `rc`, `msp`, `sync`, `tlm`, and `unk` (demodded but failed classification = noise) |
+| `sig` | object | — | elrs_sig quality: `q` = `none`/`weak`/`firm`/`strong` (firm = >=3 `crc_pass` in the harvest pass OR >=10 `sync_struct` with >=1 repeated tail; strong = >=10 `crc_pass`; weak = >=3 `sync_struct`), plus `frames`, `sync_struct`, `crc_pass` totals and per-band `lora`/`flrc` `{f,s,c}` sub-objects |
 | `sync_only` | 0/1 | — | locked but no validated RC data for >2 s — a sync-follow lock (TX beaconing, model disarmed/off). Sticks in `ch` are stale; expect no telemetry |
 | `uid` | string, optional | — | `UID[3..5]` as lowercase hex — **link fingerprint, not identity**; absent until a sync is captured |
 

@@ -112,6 +112,9 @@ static int16_t g_uid2_survivor;
 static uint8_t g_uid2_track_store[sizeof(elrs_uid2_track_t)];
 static bool g_bind_seen;
 static uint8_t g_bind_last[4];
+// elrs_sig quality (round 9): per-harvest-pass ELRS-presence signal
+static uint32_t g_sig_frames[2], g_sig_sync[2], g_sig_crc[2]; // [0]=lora [1]=flrc
+static uint32_t g_sig_repeat_tails;
 static uint32_t last_pkt_debug_ms;      // crc-ok pkt hex (2/s)
 static uint32_t last_rawpkt_ms;         // sync-classified raw hex (2/s)
 
@@ -451,6 +454,16 @@ static void emit_fingerprint(const char *band)
 // Configure the radio for a sweep step. The "dwell" event is emitted when a
 // dwell ENDS (dwell_advance), carrying that dwell's rssi_max — so the serial
 // log prints an energy fingerprint per rate as the sweep runs.
+// The ACTUAL active dwell step (sweep/harvest/fastlink aware). Using
+// sweep.steps[step_idx] outside the sweep mislabels harvest frames
+// (round-9: sync_frame said band=lora while sitting on an FLRC step).
+static const sniffer_step_t &cur_step()
+{
+    if (g_mode == 1) return g_harvest_steps[g_harvest_idx % HARVEST_STEPS];
+    if (g_mode == 2) return g_fastlink_steps[g_harvest_idx % 4];
+    return sweep.steps[step_idx];
+}
+
 static void dwell_begin(uint8_t i)
 {
     const sniffer_step_t *sp;
@@ -549,6 +562,10 @@ static void dwell_advance()
             // cycle (sync-frequency parking) before the next pass
             memset(g_hot, 0, sizeof(g_hot));
             g_mode = 1;
+            memset(g_sig_frames, 0, sizeof(g_sig_frames));
+            memset(g_sig_sync, 0, sizeof(g_sig_sync));
+            memset(g_sig_crc, 0, sizeof(g_sig_crc));
+            g_sig_repeat_tails = 0;
             Serial.printf("{\"t\":\"event\",\"what\":\"harvest\",\"state\":\"start\",\"freq\":%lu}\n",
                           (unsigned long)ELRS_2G4_SYNC_FREQ_HZ);
             dwell_begin(0);
@@ -753,6 +770,8 @@ static void stats_tick()
                   "\"lq_permille\":%lu,\"lock\":%u,\"radio\":%u,"
                   "\"freq\":%lu,\"fhss\":%u,\"sync_only\":%u,"
                   "\"crack\":\"%s\",\"mode\":\"%s\",\"conn\":\"%s\","
+                  "\"sig\":{\"q\":\"%s\",\"frames\":%lu,\"sync_struct\":%lu,\"crc_pass\":%lu,"
+                  "\"lora\":{\"f\":%lu,\"s\":%lu,\"c\":%lu},\"flrc\":{\"f\":%lu,\"s\":%lu,\"c\":%lu}},"
                   "\"rx\":%lu,\"crc_ok\":%lu,"
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},"
                   "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u",
@@ -766,6 +785,14 @@ static void stats_tick()
                   (locked && now - last_rc_ms > 2000) ? 1u : 0u,
                   g_crack_state, mode,
                   g_conn == CONN_CONNECTED ? "connected" : (g_conn == CONN_TENTATIVE ? "tentative" : "disconnected"),
+                  elrs_sig_name(elrs_sig_quality(g_sig_crc[0] + g_sig_crc[1],
+                                                 g_sig_sync[0] + g_sig_sync[1],
+                                                 g_sig_repeat_tails > 0)),
+                  (unsigned long)(g_sig_frames[0] + g_sig_frames[1]),
+                  (unsigned long)(g_sig_sync[0] + g_sig_sync[1]),
+                  (unsigned long)(g_sig_crc[0] + g_sig_crc[1]),
+                  (unsigned long)g_sig_frames[0], (unsigned long)g_sig_sync[0], (unsigned long)g_sig_crc[0],
+                  (unsigned long)g_sig_frames[1], (unsigned long)g_sig_sync[1], (unsigned long)g_sig_crc[1],
                   (unsigned long)n_rx, (unsigned long)n_crc_ok,
                   (unsigned long)n_rc, (unsigned long)n_msp,
                   (unsigned long)n_sync, (unsigned long)n_tlm, (unsigned long)n_unk,
@@ -1293,7 +1320,8 @@ void loop()
     }
 
     if (radio_ok) {
-        const bool flrc_step = sweep.steps[step_idx].rate->flrc;
+        const sniffer_step_t &step_now = cur_step();
+        const bool flrc_step = step_now.rate->flrc;
         // live energy sampling (<=5 Hz) — the RF-path discriminator.
         // Guarded: only when RX is running and no packet SPI is in flight;
         // three consecutive SPI errors stop sampling for THIS dwell (the
@@ -1315,13 +1343,14 @@ void loop()
 
         uint8_t buf[ELRS_OTA8_LEN];
         float rssi, snr;
-        size_t want = sweep.steps[step_idx].rate->payload;
+        size_t want = step_now.rate->payload;
 
         g_rx_busy = true;
         bool got = g_radio.read_packet(buf, want, rssi, snr);
         g_rx_busy = false;
         if (got) {
             n_rx++; dwell_rx++; window_rx++;
+            if (g_mode != 0) g_sig_frames[flrc_step ? 1 : 0]++;
             elrs_packet_t pkt;
             bool ok = elrs_decode_packet(&dctx, buf, want, &pkt);
             if (rssi > last_rssi) last_rssi = rssi; // peak-hold for the stats window
@@ -1356,6 +1385,7 @@ void loop()
                 }
                 if (pkt.cls == ELRS_PKT_CLASS_CRC_OK) {
                     n_crc_ok++; dwell_crc_ok++; window_pkts++;
+                    if (g_mode != 0) g_sig_crc[flrc_step ? 1 : 0]++;
                     if (locked) lock_total_pkts++;
                     // rule 5: discovery-mode garbage must not extend a lock's
                     // liveness; only real (non-discovery) validated packets do
@@ -1384,6 +1414,13 @@ void loop()
                 switch (pkt.type) {
                 case ELRS_PKT_SYNC:
                     n_sync++; dwell_sync++;
+                    if (g_mode != 0) {
+                        g_sig_sync[flrc_step ? 1 : 0]++;
+                        static uint8_t lt3, lt4, lt5;
+                        if (pkt.sync.uid3 == lt3 && pkt.sync.uid4 == lt4 && pkt.sync.uid5 == lt5)
+                            g_sig_repeat_tails++;
+                        lt3 = pkt.sync.uid3; lt4 = pkt.sync.uid4; lt5 = pkt.sync.uid5;
+                    }
                     // ---- FIND MODE: sync-shaped frame on the sync channel ----
                     if (g_mode != 0 && !locked &&
                         elrs_sync_on_sync_channel(pkt.sync.fhss_index,
@@ -1410,8 +1447,9 @@ void loop()
                                 char hex[2 * ELRS_OTA4_LEN + 1];
                                 to_hex(buf, want, hex);
                                 Serial.printf("{\"t\":\"sync_frame\",\"band\":\"%s\",\"rate\":\"%s\","
-                                              "\"hex\":\"%s\",\"rssi\":%d}\n",
-                                              flrc_step ? "flrc" : "lora", uist.rate, hex, (int)rssi);
+                                              "\"hex\":\"%s\",\"rssi\":%d,\"fhss\":%u}\n",
+                                              flrc_step ? "flrc" : "lora", step_now.rate->name, hex,
+                                              (int)rssi, pkt.sync.fhss_index);
                             }
                             // FLRC: seed brute (2^16 x variants), 2-frame confirm
                             if (flrc_step) {

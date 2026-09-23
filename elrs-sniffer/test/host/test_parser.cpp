@@ -823,6 +823,88 @@ int main()
     }
     printf("ok: switch decode endpoints (reference tables)\n");
 
+    // 14l) ROUND-9 FP GATE: CRC-passing frames with IMPOSSIBLE sync fields
+    //      (rateIdx 11/15) must NOT emit ok:1; golden syncs still validate
+    //      (incl rateIdx=9); random storm produces zero ok:1.
+    {
+        // craft: valid CRC14 (self-seeded, modelId 0) but insane rateIdx=15
+        elrs_decode_ctx_t ctx;
+        elrs_decode_init(&ctx);
+        uint8_t pkt[ELRS_OTA4_LEN] = { ELRS_PKT_SYNC, 42, 7, 0xF0, 0x61, 0xac, 0xe1, 0 };
+        uint16_t init = elrs_crc_init_from_uid(0xac, 0xe1);
+        uint16_t crc = elrs_crc14(pkt, 7, init);
+        pkt[0] |= (uint8_t)((crc >> 8) << 2);
+        pkt[7] = (uint8_t)(crc & 0xFF);
+        elrs_packet_t out;
+        bool ok = elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out);
+        assert(!ok || out.cls != ELRS_PKT_CLASS_CRC_OK); // FP gate rejects
+        // rateIdx=11 variant
+        pkt[0] = ELRS_PKT_SYNC;
+        pkt[3] = (uint8_t)((11 << 4) | (2 << 1));
+        crc = elrs_crc14(pkt, 7, init);
+        pkt[0] = (uint8_t)(ELRS_PKT_SYNC | ((crc >> 8) << 2));
+        pkt[7] = (uint8_t)(crc & 0xFF);
+        ok = elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out);
+        assert(!ok || out.cls != ELRS_PKT_CLASS_CRC_OK);
+        // golden rateIdx=9 still validates
+        pkt[0] = ELRS_PKT_SYNC;
+        pkt[3] = (uint8_t)((9 << 4) | (2 << 1));
+        crc = elrs_crc14(pkt, 7, init);
+        pkt[0] = (uint8_t)(ELRS_PKT_SYNC | ((crc >> 8) << 2));
+        pkt[7] = (uint8_t)(crc & 0xFF);
+        ok = elrs_decode_packet(&ctx, pkt, ELRS_OTA4_LEN, &out);
+        assert(ok && out.cls == ELRS_PKT_CLASS_CRC_OK);
+        // forced-insane storm (rateIdx=15): the FP gate kills EVERY frame
+        // regardless of CRC — deterministically zero ok:1
+        srand(2024);
+        unsigned fp = 0;
+        for (int i = 0; i < 20000; i++) {
+            uint8_t junk[ELRS_OTA4_LEN];
+            for (int j = 0; j < 8; j++) junk[j] = rand() & 0xFF;
+            junk[0] = (uint8_t)((junk[0] & 0xFC) | ELRS_PKT_SYNC);
+            junk[3] = (uint8_t)((15 << 4) | (junk[3] & 0x0F));
+            elrs_decode_ctx_t c2;
+            elrs_decode_init(&c2);
+            if (elrs_decode_packet(&c2, junk, ELRS_OTA4_LEN, &out) &&
+                out.cls == ELRS_PKT_CLASS_CRC_OK) fp++;
+        }
+        assert(fp == 0);
+        // random storm: chance accepts are bounded and ALL pass the gate's
+        // sanity (rateIdx<=9, tlm<=7, fhss<240) — the impossible-field
+        // ok:1 emissions from the field are gone
+        fp = 0;
+        for (int i = 0; i < 30000; i++) {
+            uint8_t junk[ELRS_OTA4_LEN];
+            for (int j = 0; j < 8; j++) junk[j] = rand() & 0xFF;
+            junk[0] = (uint8_t)((junk[0] & 0xFC) | ELRS_PKT_SYNC);
+            elrs_decode_ctx_t c2;
+            elrs_decode_init(&c2);
+            if (elrs_decode_packet(&c2, junk, ELRS_OTA4_LEN, &out) &&
+                out.cls == ELRS_PKT_CLASS_CRC_OK) {
+                assert((out.sync.rate_index <= 9) && (out.sync.tlm_ratio <= 7) &&
+                       (out.sync.fhss_index < 240));
+                fp++;
+            }
+        }
+        assert(fp < 250); // ~130 inits x 2^-14 x 30k frames: bounded chance
+    }
+    printf("ok: FP gate (insane rateIdx rejected, storm clean, golden ok)\n");
+
+    // 14m) elrs_sig QUALITY MATRIX (round 9)
+    {
+        assert(elrs_sig_quality(0, 0, false) == ELRS_SIG_NONE);
+        assert(elrs_sig_quality(0, 2, false) == ELRS_SIG_NONE);
+        assert(elrs_sig_quality(0, 3, false) == ELRS_SIG_WEAK);
+        assert(elrs_sig_quality(2, 0, false) == ELRS_SIG_NONE);   // 2 crc_pass, no syncs
+        assert(elrs_sig_quality(3, 0, false) == ELRS_SIG_FIRM);   // >=3 crc_pass
+        assert(elrs_sig_quality(0, 10, true) == ELRS_SIG_FIRM);   // 10 sync + repeat
+        assert(elrs_sig_quality(0, 10, false) == ELRS_SIG_WEAK);  // no repeat
+        assert(elrs_sig_quality(10, 0, false) == ELRS_SIG_STRONG);
+        assert(elrs_sig_quality(55, 3, false) == ELRS_SIG_STRONG);
+        assert(strcmp(elrs_sig_name(ELRS_SIG_FIRM), "firm") == 0);
+    }
+    printf("ok: elrs_sig quality matrix\n");
+
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,
     //     ghost (field chaos) nonces off-track.

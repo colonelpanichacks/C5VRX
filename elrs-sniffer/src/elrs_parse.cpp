@@ -105,7 +105,7 @@ void elrs_identity_reset(elrs_identity_t *id)
 bool elrs_identity_sane(const elrs_sync_info_t *s)
 {
     return s->rate_index <= 9 &&      // 3.x SX128X table has 10 entries
-           s->tlm_ratio <= 8 &&       // expresslrs_tlm_ratio_e max (1:2)
+           s->tlm_ratio <= 7 &&       // sync newTlmRatio = enum - NO_TLM -> 0..7
            s->fhss_index < 240;       // FHSS_SEQUENCE_LEN (256/80)*80
 }
 
@@ -476,6 +476,16 @@ bool elrs_decode_packet(elrs_decode_ctx_t *ctx, const uint8_t *data, size_t len,
             if (!got && (is8 ? ota8_crc_ok(data, 0) : ota4_crc_ok(data, 0, 0))) {
                 init = 0; got = true; // bind mode (CRC init 0)
             }
+        }
+        // FP gate (round 9): a CRC pass is NOT enough — the sync fields must
+        // be structurally sane (rateIdx<=9, tlmRatio<=7, fhss<240). Without
+        // this, ~2^-14 chance hits emitted ok:1 with impossible rateIdx 11/15.
+        if (got) {
+            elrs_sync_info_t chk;
+            chk.rate_index = data[3] >> 4;
+            chk.tlm_ratio = (data[3] >> 1) & 0x07;
+            chk.fhss_index = data[1];
+            if (!elrs_identity_sane(&chk)) got = false;
         }
         crc_ok = got;
         if (got && !ctx->crc_init_known) {

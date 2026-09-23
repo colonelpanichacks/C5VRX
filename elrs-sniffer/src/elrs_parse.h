@@ -210,6 +210,25 @@ static inline bool elrs_lastlink_fresh(bool uid_known, uint32_t demote_ms,
 #define ELRS_MSP_BIND 0x09
 bool elrs_bind_parse(const uint8_t *data, size_t len, uint8_t uid2_5[4]);
 
+// elrs_sig quality (round 9): honest ELRS-presence signal for the dashboard
+// even before any fingerprint validates. firm = >=3 crc_pass in the pass OR
+// >=10 sync_struct with >=1 repeated tail; strong = >=10 crc_pass;
+// weak = >=3 sync_struct; else none.
+typedef enum { ELRS_SIG_NONE = 0, ELRS_SIG_WEAK, ELRS_SIG_FIRM, ELRS_SIG_STRONG } elrs_sig_t;
+static inline elrs_sig_t elrs_sig_quality(uint32_t crc_pass, uint32_t sync_struct,
+                                          bool repeat_tail)
+{
+    if (crc_pass >= 10) return ELRS_SIG_STRONG;
+    if (crc_pass >= 3 || (sync_struct >= 10 && repeat_tail)) return ELRS_SIG_FIRM;
+    if (sync_struct >= 3) return ELRS_SIG_WEAK;
+    return ELRS_SIG_NONE;
+}
+static inline const char *elrs_sig_name(elrs_sig_t q)
+{
+    return q == ELRS_SIG_STRONG ? "strong" : q == ELRS_SIG_FIRM ? "firm"
+         : q == ELRS_SIG_WEAK ? "weak" : "none";
+}
+
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only
 // returns true the moment identity is ACCEPTED (2nd consistent sync)
