@@ -62,6 +62,8 @@ static uint32_t dwell_rx, dwell_crc_ok, dwell_rc, dwell_msp, dwell_sync, dwell_t
 static uint32_t dwell_cand;   // round-4: pair-gated candidates / validated syncs ONLY
 static uint8_t g_hot[SNIFFER_MAX_STEPS / 8 + 1]; // hot-junk marks, one sweep pass max
 static uint32_t g_last_demote_ms; // last-link tail decay clock
+static bool g_int_aborted;        // round 5: interferer verdict fired this dwell
+static uint32_t g_int_t0, g_int_rx0, g_int_log_ms;
 static uint32_t last_pkt_debug_ms;      // crc-ok pkt hex (2/s)
 static uint32_t last_rawpkt_ms;         // sync-classified raw hex (2/s)
 
@@ -415,6 +417,9 @@ static void dwell_begin(uint8_t i)
     dwell_first_pkt_ms = 0;
     dwell_rx = dwell_crc_ok = dwell_rc = dwell_msp = dwell_sync = dwell_tlm = dwell_unk = 0;
     dwell_cand = 0;
+    g_int_aborted = false;
+    g_int_t0 = g_int_log_ms = millis();
+    g_int_rx0 = 0;
     sampling_enabled = true;
     sample_fails = 0;
     g_tried_twin = false;
@@ -1215,8 +1220,9 @@ void loop()
                         // count silently; a flrc_sync event fires only on the
                         // 2nd consecutive accepted same-tail sane frame.
                         if (elrs_disc_frame(&g_disc, &pkt.sync, rssi, millis())) {
-                            dwell_cand++; // pair-gated candidate (round-4)
-                            g_id.u3 = g_disc.u3; g_id.u4 = g_disc.u4; g_id.u5 = g_disc.u5;
+                            dwell_cand++; // windowed candidate (round-5)
+                            g_id.u3 = pkt.sync.uid3; g_id.u4 = pkt.sync.uid4;
+                            g_id.u5 = pkt.sync.uid5;
                             g_id.count = 2;
                             g_id.known = true;
                             flrc_adopt(pkt);
@@ -1291,14 +1297,19 @@ void loop()
         }
 
         const sniffer_step_t &cur = sweep.steps[step_idx];
-        if (!locked && cur.rate->flrc && g_radio.flrcDiscovery()) {
-            // interferer bail: >200 fps sustained 500 ms with zero pairs
-            static uint32_t int_t0, int_rx0;
-            if (millis() - int_t0 >= 100) {
-                uint32_t dt = millis() - int_t0;
-                uint32_t fps = (dwell_rx - int_rx0) * 1000 / (dt ? dt : 1);
-                if (elrs_interferer_bail(fps, dwell_cand, millis() - step_entered_ms)) {
-                    Serial.printf("{\"t\":\"event\",\"what\":\"interferer\",\"rate\":\"%s\",\"fps\":%lu}\n",
+        if (!locked && cur.rate->flrc && g_radio.flrcDiscovery() && !g_int_aborted) {
+            // round 5: FIRST interferer verdict ABORTS the dwell immediately
+            // (one "abort" event, rate+twin marked hot for this pass; further
+            // diagnostics capped at 1/s so the serial link is not flooded).
+            uint32_t now = millis();
+            if (now - g_int_t0 >= 100) {
+                uint32_t dt = now - g_int_t0;
+                uint32_t fps = (dwell_rx - g_int_rx0) * 1000 / (dt ? dt : 1);
+                g_int_t0 = now;
+                g_int_rx0 = dwell_rx;
+                if (elrs_interferer_bail(fps, dwell_cand, now - step_entered_ms)) {
+                    g_int_aborted = true;
+                    Serial.printf("{\"t\":\"event\",\"what\":\"interferer\",\"rate\":\"%s\",\"fps\":%lu,\"action\":\"abort\"}\n",
                                   cur.rate->name, (unsigned long)fps);
                     g_hot[step_idx / 8] |= (uint8_t)(1u << (step_idx % 8));
                     for (uint8_t i = 0; i < sweep.count; i++) { // and its twin
@@ -1307,9 +1318,12 @@ void loop()
                             t.iq_inverted != cur.iq_inverted)
                             g_hot[i / 8] |= (uint8_t)(1u << (i % 8));
                     }
+                    dwell_advance(); // end the dwell NOW
+                } else if (fps > ELRS_INTERFERER_FPS && now - g_int_log_ms >= 1000) {
+                    g_int_log_ms = now;
+                    Serial.printf("{\"t\":\"event\",\"what\":\"interferer\",\"rate\":\"%s\",\"fps\":%lu,\"action\":\"watch\"}\n",
+                                  cur.rate->name, (unsigned long)fps);
                 }
-                int_t0 = millis();
-                int_rx0 = dwell_rx;
             }
         }
         if (!locked) {

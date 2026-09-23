@@ -57,7 +57,9 @@ are patient:
 
 `interferer` — a discovery dwell bailed on junk (WiFi): >200 frames/s
 sustained 500 ms with zero pair-gated candidates:
-`{"t":"event","what":"interferer","rate":"DVDA 500Hz","fps":767}`. The rate
+`{"t":"event","what":"interferer","rate":"DVDA 500Hz","fps":767,"action":"abort"}` —
+the FIRST verdict aborts the dwell immediately (total dwell on junk <= ~2 s);
+`action":"watch"` diagnostics are capped at 1/s. The rate
 AND its twin are skipped for the current sweep pass only (marks clear when
 the pass wraps). Dwell extensions count ONLY CRC-validated packets and
 pair-gated candidates — raw type-classifier "sync" labels never extend.
@@ -175,10 +177,11 @@ Boot/lifecycle:
   - `fp` — OSINT fingerprint, first sync of a link:
     `{"t":"event","what":"fp","band":"lora|flrc","uid_tail":"a1b2c3"}`.
   - `flrc_sync` — FLRC sync parsed. `tail_src`: `structural` = classified
-    in discovery mode — emitted ONLY after 2 consecutive accepted same-tail
-    frames (RSSI-gated against the dwell's running noise floor: +12 dB
-    margin, -100 dBm absolute floor; one-off frames counted silently) — a
-    sighting, not a confirmation; `syncword+crc24` = demodulated under the
+    in discovery mode — emitted when a tail reaches ELRS_DISC_NEEDED (3)
+    sightings inside a 2 s sliding window (RSSI-gated against the dwell's
+    noise floor: +12 dB margin, -100 dBm absolute floor; windowed counting,
+    not adjacency — a real 6-12/s link candidates in <1 s amid 800/s junk) —
+    a sighting, not a confirmation; `syncword+crc24` = demodulated under the
     exact UID-derived 32-bit sync word with the seeded radio CRC
     (confirmed).
   - `uid2_crack` — per UID[2] candidate with any score:

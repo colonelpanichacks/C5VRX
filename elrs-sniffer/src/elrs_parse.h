@@ -140,45 +140,49 @@ bool elrs_sync_crc_selfseed(const uint8_t *data, size_t len,
                             uint16_t *init_out, uint8_t *uid5_true_out,
                             uint8_t *model_id_out);
 
-// FLRC-discovery noise gate (field: CRC-off/no-sync discovery false-demods
-// ~570 junk frames/s on pure noise; every junk frame looked like a "sync").
-// Per dwell: running noise floor (starts -120, tracks the min), a frame is
-// accepted only at rssi >= floor+12 dB AND >= -100 dBm absolute; a sync
-// EVENT fires only after 2 consecutive accepted same-tail frames that pass
-// the structural sanity (via elrs_identity_sane). One-off frames count
-// silently. Emissions for the same tail coalesce to 1 per 2 s.
+// FLRC-discovery classifier (round 5: WINDOWED TAIL COUNTING). The round-3
+// consecutive-pair gate could never fire in the field: a real DVDA link
+// yields only ~6-12 same-tail frames/s on a dwell channel among ~800
+// WiFi-junk frames/s, so real frames are never adjacent. Instead: per-dwell
+// sliding window (~2 s) of RSSI-gated, structurally-sane tails; a tail
+// becomes a CANDIDATE at >= ELRS_DISC_NEEDED sightings in the window.
+// Junk safety: 800 random 24-bit tails/s -> expected same-tail collisions
+// per window ~= 0; a real link candidates in <1 s.
 #define ELRS_DISC_NF_START -120.0f
 #define ELRS_DISC_NF_MARGIN 12.0f
 #define ELRS_DISC_ABS_FLOOR -100.0f
+#define ELRS_DISC_WINDOW_MS 2000u
+#define ELRS_DISC_NEEDED 3
+#define ELRS_DISC_SLOTS 16
 #define ELRS_DISC_EMIT_MIN_MS 2000u
 
 typedef struct {
-    float nf;                 // running noise floor (min of observed rssi)
-    uint8_t u3, u4, u5;       // current candidate tail
-    uint8_t count;            // consecutive accepted same-tail sane frames
-    uint32_t last_emit_ms;    // throttle memory
-    uint8_t last_emit_u3, last_emit_u4, last_emit_u5;
+    float   nf;                          // running noise floor (min)
+    uint8_t needed;                      // sightings required (configurable)
+    struct {
+        uint8_t  u3, u4, u5;
+        uint8_t  count;
+        uint32_t last_ms;                // 0 = free slot
+    } slot[ELRS_DISC_SLOTS];
+    uint32_t last_emit_ms;               // per-tail emission throttle
+    uint8_t  le3, le4, le5;
 } elrs_disc_gate_t;
 
 void elrs_disc_reset(elrs_disc_gate_t *g);
-// returns true exactly when a flrc_sync event should be emitted
+// returns true exactly when a flrc_sync/adopt event should fire
 bool elrs_disc_frame(elrs_disc_gate_t *g, const elrs_sync_info_t *s,
                      float rssi_dbm, uint32_t now_ms);
 
-// Dwell-extension predicate (round-4 regression): a dwell may extend ONLY
-// on CRC-validated packets and/or pair-gated discovery candidates — NEVER
-// on raw type-classifier labels ("sync"/"rc" on unvalidated frames). The
-// field bug: 27,600 WiFi-junk frames/s, 4,361 labeled "sync", extended a
-// DVDA dwell to 36 s with zero real candidates.
+// Dwell-extension predicate (round-4): extend ONLY on CRC-validated packets
+// and/or pair/window-gated discovery candidates — NEVER on raw
+// type-classifier labels.
 static inline bool elrs_dwell_extend(uint32_t crc_ok_count, uint32_t cand_count)
 {
     return crc_ok_count > 0 || cand_count > 0;
 }
 
-// Interferer bail (round 4): a discovery dwell seeing >ELRS_INTERFERER_FPS
-// frames/s sustained for ELRS_INTERFERER_MS with zero accepted same-tail
-// pairs is junk (WiFi bursts) — abort it. A real ELRS FLRC link pairs
-// within milliseconds.
+// Interferer bail: >ELRS_INTERFERER_FPS frames/s sustained
+// ELRS_INTERFERER_MS with zero accepted same-tail candidates = junk.
 #define ELRS_INTERFERER_FPS 200u
 #define ELRS_INTERFERER_MS 500u
 static inline bool elrs_interferer_bail(uint32_t fps, uint32_t cand_count,
@@ -188,9 +192,7 @@ static inline bool elrs_interferer_bail(uint32_t fps, uint32_t cand_count,
            sustained_ms >= ELRS_INTERFERER_MS;
 }
 
-// Last-link tail freshness (round 4): the previous link's tail may seed
-// crack/listening states for 60 s after demote, then decays to the phrase
-// guess so an idle sniffer stops chasing ghosts.
+// Last-link tail freshness: usable for 60 s after demote, then decays.
 #define ELRS_LASTLINK_DECAY_MS 60000u
 static inline bool elrs_lastlink_fresh(bool uid_known, uint32_t demote_ms,
                                        uint32_t now_ms)

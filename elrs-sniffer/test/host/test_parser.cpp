@@ -555,53 +555,54 @@ int main()
     }
     printf("ok: self-seeded sync validator (modelId on/off, rateIdx 9)\n");
 
-    // 14e) DISCOVERY NOISE GATE (round-3 acceptance):
-    //   (a) junk at RSSI -128 never produces an event
-    //   (b) same-tail pair at -60 with sane rateIdx -> exactly one event
-    //   (c) a single above-threshold frame -> no event
-    //   (d) same-tail emissions coalesce to 1 per 2 s
+    // 14e) DISCOVERY CLASSIFIER (windowed tail counting): junk never
+    //     candidates; >=ELRS_DISC_NEEDED sightings of one tail inside the
+    //     2 s window emits exactly once (per-tail throttle).
     {
         elrs_disc_gate_t g;
         elrs_sync_info_t s;
-        memset(&s, 0, sizeof(s));
-        s.uid3 = 0xf8; s.uid4 = 0x42; s.uid5 = 0x8d;
-        s.rate_index = 4; s.tlm_ratio = 2; s.fhss_index = 10;
-
-        // (a) pure-noise junk at -128, random tails, forever
         elrs_disc_reset(&g);
-        for (int i = 0; i < 500; i++) {
+        srand(999);
+        // 800/s random-tail junk for 4 s -> zero candidates
+        for (int i = 0; i < 3200; i++) {
+            memset(&s, 0, sizeof(s));
             s.uid3 = rand() & 0xFF; s.uid4 = rand() & 0xFF; s.uid5 = rand() & 0xFF;
-            s.nonce = rand() & 0xFF; s.fhss_index = rand() % 200; s.rate_index = rand() % 16;
-            assert(!elrs_disc_frame(&g, &s, -127.5f - (rand() % 5), 1000 + i));
+            s.nonce = rand() & 0xFF; s.fhss_index = rand() % 256;
+            s.rate_index = rand() % 16; s.tlm_ratio = rand() % 16;
+            float rssi = (i % 64) ? (-45.0f - (rand() % 20)) : -128.0f;
+            assert(!elrs_disc_frame(&g, &s, rssi, 1000 + i));
         }
-        assert(g.nf <= -127.0f); // floor tracked the noise
-
-        // (b)+(c): one strong frame -> silent; the matching second -> one event
+        assert(g.nf <= -127.0f);
+        // real link: same tail 8/s among the junk -> candidate at 3rd sighting
         elrs_disc_reset(&g);
-        s.uid3 = 0xbe; s.uid4 = 0x07; s.uid5 = 0x83;
-        s.rate_index = 6; s.tlm_ratio = 2; s.fhss_index = 42; s.nonce = 1;
-        assert(!elrs_disc_frame(&g, &s, -60.0f, 2000)); // single: no event (c)
-        s.nonce = 2;
-        assert(elrs_disc_frame(&g, &s, -58.0f, 2100));  // pair: ONE event (b)
-        s.nonce = 3;
-        assert(!elrs_disc_frame(&g, &s, -59.0f, 2200)); // throttle: same tail <2s (d)
-
-        // (d) after 2 s the same tail may emit again
-        assert(elrs_disc_frame(&g, &s, -59.0f, 2100 + 2000));
-
-        // tail change resets the consecutive count even when strong; a new
-        // tail is NOT throttled by a different tail's emission
+        unsigned emits = 0;
+        for (int i = 0; i < 4000; i++) { // 4 s at 1ms steps, 800 junk + 8 real/s
+            memset(&s, 0, sizeof(s));
+            if (i % 125 == 0) { // one real frame every 125 ms (8/s)
+                s.uid3 = 0x61; s.uid4 = 0xac; s.uid5 = 0xe1;
+                s.rate_index = 2; s.tlm_ratio = 2; s.fhss_index = 40;
+                s.nonce = (uint8_t)(i / 125);
+            } else {
+                s.uid3 = rand() & 0xFF; s.uid4 = rand() & 0xFF; s.uid5 = rand() & 0xFF;
+                s.nonce = rand() & 0xFF; s.fhss_index = rand() % 256;
+                s.rate_index = rand() % 16; s.tlm_ratio = rand() % 16;
+            }
+            if (elrs_disc_frame(&g, &s, -50.0f, 1000 + i)) emits++;
+        }
+        assert(emits >= 1 && emits <= 2); // first ~375 ms in; throttle allows 1 per 2 s
+        // sustained same-tail flow emits again only after the 2 s throttle
         elrs_disc_reset(&g);
-        s.uid3 = 0xaa; s.nonce = 1;
-        assert(!elrs_disc_frame(&g, &s, -60, 5000));
-        s.uid3 = 0xbb; s.nonce = 1;
-        assert(!elrs_disc_frame(&g, &s, -60, 5100)); // new tail: count restarts
-        s.nonce = 2;
-        assert(elrs_disc_frame(&g, &s, -60, 5200));  // 2nd of new tail -> emit
-        s.nonce = 3;
-        assert(!elrs_disc_frame(&g, &s, -60, 6000)); // same tail <2s: coalesced
+        emits = 0;
+        for (int i = 0; i < 6000; i++) {
+            memset(&s, 0, sizeof(s));
+            s.uid3 = 0xbe; s.uid4 = 0x07; s.uid5 = 0x83;
+            s.rate_index = 6; s.tlm_ratio = 2; s.fhss_index = 42;
+            s.nonce = (uint8_t)i;
+            if (elrs_disc_frame(&g, &s, -60.0f, 1000 + i)) emits++;
+        }
+        assert(emits >= 2 && emits <= 4); // ~1 per 2 s over 6 s
     }
-    printf("ok: discovery noise gate (a-d)\n");
+    printf("ok: discovery windowed tail counting\n");
 
     // 14f) ROUND-4 acceptance:
     //  (a) 27k junk frames with type-classifier "sync" labels -> zero dwell
@@ -630,14 +631,17 @@ int main()
         assert(cand == 0); // random tails never pair 27k:1 by chance
         assert(!elrs_dwell_extend(0, cand)); // zero extensions -> base exit
 
-        // (c) pair-gated candidate extends
+        // (c) windowed candidate extends (3 sightings inside the window)
         elrs_disc_reset(&g);
         memset(&s, 0, sizeof(s));
         s.uid3 = 0x61; s.uid4 = 0xac; s.uid5 = 0xe1;
-        s.rate_index = 6; s.tlm_ratio = 2; s.fhss_index = 10; s.nonce = 1;
-        assert(!elrs_disc_frame(&g, &s, -60, 100));
-        s.nonce = 2;
-        assert(elrs_disc_frame(&g, &s, -60, 120)); // pair -> candidate
+        s.rate_index = 6; s.tlm_ratio = 2; s.fhss_index = 10;
+        unsigned c = 0;
+        for (uint8_t k = 1; k <= 3; k++) {
+            s.nonce = k;
+            if (elrs_disc_frame(&g, &s, -60, 100 + k * 10)) c++;
+        }
+        assert(c == 1); // 3rd sighting emits
         assert(elrs_dwell_extend(0, 1));
 
         // (b) interferer bail
