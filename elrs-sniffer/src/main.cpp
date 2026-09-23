@@ -59,6 +59,9 @@ static uint32_t lock_total_pkts;
 // rx = RxDone demods; crc_ok = passed ELRS software CRC; types = parses.
 static uint32_t n_rx, n_crc_ok, n_rc, n_msp, n_sync, n_tlm, n_unk;
 static uint32_t dwell_rx, dwell_crc_ok, dwell_rc, dwell_msp, dwell_sync, dwell_tlm, dwell_unk;
+static uint32_t dwell_cand;   // round-4: pair-gated candidates / validated syncs ONLY
+static uint8_t g_hot[SNIFFER_MAX_STEPS / 8 + 1]; // hot-junk marks, one sweep pass max
+static uint32_t g_last_demote_ms; // last-link tail decay clock
 static uint32_t last_pkt_debug_ms;      // crc-ok pkt hex (2/s)
 static uint32_t last_rawpkt_ms;         // sync-classified raw hex (2/s)
 
@@ -147,8 +150,11 @@ static void crack_emit(const char *state)
     snprintf(g_crack_state, sizeof(g_crack_state), "%s", state);
     uint8_t t3, t4, t5;
     const char *tail_src;
+    // round-4: the "last-link" tail decays 60 s after demote so an idle
+    // sniffer stops chasing ghosts and falls back to the phrase guess
+    bool lastlink_fresh = elrs_lastlink_fresh(dctx.uid_known, g_last_demote_ms, millis());
     if (g_id.count || g_id.known) { t3 = g_id.u3; t4 = g_id.u4; t5 = g_id.u5; tail_src = "sync"; }
-    else if (dctx.uid_known) { t3 = dctx.uid3; t4 = dctx.uid4; t5 = dctx.uid5; tail_src = "last-link"; }
+    else if (lastlink_fresh) { t3 = dctx.uid3; t4 = dctx.uid4; t5 = dctx.uid5; tail_src = "last-link"; }
     else { t3 = g_uid[3]; t4 = g_uid[4]; t5 = g_uid[5]; tail_src = "phrase"; }
     Serial.printf("{\"t\":\"crack\",\"state\":\"%s\",\"uid_tail\":\"%02x%02x%02x\","
                   "\"tail_src\":\"%s\",\"done\":%u,\"total\":256,\"valids_best\":%lu",
@@ -408,6 +414,7 @@ static void dwell_begin(uint8_t i)
     dwell_rx = 0;
     dwell_first_pkt_ms = 0;
     dwell_rx = dwell_crc_ok = dwell_rc = dwell_msp = dwell_sync = dwell_tlm = dwell_unk = 0;
+    dwell_cand = 0;
     sampling_enabled = true;
     sample_fails = 0;
     g_tried_twin = false;
@@ -464,7 +471,17 @@ static void dwell_advance()
                   (unsigned long)dwell_rc, (unsigned long)dwell_msp,
                   (unsigned long)dwell_sync, (unsigned long)dwell_tlm,
                   (unsigned long)dwell_unk);
-    dwell_begin(step_idx + 1);
+    // advance to the next non-hot step; hot marks live for ONE sweep pass
+    // (cleared when the pass wraps) so a real link is never permanently
+    // skipped after one unlucky interferer collision.
+    uint8_t start = step_idx;
+    uint8_t next = step_idx;
+    for (;;) {
+        next = (uint8_t)((next + 1) % sweep.count);
+        if (next == 0) memset(g_hot, 0, sizeof(g_hot)); // new pass
+        if (next == start || !(g_hot[next / 8] & (uint8_t)(1u << (next % 8)))) break;
+    }
+    dwell_begin(next);
 }
 
 // jump the sweep straight to a rate index heard in a sync packet
@@ -1198,6 +1215,7 @@ void loop()
                         // count silently; a flrc_sync event fires only on the
                         // 2nd consecutive accepted same-tail sane frame.
                         if (elrs_disc_frame(&g_disc, &pkt.sync, rssi, millis())) {
+                            dwell_cand++; // pair-gated candidate (round-4)
                             g_id.u3 = g_disc.u3; g_id.u4 = g_disc.u4; g_id.u5 = g_disc.u5;
                             g_id.count = 2;
                             g_id.known = true;
@@ -1222,7 +1240,7 @@ void loop()
                                           pkt.sync.uid5 == g_id.u5;
                         if (g_id.count == 1) crack_emit_sync_seen_throttled();
                         if (tail_match && g_id.known) {
-                            if (!was_known) crack_emit("identity");
+                            if (!was_known) { crack_emit("identity"); dwell_cand++; }
                             if (!was_known) crack_emit("identity");
                             g_uid[3] = g_id.u3; g_uid[4] = g_id.u4; g_uid[5] = g_id.u5;
                             dctx.uid3 = g_id.u3;
@@ -1273,6 +1291,27 @@ void loop()
         }
 
         const sniffer_step_t &cur = sweep.steps[step_idx];
+        if (!locked && cur.rate->flrc && g_radio.flrcDiscovery()) {
+            // interferer bail: >200 fps sustained 500 ms with zero pairs
+            static uint32_t int_t0, int_rx0;
+            if (millis() - int_t0 >= 100) {
+                uint32_t dt = millis() - int_t0;
+                uint32_t fps = (dwell_rx - int_rx0) * 1000 / (dt ? dt : 1);
+                if (elrs_interferer_bail(fps, dwell_cand, millis() - step_entered_ms)) {
+                    Serial.printf("{\"t\":\"event\",\"what\":\"interferer\",\"rate\":\"%s\",\"fps\":%lu}\n",
+                                  cur.rate->name, (unsigned long)fps);
+                    g_hot[step_idx / 8] |= (uint8_t)(1u << (step_idx % 8));
+                    for (uint8_t i = 0; i < sweep.count; i++) { // and its twin
+                        const sniffer_step_t &t = sweep.steps[i];
+                        if (t.rate == cur.rate && t.legacy_2x == cur.legacy_2x &&
+                            t.iq_inverted != cur.iq_inverted)
+                            g_hot[i / 8] |= (uint8_t)(1u << (i % 8));
+                    }
+                }
+                int_t0 = millis();
+                int_rx0 = dwell_rx;
+            }
+        }
         if (!locked) {
             // Adaptive dwell, IQ-trap safe: extension requires VALIDATED or
             // SYNC-classified packets (junk rc/msp never extends — the field
@@ -1283,9 +1322,11 @@ void loop()
             // the TWIN IQ step of the same rate — the highest-value next
             // step, since ~half of all bound links run inverted IQ.
             if (millis() - step_entered_ms > dwell_len_ms) {
-                bool any_valid = cur.rate->flrc
-                                     ? (dwell_sync > 0)
-                                     : (dwell_crc_ok > 0 || dwell_sync > 0);
+                // round-4: extend ONLY on CRC-validated packets and/or
+                // pair-gated candidates — raw type-classifier "sync" labels
+                // on unvalidated discovery frames must NEVER extend (the
+                // 27k-junk/36s DVDA dwell bug).
+                bool any_valid = elrs_dwell_extend(dwell_crc_ok, dwell_cand);
                 bool hot_dead = dwell_rssi_max > TRAP_RSSI_DB && !any_valid;
                 if (any_valid && dwell_len_ms < DWELL_MAX_MS) {
                     dwell_len_ms += DWELL_CHUNK_MS;
@@ -1356,6 +1397,7 @@ void loop()
             elrs_identity_reset(&g_id);
             dctx.uid_known = false;      // stale tails must not seed later
             dctx.crc_init_known = false; // listening/crack states
+            g_last_demote_ms = millis(); // last-link tail decay clock
             Serial.println("{\"t\":\"unlock\",\"why\":\"timeout\"}");
             // re-enter sweep: parked step if set, else last good rate+IQ
             dwell_begin(g_park_step >= 0 ? (uint8_t)g_park_step : last_good_step);

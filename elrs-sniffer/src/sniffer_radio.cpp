@@ -2,6 +2,36 @@
 #include "sniffer_radio.h"
 #include "board_pins.h"
 #include "elrs_parse.h" // uidMacSeed / crc-init helpers (elrs_defs.h cited)
+void sniffer_sweep_build(sniffer_sweep_t *sw)
+{
+    sw->count = 0;
+    // Round-4 order: LoRa FIRST. The self-seeded CRC14 validator is
+    // mathematically bulletproof on LoRa (no junk passes), LoRa 250 is the
+    // stock Pocket default, and quiet LoRa dwells are cheap (2 s). FLRC
+    // promiscuous discovery is the fallback for FLRC-only links. Order:
+    // 250, 500, 150, 50 (IQ pairs), FLRC trio, 8ch variants, legacy rows.
+    static const uint8_t order3x[ELRS_RATES_3X_COUNT] = { 2, 0, 3, 5, 1, 4 };
+    //                         table idx ->   250, 500, 150, 50, 333-8, 100-8
+    for (uint8_t k = 0; k < 4; k++) { // the four main LoRa rates, IQ pairs
+        uint8_t i = order3x[k];
+        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], false, false };
+        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], true, false };
+    }
+    for (uint8_t i = 0; i < ELRS_RATES_FLRC_COUNT; i++) {
+        sw->steps[sw->count++] = { &ELRS_RATES_FLRC[i], false, false };
+    }
+    for (uint8_t k = 4; k < ELRS_RATES_3X_COUNT; k++) { // 8ch variants
+        uint8_t i = order3x[k];
+        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], false, false };
+        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], true, false };
+    }
+    for (uint8_t i = 0; i < ELRS_RATES_2X_COUNT; i++) {
+        sw->steps[sw->count++] = { &ELRS_RATES_2X[i], false, true };
+        sw->steps[sw->count++] = { &ELRS_RATES_2X[i], true, true };
+    }
+}
+
+
 #ifdef ARDUINO
 #include <Arduino.h>
 #include <RadioLib.h>
@@ -17,34 +47,6 @@ public:
     using SX1280::setPacketParamsGFSK;
     using SX1280::setPacketType;
 };
-
-void sniffer_sweep_build(sniffer_sweep_t *sw)
-{
-    sw->count = 0;
-    // Likelihood-ordered first pass — FLRC interleaved early (it is the
-    // modern ELRS default; a strong FLRC link must be reached in seconds,
-    // not after the whole LoRa table). Order: 250, 500 (IQ pairs), FLRC
-    // trio, 150, 50, then the 8ch variants and legacy 2.x rows.
-    static const uint8_t order3x[ELRS_RATES_3X_COUNT] = { 2, 0, 3, 5, 1, 4 };
-    //                         table idx ->   250, 500, 150, 50, 333-8, 100-8
-    for (uint8_t k = 0; k < 2; k++) { // 250 + 500, IQ pairs
-        uint8_t i = order3x[k];
-        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], false, false };
-        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], true, false };
-    }
-    for (uint8_t i = 0; i < ELRS_RATES_FLRC_COUNT; i++) {
-        sw->steps[sw->count++] = { &ELRS_RATES_FLRC[i], false, false };
-    }
-    for (uint8_t k = 2; k < ELRS_RATES_3X_COUNT; k++) { // 150, 50, 8ch variants
-        uint8_t i = order3x[k];
-        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], false, false };
-        sw->steps[sw->count++] = { &ELRS_RATES_3X[i], true, false };
-    }
-    for (uint8_t i = 0; i < ELRS_RATES_2X_COUNT; i++) {
-        sw->steps[sw->count++] = { &ELRS_RATES_2X[i], false, true };
-        sw->steps[sw->count++] = { &ELRS_RATES_2X[i], true, true };
-    }
-}
 
 const radio_pin_set_t RADIO_PIN_SETS[] = {
     // name            nss sck miso mosi rst dio1 busy rxen txen

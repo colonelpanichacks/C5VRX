@@ -55,6 +55,13 @@ are patient:
  "rx":14,"crc_ok":11,"types":{"rc":11,"msp":0,"sync":0,"tlm":0,"unk":3}}
 {"t":"dwell_ext","rate":"LoRa 250Hz","iq":"n","rssi_max":-69,"dwell_ms":4000}
 
+`interferer` — a discovery dwell bailed on junk (WiFi): >200 frames/s
+sustained 500 ms with zero pair-gated candidates:
+`{"t":"event","what":"interferer","rate":"DVDA 500Hz","fps":767}`. The rate
+AND its twin are skipped for the current sweep pass only (marks clear when
+the pass wraps). Dwell extensions count ONLY CRC-validated packets and
+pair-gated candidates — raw type-classifier "sync" labels never extend.
+
 Dwell lines carry `nf` (discovery noise floor dBm, running min) and
 `nf_thr` (`nf` + 12 dB - the frame-acceptance threshold). `crc_ok`
 stays 0 in discovery mode (radio CRC disabled there; the counter is

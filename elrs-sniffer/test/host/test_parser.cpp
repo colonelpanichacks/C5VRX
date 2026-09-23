@@ -9,6 +9,7 @@
 #include "elrs_crc.h"
 #include "elrs_parse.h"
 #include "elrs_fhss.h"
+#include "sniffer_radio.h"
 
 // ---- independent CRC formulation: verbatim port of the ELRS 3.6.4 table
 // implementation (src/lib/CRC/crc.cpp Crc2Byte), kept structurally different
@@ -601,6 +602,78 @@ int main()
         assert(!elrs_disc_frame(&g, &s, -60, 6000)); // same tail <2s: coalesced
     }
     printf("ok: discovery noise gate (a-d)\n");
+
+    // 14f) ROUND-4 acceptance:
+    //  (a) 27k junk frames with type-classifier "sync" labels -> zero dwell
+    //      extensions (dwell exits at base)
+    //  (b) interferer burst >200 fps, no pairs, sustained -> bail; pairs or
+    //      low fps -> no bail
+    //  (c) a pair-gated candidate still extends
+    //  (d) sweep order is LoRa-first
+    //  (e) last-link tail decays 60 s after demote
+    {
+        // (a) replay: 27,600 WiFi-junk frames, random tails incl. sync-typed
+        elrs_disc_gate_t g;
+        elrs_sync_info_t s;
+        elrs_disc_reset(&g);
+        srand(1337);
+        unsigned cand = 0;
+        for (int i = 0; i < 27600; i++) {
+            memset(&s, 0, sizeof(s));
+            s.uid3 = rand() & 0xFF; s.uid4 = rand() & 0xFF; s.uid5 = rand() & 0xFF;
+            s.nonce = rand() & 0xFF; s.fhss_index = rand() % 256;
+            s.rate_index = rand() % 16; s.tlm_ratio = rand() % 16;
+            // bursty WiFi: strong DURING the burst (per-frame rssi reads high)
+            float rssi = (i % 64) ? (-45.0f - (rand() % 20)) : -128.0f;
+            if (elrs_disc_frame(&g, &s, rssi, 1000 + i)) cand++;
+        }
+        assert(cand == 0); // random tails never pair 27k:1 by chance
+        assert(!elrs_dwell_extend(0, cand)); // zero extensions -> base exit
+
+        // (c) pair-gated candidate extends
+        elrs_disc_reset(&g);
+        memset(&s, 0, sizeof(s));
+        s.uid3 = 0x61; s.uid4 = 0xac; s.uid5 = 0xe1;
+        s.rate_index = 6; s.tlm_ratio = 2; s.fhss_index = 10; s.nonce = 1;
+        assert(!elrs_disc_frame(&g, &s, -60, 100));
+        s.nonce = 2;
+        assert(elrs_disc_frame(&g, &s, -60, 120)); // pair -> candidate
+        assert(elrs_dwell_extend(0, 1));
+
+        // (b) interferer bail
+        assert(elrs_interferer_bail(767, 0, 500));   // hot, no pairs, sustained
+        assert(!elrs_interferer_bail(767, 1, 500));  // a pair exists -> real link
+        assert(!elrs_interferer_bail(150, 0, 500));  // below fps threshold
+        assert(!elrs_interferer_bail(767, 0, 400));  // not sustained yet
+
+        // (e) last-link decay
+        assert(!elrs_lastlink_fresh(true, 0, 120000));   // demoted long ago
+        assert(elrs_lastlink_fresh(true, 60000, 110000)); // within 60 s
+        assert(!elrs_lastlink_fresh(false, 60000, 61000)); // no uid at all
+    }
+    printf("ok: round-4 dwell/extension/interferer/decay (a-c,e)\n");
+
+    // 14g) SWEEP ORDER: LoRa rates first (250,500,150,50 x IQ), FLRC trio
+    //      after — LoRa self-seed validation is junk-proof and 250 is the
+    //      stock Pocket default.
+    {
+        sniffer_sweep_t sw;
+        sniffer_sweep_build(&sw);
+        assert(sw.count == 2 * (ELRS_RATES_3X_COUNT + ELRS_RATES_2X_COUNT) + ELRS_RATES_FLRC_COUNT);
+        static const char *want0[8] = { "LoRa 250Hz", "LoRa 250Hz", "LoRa 500Hz", "LoRa 500Hz",
+                                        "LoRa 150Hz", "LoRa 150Hz", "LoRa 50Hz", "LoRa 50Hz" };
+        for (int i = 0; i < 8; i++) {
+            assert(strcmp(sw.steps[i].rate->name, want0[i]) == 0);
+            assert(sw.steps[i].rate->flrc == 0);
+        }
+        for (int i = 0; i < 8; i += 2) { // IQ pairs n,i
+            assert(sw.steps[i].iq_inverted == false);
+            assert(sw.steps[i + 1].iq_inverted == true);
+        }
+        assert(sw.steps[8].rate->flrc == 1); // first FLRC after the LoRa first pass
+        assert(sw.steps[8].iq_inverted == false); // FLRC: IQ n/a, single polarity
+    }
+    printf("ok: sweep order LoRa-first (d)\n");
 
     // 15) REFERENCE-RX PORT rules: minLqForChaos values + nonce tracking
     //     (rx_main.cpp:273, 678, 1092) — expected progression accepted,

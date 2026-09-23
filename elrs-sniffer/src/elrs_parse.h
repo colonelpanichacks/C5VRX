@@ -165,6 +165,39 @@ void elrs_disc_reset(elrs_disc_gate_t *g);
 bool elrs_disc_frame(elrs_disc_gate_t *g, const elrs_sync_info_t *s,
                      float rssi_dbm, uint32_t now_ms);
 
+// Dwell-extension predicate (round-4 regression): a dwell may extend ONLY
+// on CRC-validated packets and/or pair-gated discovery candidates — NEVER
+// on raw type-classifier labels ("sync"/"rc" on unvalidated frames). The
+// field bug: 27,600 WiFi-junk frames/s, 4,361 labeled "sync", extended a
+// DVDA dwell to 36 s with zero real candidates.
+static inline bool elrs_dwell_extend(uint32_t crc_ok_count, uint32_t cand_count)
+{
+    return crc_ok_count > 0 || cand_count > 0;
+}
+
+// Interferer bail (round 4): a discovery dwell seeing >ELRS_INTERFERER_FPS
+// frames/s sustained for ELRS_INTERFERER_MS with zero accepted same-tail
+// pairs is junk (WiFi bursts) — abort it. A real ELRS FLRC link pairs
+// within milliseconds.
+#define ELRS_INTERFERER_FPS 200u
+#define ELRS_INTERFERER_MS 500u
+static inline bool elrs_interferer_bail(uint32_t fps, uint32_t cand_count,
+                                        uint32_t sustained_ms)
+{
+    return fps > ELRS_INTERFERER_FPS && cand_count == 0 &&
+           sustained_ms >= ELRS_INTERFERER_MS;
+}
+
+// Last-link tail freshness (round 4): the previous link's tail may seed
+// crack/listening states for 60 s after demote, then decays to the phrase
+// guess so an idle sniffer stops chasing ghosts.
+#define ELRS_LASTLINK_DECAY_MS 60000u
+static inline bool elrs_lastlink_fresh(bool uid_known, uint32_t demote_ms,
+                                       uint32_t now_ms)
+{
+    return uid_known && (now_ms - demote_ms <= ELRS_LASTLINK_DECAY_MS);
+}
+
 void elrs_identity_reset(elrs_identity_t *id);
 bool elrs_identity_sane(const elrs_sync_info_t *s);  // structural checks only
 // returns true the moment identity is ACCEPTED (2nd consistent sync)
