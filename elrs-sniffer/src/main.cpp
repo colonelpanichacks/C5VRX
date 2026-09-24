@@ -842,7 +842,7 @@ static void stats_tick()
                   "\"crack\":\"%s\",\"mode\":\"%s\",\"conn\":\"%s\","
                   "\"sig\":{\"q\":\"%s\",\"frames\":%lu,\"sync_struct\":%lu,\"crc_pass\":%lu,"
                   "\"lora\":{\"f\":%lu,\"s\":%lu,\"c\":%lu},\"flrc\":{\"f\":%lu,\"s\":%lu,\"c\":%lu}},"
-                  "\"rx\":%lu,\"crc_ok\":%lu,"
+                  "\"rx\":%lu,\"crc_ok\":%lu,\"rx_dropped\":%lu,"
                   "\"types\":{\"rc\":%lu,\"msp\":%lu,\"sync\":%lu,\"tlm\":%lu,\"unk\":%lu},"
                   "\"ch\":[%lu,%lu,%lu,%lu],\"arm\":%u,"
                   "\"irq\":\"%02x\",\"cm\":\"%s\",\"rxdone_latched\":%lu,\"dio_miss\":%lu",
